@@ -355,10 +355,13 @@ async function main() {
       !!(oe1.setup && oe1.setup.token === TOKEN && oe1.setup.step1 && oe1.setup.step3), JSON.stringify(oe1.setup || {}).slice(0, 240))
     t('等满了 waitMs 才返回（不是立刻放弃）', oe1.waitedMs >= 2000, 'waitedMs=' + oe1.waitedMs)
     const oeDesk = await call('scratch_open_editor', { app: 'desktop', waitMs: 0 })
-    t('app=desktop 能定位到本地 TurboWarp Desktop（注册表那条路）',
+    t('app=desktop 能定位到本地 TurboWarp Desktop（desktopPath / 注册表那条路）',
       !!(oeDesk.launched && oeDesk.launched.path), JSON.stringify(oeDesk.launched))
-    t('并且明确说桥驱动不了桌面版（不谎报连上）',
-      oeDesk.connected === false && oeDesk.bridgeCanDrive === false, JSON.stringify({ c: oeDesk.connected, d: oeDesk.bridgeCanDrive }))
+    t('启动时带了 --remote-debugging-port（桌面版靠 CDP 直连，不靠扩展）',
+      /--remote-debugging-port=\d+/.test(JSON.stringify(stubLaunches())), JSON.stringify(stubLaunches()).slice(0, 200))
+    t('桩起不了 CDP 端点时如实报错，不谎报连上',
+      oeDesk.connected === false && typeof oeDesk.error === 'string', JSON.stringify({ c: oeDesk.connected, e: oeDesk.error }).slice(0, 200))
+    // 桌面版真正的端到端验收在 lab/desktop-cdp-check.mjs（那边会真开一个 TurboWarp 窗口）
 
     // ---- 2. 拉真浏览器 + 真扩展 ----
     // 关于装扩展：Chrome 137 起**品牌版 Chrome 直接忽略 --load-extension**
@@ -421,14 +424,20 @@ async function main() {
 
     let EXT_ID = null
     let extProbe = null
+    let loadUnpackedErr = ''
     const browserWs = await Cdp.attach(ver.webSocketDebuggerUrl)
     try {
       const r = await browserWs.send('Extensions.loadUnpacked', { path: EXT_DIR })
       EXT_ID = r && r.id ? r.id : null
     } catch (e) {
+      loadUnpackedErr = e.message
       console.log('  Extensions.loadUnpacked 不可用（' + e.message.slice(0, 80) + '），回退 --load-extension')
     }
-    t('Extensions.loadUnpacked 装上了扩展并给出真实 ID', !!EXT_ID, String(EXT_ID))
+    // Edge 没有 Extensions 这个 CDP 域（那是 Chrome 专属），所以这里判"两条路有一条走通"：
+    // loadUnpacked 给了 ID，或者确认它不可用→回退（回退是否真装上，下面几条断言会验）。
+    t('装扩展：loadUnpacked 给了真实 ID，或（Edge 等无此域时）明确走回退 --load-extension',
+      !!EXT_ID || !!loadUnpackedErr,
+      `EXT_ID=${EXT_ID} loadUnpackedErr=${loadUnpackedErr ? 'yes' : 'no'}`)
     if (EXT_ID) extProbe = await probeExtPage(EXT_ID)
 
     if (!EXT_ID) {

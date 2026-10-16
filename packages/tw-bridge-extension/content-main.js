@@ -18,9 +18,13 @@
 
   // ---------------- 传输层（对上面那些文件，本文件只认 __dshBridgeRelay 消息） ----------------
   const TAG = '__dshBridgeRelay'
-  let linkOk = false      // SW 侧的 socket 是否已握手通过（由 SW 告知，本页自己判断不了）
-  let tokenSet = false    // 仅供状态展示：SW 手里有没有 token
+  let linkOk = false      // 对端的 socket 是否已握手通过（由对端告知，本页自己判断不了）
+  let tokenSet = false    // 仅供状态展示：对端手里有没有 token
   let linkReason = ''     // 断开原因（握手超时/token 不对…）
+  // 谁在转发消息：'sw' = 浏览器扩展的 service worker（公网页面连不了 loopback，socket 只能在 SW 里），
+  // 'cdp' = 插件用 DevTools 协议直接注入本脚本（TurboWarp Desktop 这条路，没有扩展也没有 token）。
+  // 这个字段只影响**自报状态**，但很重要：排查时"到底谁在跟我说话"必须一眼看得出。
+  let linkVia = 'sw'
 
   function relaySend(type, extra) {
     try { window.postMessage(Object.assign({ [TAG]: type }, extra), window.location.origin) } catch { /* 非浏览器环境 */ }
@@ -46,7 +50,8 @@
       linkOk = !!d.ok
       tokenSet = d.tokenSet !== undefined ? !!d.tokenSet : tokenSet
       linkReason = d.reason || ''
-      if (linkOk && !wasOk) console.info('[dsh-bridge] 桥已连上（socket 在扩展 SW 里）')
+      if (d.via) linkVia = String(d.via)
+      if (linkOk && !wasOk) console.info('[dsh-bridge] 桥已连上（' + (linkVia === 'cdp' ? 'CDP 直连，没有扩展' : 'socket 在扩展 SW 里') + '）')
       if (!linkOk && linkReason) console.warn('[dsh-bridge] ' + linkReason)
       return
     }
@@ -414,6 +419,8 @@
         return {
           title: document.title.replace(/ - TurboWarp$/, ''),
           extensions: pj.extensions,
+          // AI 写积木时要知道"现在光标在哪个角色上"（read_script 缺省也用它）
+          editingTarget: vm.editingTarget ? vm.editingTarget.getName() : null,
           targets: pj.targets.map(t => {
             const c = countBlocksOf(t.blocks)
             return {
@@ -922,16 +929,18 @@
   window.__dshBridge = {
     ops, snapshotJson, watchState, userEvents,
     // 状态查询（扩展图标点击时在 MAIN world 读；lab 的真机层也读它）
-    // 注意：socket 不在本页，linkOk 是 SW 通过 'link' 消息告知的。
-    // 想核对"到底谁持有 socket"，要读 SW 侧的 __dshBridgeSW.state()（CDP 连 service_worker target）。
+    // 注意：本页不持有 socket。扩展路径下 linkOk 是 SW 通过 'link' 消息告知的；
+    // CDP 路径下同一句话说给插件的 cdp.js 听。想核对"到底谁持有连接"，
+    // 扩展路径要读 SW 侧的 __dshBridgeSW.state()（CDP 连 service_worker target）。
     state () {
       const socket = linkOk ? 'open' : (linkReason ? 'closed' : 'connecting')
-      return `transport=sw socket=${socket} authed=${linkOk} token=${tokenSet ? '已配置' : '未配置'} vm=${typeof window.vm}`
+      const tok = linkVia === 'cdp' ? '不需要' : (tokenSet ? '已配置' : '未配置')
+      return `transport=${linkVia} socket=${socket} authed=${linkOk} token=${tok} vm=${typeof window.vm}`
         + (linkReason ? ` reason=${linkReason}` : '')
     },
-    linkState: () => ({ linkOk, tokenSet, linkReason })
+    linkState: () => ({ linkOk, tokenSet, linkReason, via: linkVia })
   }
-  console.info('[dsh-bridge] executor ready, vm =', typeof window.vm, '（socket 在扩展 SW，本页只做 vm 操作）')
+  console.info('[dsh-bridge] executor ready, vm =', typeof window.vm, '（本页只做 vm 操作，连接由扩展 SW 或 CDP 持有）')
   // 向 SW 报"执行器就绪"（SW 可能比本脚本晚/早，谁也说不准；20s 心跳里也会带 meta 兜底）
   relaySend('ready', { meta: pageMeta() })
 

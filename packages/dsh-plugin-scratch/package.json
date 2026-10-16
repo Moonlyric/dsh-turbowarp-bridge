@@ -12,6 +12,10 @@
   "engines": {
     "dsh": ">=0.1.2"
   },
+  "scripts": {
+    "test": "node test-tools.mjs && node test-skills.mjs && node test-bridge-auth.mjs",
+    "sync-executor": "node ../../lab/sync-executor.mjs"
+  },
   "dependencies": {
     "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
     "ws": "^8.0.0"

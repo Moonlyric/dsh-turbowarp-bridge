@@ -42,7 +42,7 @@ node test-bridge-auth.mjs    # 21 条断言（握手认证 + 跨会话伪造防�
 2. 拉起真浏览器（临时 profile），用 CDP 的 `Extensions.loadUnpacked` 装真扩展
 3. 打开扩展选项页，用 `chrome.storage.local` 写 token（等价于用户手填）
 4. 打开真 `https://turbowarp.org/editor`，等 MAIN world 执行器自报 `socket=open authed=true`
-5. **用真工具跑一遍全流程，17 个工具全覆盖**：
+5. **用真工具跑一遍全流程，19 个工具全覆盖**：
    open_editor（唤起 + 没有会话时给 token 步骤）→ list_sessions → snapshot →
    add_blocks（preview→apply）→ update_block → locate（滚动+高亮）→ delete_blocks →
    snapshot 查孤儿 → rollback → get_opcodes → tidy_blocks → add_costume →

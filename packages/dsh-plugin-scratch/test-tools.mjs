@@ -6,7 +6,8 @@
 // 用法：node test-tools.mjs
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, copyFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import net from 'node:net'
 
 const HOME = mkdtempSync(join(tmpdir(), 'dsh-tools-home-'))
@@ -90,15 +91,24 @@ err = await thrown(() => call('scratch_open_editor', { url: 'javascript:alert(1)
 t('javascript: 地址被拒', !!err && /只允许 http\/https/.test(err), String(err))
 t('被拒的地址没有传给桩（没有多出启动记录）', launches().filter(l => /calc\.exe|javascript/.test(l)).length === 0, JSON.stringify(launches()))
 
-// ==================== 4. Desktop 分支 ====================
-console.log('\n[4] app=desktop（本地 TurboWarp Desktop）')
+// ==================== 4. Desktop 分支（CDP 直连那条路） ====================
+// 桌面版现在**能被驱动**了：我们启动时给它带上 --remote-debugging-port，再用 CDP 把
+// 页面执行器注进去（TurboWarp Desktop 装不了浏览器扩展，所以扩展那条路对它无解）。
+// 这里用桩脚本冒充桌面版：桩不会起 CDP 端点，所以必然走到"接不上"的诚实分支。
+console.log('\n[4] app=desktop（本地 TurboWarp Desktop + CDP 直连）')
 r = await call('scratch_open_editor', { app: 'desktop', waitMs: 0 })
 await sleep(500)
 t('桌面版桩被启动了', launches().some(l => l.startsWith('desktop')), JSON.stringify(launches()))
-t('明确告诉 AI：桥驱动不了桌面版（不会假装连上）',
-  r.connected === false && r.bridgeCanDrive === false && /Electron/.test(r.why || ''),
-  JSON.stringify({ connected: r.connected, bridgeCanDrive: r.bridgeCanDrive, why: r.why }).slice(0, 240))
-t('桌面版分支不返回 setup（那条路本来就不需要 token）', r.setup === undefined, JSON.stringify(Object.keys(r)))
+t('启动时带了 --remote-debugging-port（CDP 直连的前提）',
+  launches().some(l => l.startsWith('desktop') && /--remote-debugging-port=\d+/.test(l)),
+  JSON.stringify(launches().filter(l => l.startsWith('desktop'))))
+t('启动本身没报错（launched.error 为空 —— .cmd 桩走的是 cmd.exe 那条路）',
+  !r.launched.error, String(r.launched.error || ''))
+t('接不上时不谎报连上，且说清是 CDP 的问题',
+  r.connected === false && typeof r.error === 'string' && /CDP/.test(r.error + (r.hint || '')),
+  JSON.stringify({ connected: r.connected, error: r.error }).slice(0, 240))
+t('桌面版分支不需要 token（那条路没有 token 这回事）', r.setup === undefined, JSON.stringify(Object.keys(r)))
+t('返回值里如实带上调试端口，方便排查', Number.isInteger(r.launched && r.launched.debugPort), JSON.stringify(r.launched))
 
 // ==================== 5. 桌面版：已在运行 / 找不到 两条分支 ====================
 // ⚠️ 这一节以前会**在用户桌面上真开一个 TurboWarp 窗口**：它故意不传 desktopPath 来测"自动定位"，
@@ -106,7 +116,7 @@ t('桌面版分支不返回 setup（那条路本来就不需要 token）', r.set
 //    现在改成两条都不会有副作用的路：
 //      a) desktopPath 指向**正在运行的进程**（node.exe 就是本测试自己）→ 验"已在运行不重复开"
 //      b) 把注册表探测隔离掉（PATH 前置一个假的 reg.exe）+ desktopPath 指向不存在的路径 → 验"找不到"
-console.log('\n[5] 桌面版：已在运行 → 不重复开')
+console.log('\n[5] 桌面版：已在运行 → 不重复开（它那份没有调试端口，接不进去）')
 const mod2 = await import('./index.js')
 const reg2 = new Map()
 const ctx2 = {
@@ -121,9 +131,10 @@ t('检测到已在运行 → alreadyRunning，且 launched.skipped 标出来了'
   r5.alreadyRunning === true && r5.launched && r5.launched.skipped === true,
   JSON.stringify(r5).slice(0, 260))
 t('已经在运行时进程数如实回报（>0）', r5.runningProcesses > 0, String(r5.runningProcesses))
-t('已经在运行时也不谎报「桥连上了」', r5.connected === false && r5.bridgeCanDrive === false,
-  JSON.stringify({ c: r5.connected, d: r5.bridgeCanDrive }))
-t('提示里保留了 desktop 分支的老实话（Electron 装不了扩展）', /Electron/.test(r5.hint || ''), String(r5.hint).slice(0, 140))
+t('已经在运行时也不谎报「连上了」', r5.connected === false, JSON.stringify({ c: r5.connected }))
+t('讲清楚为什么接不进去（没带调试端口）', /remote-debugging-port|调试端口/.test(r5.why || ''), String(r5.why).slice(0, 140))
+t('给出两个出路（重启接管 / 用网页版）', /force/.test(r5.hint || '') && /browser/.test(r5.hint || ''), String(r5.hint).slice(0, 200))
+t('⚠️ 接管会丢未保存改动这件事写进提示里了', /存盘/.test(r5.hint || ''), String(r5.hint).slice(0, 200))
 
 console.log('\n[6] 桌面版：找不到时给下载地址（隔离注册表探测，不碰真安装）')
 // 让 reg 这个命令解析到一个假 exe：装到非默认目录的机器上，注册表是唯一的线索来源，
@@ -305,6 +316,39 @@ const skOn = await reg2.get('scratch_skills').execute({ action: 'list' })
 t('没配 skillsEnabled 时默认是**开**（undefined 不该被当成 false）',
   Array.isArray(skOn.skills) && skOn.skills.length >= 8, JSON.stringify(skOn).slice(0, 200))
 t('skill 列表内容也是无损 JSON', badJson(skOn) === null, String(badJson(skOn)))
+
+// ==================== 9. CDP 直连的执行器副本不能漂移 ====================
+// CDP 那条路（TurboWarp Desktop）注进页面的就是 vm-executor.js，它是扩展的
+// content-main.js 的同步副本。两份一旦不一致，扩展和桌面版的行为就会分叉 ——
+// 而且这种漂移在真机上极难发现（两边都"能跑"，只是行为不同）。
+console.log('\n[9] vm-executor.js 与扩展的 content-main.js 逐字节一致')
+const extDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'tw-bridge-extension')
+const srcPath = join(extDir, 'content-main.js')
+const dstPath = join(dirname(fileURLToPath(import.meta.url)), 'vm-executor.js')
+const cdpSrc = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'cdp.js'), 'utf8')
+const srcBuf = readFileSync(srcPath)
+const dstBuf = readFileSync(dstPath)
+t('两份执行器逐字节一致（改完记得 node lab/sync-executor.mjs）',
+  srcBuf.equals(dstBuf), `${srcBuf.length}B vs ${dstBuf.length}B`)
+t('执行器里没有任何 chrome.* 依赖（否则 CDP 注入进桌面版会直接炸）',
+  // 只看代码，不看清注释（注释里提到 chrome.runtime 是在讲协议，不是依赖）
+  !/chrome\s*\.\s*(runtime|storage|tabs|scripting|alarms)/
+    .test(dstBuf.toString('utf8').split(/\r?\n/).map(l => l.replace(/\/\/.*$/, '')).join('\n')))
+t('执行器认的是 postMessage 那条协议（垫片就是照它写的）',
+  dstBuf.toString('utf8').includes('__dshBridgeRelay'))
+t('cdp.js 的垫片用 __dshCdpDeliver/__dshCdpSend 这两个名字',
+  cdpSrc.includes('__dshCdpDeliver') && cdpSrc.includes('__dshCdpSend'))
+t('垫片合成的事件带 source: window（执行器的监听会按这个过滤）', cdpSrc.includes('source: window'))
+// tagForPage：CDP 路径必须自己给 op 消息贴标签（扩展路径里这层是 relay/SW 干的）。
+// 少了它：ping/pong 正常、页面自报 authed=true，但**每个 op 都超时**（真机踩过）。
+const { tagForPage } = await import('./cdp.js')
+const tagged = JSON.parse(tagForPage(JSON.stringify({ id: 'r7', op: 'snapshot', args: { target: 'a' } })))
+t('tagForPage 给 op 消息贴上 __dshBridgeRelay=op', tagged.__dshBridgeRelay === 'op', JSON.stringify(tagged).slice(0, 120))
+t('贴标签时不动 id/op/args（路由靠它）',
+  tagged.id === 'r7' && tagged.op === 'snapshot' && tagged.args.target === 'a', JSON.stringify(tagged))
+t('已经带标签的消息不会被贴第二层', JSON.parse(tagForPage(JSON.stringify({ __dshBridgeRelay: 'ping' }))).__dshBridgeRelay === 'ping')
+t('{type:"pong"} 这类控制消息原样透传（页面本来就会忽略未知标签）',
+  tagForPage('{"type":"pong"}') === '{"type":"pong"}')
 
 console.log(`\n===== 插件工具单测: ${pass} pass / ${fail} fail =====`)
 try { rmSync(STUB_DIR, { recursive: true, force: true }); rmSync(HOME, { recursive: true, force: true }) } catch {}

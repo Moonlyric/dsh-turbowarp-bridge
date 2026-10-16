@@ -203,8 +203,17 @@ async function main() {
   t('state() 写明 transport=sw（谁持有 socket 一眼可辨）', /transport=sw/.test(state()), state())
   t('state() 报出 token 已配置（SW 手里有 token）', /token=已配置/.test(state()), state())
   t('linkState() 暴露原始字段供诊断', JSON.stringify(sandbox.window.__dshBridge.linkState()) ===
-    JSON.stringify({ linkOk: true, tokenSet: true, linkReason: '' }),
+    JSON.stringify({ linkOk: true, tokenSet: true, linkReason: '', via: 'sw' }),
     JSON.stringify(sandbox.window.__dshBridge.linkState()))
+  // via 字段是给 CDP 那条路用的（插件直连时页面必须自报 transport=cdp，不能一直自称 sw）
+  swSend({ __dshBridgeRelay: 'link', ok: true, tokenSet: true, via: 'cdp' })
+  await new Promise(r => setTimeout(r, 30))
+  t('link 带 via=cdp 时自报状态切成 transport=cdp（CDP 路径的诚实性）',
+    /transport=cdp/.test(state()) && /token=不需要/.test(state()), state())
+  swSend({ __dshBridgeRelay: 'link', ok: true, tokenSet: true, via: 'sw' })
+  await new Promise(r => setTimeout(r, 30))
+  t('切回 via=sw 后自报又变回扩展那条（两条路不会互相污染）',
+    /transport=sw/.test(state()) && /token=已配置/.test(state()), state())
 
   swSend({ __dshBridgeRelay: 'link', ok: false, tokenSet: false, reason: '认证失败：token 不对或没填' })
   await new Promise(r => setTimeout(r, 30))

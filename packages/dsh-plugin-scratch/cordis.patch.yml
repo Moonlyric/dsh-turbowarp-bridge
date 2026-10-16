@@ -22,5 +22,10 @@
         # 唤起编辑器（scratch_open_editor）用哪个浏览器；留空 = 系统默认浏览器
         # browserPath: C:\Program Files\Google\Chrome\Application\chrome.exe
         # 本地 TurboWarp Desktop 的 exe；留空 = 自动找（常见目录 + 注册表卸载项）
-        # 注意：桌面版装不了浏览器扩展，桥驱动不了它，配了也只是能帮用户把软件打开
+        # 桌面版走 **CDP 直连**（启动时带 --remote-debugging-port，把页面执行器注进默认上下文）：
+        # 它装不了 Chrome 扩展，但照样能被 AI 读写积木 —— 零安装、零 token。
         # desktopPath: G:\09 Eutopia\scr\TurboWarp\TurboWarp.exe
+        # 「可接管」固定调试端口：app=desktop 会先探这个端口，有实例就直接接管（不新开窗口）。
+        # 用仓库根目录的「启动TurboWarp(AI可接管).cmd」启动桌面版就是走这个端口。
+        # 改这里的话记得同步改那个 .cmd。
+        # desktopDebugPort: 31821

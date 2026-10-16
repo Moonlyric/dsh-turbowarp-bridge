@@ -1,17 +1,32 @@
-# dsh-plugin-scratch — TurboWarp 桥插件（v0.3.0 · M2 + Skill 区）
+# dsh-plugin-scratch — TurboWarp 桥插件（v0.3.0 · M2 + Skill 区 + CDP 直连）
 
 DSH（DeepSeek Harness）插件：把 TurboWarp 编辑器接入 agent。
 AI 通过 `scratch_*` 工具读取/修改 Scratch 项目，用户在 TurboWarp 界面里**实时**看到变化。
 
-架构：
+架构（两条传输路径，读写的是**同一份**页面执行器）：
 
 ```
-本插件（Node）= WebSocket 服务端（桥 :31820） + 16 个 scratch_* 工具 + Skill 经验库
-        ↕ JSON-RPC over ws
-浏览器扩展 tw-bridge-extension = 桥客户端 + turbowarp.org 页面 MAIN world 里的 window.vm 执行器
+本插件（Node）= WebSocket 服务端（桥 :31820） + CDP 直连客户端 + 19 个 scratch_* 工具 + Skill 经验库
+
+  路一 · 扩展桥
+        ↕ JSON-RPC over ws（握手 token）
+  浏览器扩展 tw-bridge-extension = 桥客户端 + turbowarp.org 页面 MAIN world 里的 window.vm 执行器
         ↕ window.vm
-TurboWarp 编辑器（用户实时看到一切）
+  TurboWarp 编辑器（用户实时看到一切）
+
+  路二 · CDP 直连（TurboWarp Desktop，零安装、零 token）
+        ↕ Chrome DevTools Protocol（启动时给进程带 --remote-debugging-port）
+  TurboWarp Desktop 的编辑器页面：同一份执行器注进**默认执行上下文**
+        ↕ window.vm
 ```
+
+| 路径 | 要求 | 页面自报 | 会话 id | 工具返回值里的 `transport` |
+|---|---|---|---|---|
+| 扩展桥 | 装 MV3 扩展 + 选项页填 token | `transport=sw` | `tw-1` | `extension-bridge` |
+| CDP 直连 | 只要 TurboWarp Desktop，**零安装、零 token** | `transport=cdp` | `cd-1` | `cdp-desktop` |
+
+> 为什么桌面版必须走 CDP：TurboWarp Desktop 是 Electron 应用，**装不了 Chrome 扩展**
+> （它只有自己的 userscript addon 系统），扩展那条路对它根本无解。
 
 ## 装到 dsh（DSH Desktop）
 
@@ -53,12 +68,17 @@ DSH Desktop 内部固定用自己的单个 `--patch`，所以用户侧没有 `--
 不方便翻文件时的正经拿法：让 AI 调一次 `scratch_list_sessions`——**没有会话时它会返回
 `setup.token` 和三步连接指引**，AI 会直接念给你。
 
-## 工具清单（17 个）
+> **只有浏览器（扩展桥）那条路要 token。** 桌面版走 CDP 直连：不用扩展、不用 token，
+> 因为它连的是"我们自己拉起来、自己注执行器"的进程，没有"本机任意页面都能连进来"这个问题。
+
+## 工具清单（19 个）
 
 | 工具 | 方向 | 说明 |
 |---|---|---|
 | `scratch_list_sessions` | 读 | 已连接的 TW 编辑器标签页；无会话时返回 token + 配置步骤 |
-| `scratch_open_editor` | 启动 | **主动帮用户打开编辑器**（浏览器 / 本地桌面版），并等会话连上 |
+| `scratch_open_editor` | 启动 | **主动帮用户打开编辑器**（浏览器 / 本地桌面版两条路），可顺手把 `.sb3` 装进去 |
+| `scratch_load_project` | 写 | 打开本机 `.sb3` / `.sb2` / `project.json`（先自动快照） |
+| `scratch_save_project` | 写 | 存成 `.sb3`（默认**不覆盖**已有文件，另存 `-ai-时间戳`） |
 | `scratch_snapshot` | 读 | 项目全量 sb3 JSON（真 project.json，不是 `saveProjectSb3DontZip` 的文件映射） |
 | `scratch_read_script` | 读 | 单精灵块 JSON（省 token） |
 | `scratch_add_blocks` | 写 | 注入块：sb3 dict 进 → 自动转活块形态、ID 换新、扩展自动加载、返回 `idMap` |
@@ -79,19 +99,41 @@ DSH Desktop 内部固定用自己的单个 `--patch`，所以用户侧没有 `--
 
 用户说「打开 TurboWarp」时，AI 不该只会说"请你自己去开"。这个工具：
 
+- **`path`（新参数）**：传 `.sb3` / `.sb2` / `project.json` 的绝对路径，就顺手把作品装进去
+  （等于用户手动拖文件进去）。**已经有会话时不重复开窗口**，直接把文件装进现有会话，
+  返回值里给 `loaded`。
 - `app=browser`（默认）：用**默认浏览器**打开 `turbowarp.org/editor`（也可传 `url` 打开指定作品），
-  然后在 `waitMs`（默认 20s）内等桥连上，返回 `connected` 结论。
+  然后在 `waitMs`（默认 20000，上限 60000）内等会话连上，返回 `connected`。
+  **这一条行为不变**——走的就是原来的扩展那条路。
   没连上时会把 token + 三步配置指引一起返回——AI 直接念给用户，用户填完**不用刷新**就会自己连上。
-- `app=desktop`：启动本地 TurboWarp Desktop。
-  **已经在运行就不会重复开**（用 `tasklist`/`pgrep` 数进程，重复调只会返回 `alreadyRunning`；
-  桌面版没有单实例锁，以前重复调会满屏窗口）——想强制再开传 `force: true`。
-  ⚠️ **桌面版装不了浏览器扩展**（实测它的 app.asar 里没有任何 `session.loadExtension`，
-  只有自己的 userscript addon 系统），所以**桥驱动不了它**——返回值里 `bridgeCanDrive: false`
-  会明说，不会假装连上。桌面版要接 AI，得等 userscript 版桥（M3）。
+- `app=desktop`（**CDP 直连**，零安装、零 token）：启动本地 TurboWarp Desktop 并给它带一个空闲的
+  `--remote-debugging-port`，再用 CDP 把同一份执行器注进编辑器页面的**默认执行上下文**
+  （隔离上下文里没有 `window.vm`）。
+  - 接上后**等编辑器里真有角色了才回报 `ready: true`**：桌面版冷启动是"GUI 先出来、项目后加载"，
+    刚接上时 `targets` 可能是空的，直接回报就绪会害 AI 往不存在的角色里塞积木。
+  - 返回值给 `ready` / `targets` / `editingTarget` / `target`（`tw-editor://…`）/ `launched.debugPort`。
+  - **会先探固定调试端口**（默认 `31821`，配置项 `desktopDebugPort` 可改）：端口上有 CDP 端点就直接
+    **接管那个现成的窗口**，不再新开一个。这就是「我开着作品，AI 帮我改」的正路 ——
+    让用户用仓库根的 `启动TurboWarp(AI可接管).cmd` 开桌面版（它和双击原版的唯一区别就是多了
+    `--remote-debugging-port=31821`），接管时返回值里 `launched.attached === true`、
+    `launched.via === 'existing-debug-port'`、**没有 `pid` 字段**（不是它启动的），
+    hint 会说明"没动他的窗口"。
+- ⚠️ `app=desktop` 且桌面版**已经在运行、又没带调试端口**时（直接双击原版开的）接不进去
+  （运行中的进程没法补启动参数）：如实返回 `alreadyRunning: true` 并说明原因，**三个办法**：
+  1) 让用户**先存盘**、关掉桌面版，再调一次这个工具（它启动时会带调试端口）；
+  2) 让用户以后改用仓库里的 `启动TurboWarp(AI可接管).cmd` 启动 —— 他自己开的窗口也能被接管；
+  3) 传 `force: true` 让我接管 —— **会先关掉现有窗口，未保存的改动会丢**，务必先让用户存盘。
+  不想动它就改用 `app: "browser"`。
+- 桌面版已经在运行时也不会重复开：**先探固定端口**（能接管就接管），探不到才数进程
+  （`tasklist`/`pgrep`）并返回 `alreadyRunning`——桌面版没有单实例锁，以前重复调会满屏窗口。
 - 已经连着会话时直接返回 `alreadyConnected`，不会重复开标签页（想强制再开传 `force: true`）。
 - 只接受 `http/https` 地址（防止被诱导去 `file://` 拉起本地程序）。
 - 找桌面版：`config.desktopPath` → `$TURBOWARP_DESKTOP` → 常见安装目录 → **注册表卸载项**
   （装到自定义盘符时只有这条路认得出）。
+
+> 桌面版是 Electron 应用、**装不了 Chrome 扩展**（它只有自己的 userscript addon 系统），
+> 所以 desktop 这条路根本不走扩展 —— 它靠 CDP 把执行器注进页面，用户零安装、零 token。
+> `project_meta` 现在也多返回一个 `editingTarget`（AI 写积木前得知道光标在哪个角色上）。
 
 配置（`cordis.patch.yml` 的 `config`）：
 
@@ -99,6 +141,7 @@ DSH Desktop 内部固定用自己的单个 `--patch`，所以用户侧没有 `--
 |---|---|
 | `browserPath` | 指定用哪个浏览器打开（不填=系统默认；Windows 下也接受 `.cmd`/`.bat` 包装脚本） |
 | `desktopPath` | 指定 TurboWarp Desktop 的 exe 路径（不填=自动找） |
+| `desktopDebugPort` | `app=desktop` 时先探的固定调试端口（默认 `31821`）。端口上有 CDP 端点就**接管**那个窗口；改端口时记得同步改 `启动TurboWarp(AI可接管).cmd` |
 
 ## 安全三档（`cordis.patch.yml` 的 `safety`）
 
@@ -128,23 +171,28 @@ DSH Desktop 内部固定用自己的单个 `--patch`，所以用户侧没有 `--
 
 ## 文件
 
-- `index.js` — 入口：桥 + 握手 + 19 工具 + 快照持久化 + skill 区
+- `index.js` — 入口：桥 + 握手 + 19 工具 + 快照持久化 + skill 区 + 桌面版启动
+- `cdp.js` — **CDP 直连**：给桌面版带调试端口启动、注入执行器、`tagForPage()` 贴协议标签
+- `vm-executor.js` — 扩展 `content-main.js` 的**逐字节副本**（CDP 注的就是它；
+  改完扩展执行器跑 `node ../lab/sync-executor.mjs` 同步，`test-tools.mjs` 有一致性断言守着）
 - `skills/` — 内置 8 篇经验 + `INDEX.md`
 - `cordis.patch.yml` — dsh 插件层（`name` 三种写法见注释）
 - `test-skills.mjs` — skill 区单测（23 断言）
 - `test-bridge-auth.mjs` — 桥的握手认证与应答来源校验（21 断言，别删）
 - `test-tools.mjs` — 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 /
-  桥端口被占自愈 / 返回值无损 JSON，36 断言）
+  CDP 桌面分支的启动参数与诚实报错 / `tagForPage` 四连 / 执行器副本一致性 / 桥端口被占自愈 /
+  返回值无损 JSON，50 断言）
 
-## 测试状态（2026-10-17）
+## 测试状态（2026-10-17 本轮实测，VPN 全程关闭）
 
 | 套件 | 结果 |
 |---|---|
 | `test-skills.mjs` | 23/23 ✅ |
 | `test-bridge-auth.mjs` | 21/21 ✅ |
-| `test-tools.mjs` | 36/36 ✅ |
+| `test-tools.mjs` | 50/50 ✅ |
 | `../lab/test-content-ops.js` | 112/112 ✅ |
-| `../lab/real-machine-check.mjs`（真 Chrome + 真 turbowarp.org） | 122/122 ✅ |
+| `../lab/real-machine-check.mjs`（真 Chrome / Edge + 真 turbowarp.org；不传 `SB3_FIXTURE`） | 115/115 ✅（Chrome、Edge 各一遍） |
+| `../lab/desktop-cdp-check.mjs`（TurboWarp Desktop + CDP；真开一个窗口、跑完自动关） | 54/54 ✅ |
 
 真机那一轮跑的是完整闭环，**19 个工具全覆盖**：唤起编辑器（含"没有会话时给 token 步骤"这条路）
 → 装扩展 → 填 token → 打开 turbowarp.org/editor → 握手认证 → list_sessions → snapshot
@@ -152,6 +200,12 @@ DSH Desktop 内部固定用自己的单个 `--patch`，所以用户侧没有 `--
 → delete_blocks → 再快照查孤儿 → rollback → get_opcodes → tidy_blocks → add_costume
 → watch（真定时器轮询）→ user_context（真鼠标点块 + 绿旗）→ save_project（落盘 .sb3）
 → load_project（打开真实作品，14.6MB）→ 大项目往返 + 回滚 → 空闲 45s 连接不许断。
+
+桌面版那一轮走的是 CDP（`../lab/desktop-cdp-check.mjs`，54 条）：启动桌面版 → 注入执行器 →
+用**另一条独立 CDP 连接**直接读 `vm.runtime.targets[].blocks._blocks` 当证据（不读插件自己的返回值）
+→ 存盘 → 从磁盘装回来验往返 → **接管用户自己开的实例**（验接管的是那个实例、没新开窗口、
+没重复注册会话、收尾关干净）→ 关掉桌面版后会话必须自动掉线（不留僵尸会话）。
+检测到用户已经开着 TurboWarp 时会 SKIP，不打扰。
 
 ⛔ **跑真机层之前先关 VPN**：开着时 turbowarp.org 会被解析成 fake-IP（私网段），
 Chrome 会认为"本页也是本地"从而绕过 Local Network Access 检查 —— 那样跑出来的绿是**假绿**

@@ -13,6 +13,8 @@ import { randomBytes } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { spawn, execFileSync } from 'node:child_process'
 import { basename } from 'node:path'
+// CDP 直连（不需要浏览器扩展）—— 见 cdp.js 顶部注释。TurboWarp Desktop 走的就是这条路。
+import { attachCdp, findFreePort, tagForPage, probeCdp } from './cdp.js'
 
 export const name = 'dsh-plugin-scratch'
 export const inject = ['tools'] // dsh 规范：用到 ctx.tools 必须声明，框架保证注入后才加载
@@ -78,6 +80,7 @@ export function apply(ctx, config) {
   // 伪造 {id, ok:true} 的应答、还能往 watch/event 帧里塞文本 —— 而后者会进
   // scratch_watch / scratch_user_context 的返回值，等于一条写进 agent 上下文的注入通道。
   const sessions = new Map() // sessionId -> { socket, meta, watchEvents, userEvents }
+  const cdpHandles = new Map() // sessionId -> CDP 句柄（只有 CDP 直连会话有；卸载时要关掉）
   const pending = new Map() // 请求 id -> { resolve, reject, timer, sessionId }
   const MAX_EVENTS = 500 // 每个会话的 watch/event 队列上限（页面一直开着也不会无限涨）
   let reqSeq = 0
@@ -199,52 +202,73 @@ export function apply(ctx, config) {
           return
         }
 
-        const s = sessions.get(id)
-        if (!s) return
-        // 扩展的 WebSocket 在 MV3 service worker 里，SW 空闲 ~30s 就会被回收、socket 跟着死。
-        // Chrome 116+ 把 WebSocket 的收发算作 SW 的活动，所以这个 pong 是**必须回**的：
-        // 不回 = 放任对面掉线。对接方每 20s ping 一次。
-        if (msg.type === 'ping') { try { socket.send('{"type":"pong"}') } catch {} ; return }
-        if (msg.type === 'watch') {
-          // M2 观察者：扩展侧轮询到的变量变化帧，存队列等 scratch_watch 拉
-          s.watchEvents.push(...(msg.changes || []).map(c => Object.assign({ at: msg.at, target: msg.target }, c)))
-          if (s.watchEvents.length > MAX_EVENTS) s.watchEvents.splice(0, s.watchEvents.length - MAX_EVENTS)
-        } else if (msg.type === 'event') {
-          // M2 双向联动：绿旗等运行事件
-          s.userEvents.push(msg)
-          if (s.userEvents.length > MAX_EVENTS) s.userEvents.splice(0, s.userEvents.length - MAX_EVENTS)
-        } else if (msg.type === 'hello') {
-          s.meta = msg.meta || s.meta // 允许重发 hello 更新 meta
-        } else if (msg.id && pending.has(msg.id)) {
-          const p = pending.get(msg.id)
-          // 关键：应答必须来自该请求发往的那个会话，否则就是串答/伪造
-          if (p.sessionId !== id) {
-            log.warn('忽略来自 %s 的跨会话应答 %s（该请求发往 %s）', id, msg.id, p.sessionId)
-            return
-          }
-          pending.delete(msg.id)
-          clearTimeout(p.timer)
-          msg.ok ? p.resolve(msg.result) : p.reject(new Error(msg.error || 'bridge error'))
-        }
+        dispatchClientMessage(id, msg)
       })
       socket.on('close', () => {
         clearTimeout(authTimer)
-        if (!sessions.has(id)) return
-        sessions.delete(id)
-        // 掉线时立刻把这会话的挂起请求全部拒掉，别让调用方干等 15s 超时
-        for (const [reqId, p] of pending) {
-          if (p.sessionId === id) {
-            clearTimeout(p.timer)
-            pending.delete(reqId)
-            p.reject(new Error(`会话 ${id} 已断开（请求 ${reqId} 未完成）`))
-          }
-        }
-        log.info('编辑器断开: %s', id)
+        dropSession(id, '扩展断开')
       })
       socket.on('error', () => {})
       })
     }
     listen()
+  }
+
+  // ---------------- 会话消息分发（扩展的 WS 与 CDP 直连共用同一条路） ----------------
+  // 抽出来的原因：CDP 会话（TurboWarp Desktop 等）走的是同一套协议，只是"运输层"
+  // 从 WebSocket 换成了 DevTools binding。工具层不需要知道区别。
+  function dispatchClientMessage(id, msg) {
+    const s = sessions.get(id)
+    if (!s) return
+    // 扩展的 WebSocket 在 MV3 service worker 里，SW 空闲 ~30s 就会被回收、socket 跟着死。
+    // Chrome 116+ 把 WebSocket 的收发算作 SW 的活动，所以这个 pong 是**必须回**的：
+    // 不回 = 放任对面掉线。对接方每 20s ping 一次。
+    if (msg.type === 'ping') { try { s.socket.send('{"type":"pong"}') } catch {} ; return }
+    if (msg.type === 'watch') {
+      // M2 观察者：页面侧轮询到的变量变化帧，存队列等 scratch_watch 拉
+      s.watchEvents.push(...(msg.changes || []).map(c => Object.assign({ at: msg.at, target: msg.target }, c)))
+      if (s.watchEvents.length > MAX_EVENTS) s.watchEvents.splice(0, s.watchEvents.length - MAX_EVENTS)
+      return
+    }
+    if (msg.type === 'event') {
+      // M2 双向联动：绿旗等运行事件
+      s.userEvents.push(msg)
+      if (s.userEvents.length > MAX_EVENTS) s.userEvents.splice(0, s.userEvents.length - MAX_EVENTS)
+      return
+    }
+    if (msg.type === 'hello' || msg.type === 'ready' || msg.type === 'pong') {
+      // 允许重发 meta（页面刷新/换标签页后 meta 会变）
+      if (msg.meta) s.meta = msg.meta
+      return
+    }
+    if (msg.id && pending.has(msg.id)) {
+      const p = pending.get(msg.id)
+      // 关键：应答必须来自该请求发往的那个会话，否则就是串答/伪造
+      if (p.sessionId !== id) {
+        log.warn('忽略来自 %s 的跨会话应答 %s（该请求发往 %s）', id, msg.id, p.sessionId)
+        return
+      }
+      pending.delete(msg.id)
+      clearTimeout(p.timer)
+      msg.ok ? p.resolve(msg.result) : p.reject(new Error(msg.error || 'bridge error'))
+    }
+  }
+
+  /** 会话下线：挂起请求全部拒掉，别让调用方干等超时 */
+  function dropSession(id, why = '断开') {
+    const s = sessions.get(id)
+    if (!s) return
+    sessions.delete(id)
+    if (s.pingTimer) clearInterval(s.pingTimer)
+    if (s.cdp) { try { s.cdp.close() } catch {} ; cdpHandles.delete(id) }
+    for (const [reqId, p] of pending) {
+      if (p.sessionId === id) {
+        clearTimeout(p.timer)
+        pending.delete(reqId)
+        p.reject(new Error(`会话 ${id} 已断开（请求 ${reqId} 未完成）`))
+      }
+    }
+    log.info('编辑器断开: %s（%s）', id, why)
   }
 
   // 操作超时按 op 分档。默认 15s 是「改几个块」的量级，但**整项目级**的操作远超它：
@@ -442,14 +466,19 @@ export function apply(ctx, config) {
 
   // ---------------- 主动唤起编辑器 ----------------
   // 用户说「打开 TurboWarp」时，AI 不该只会说"请你自己去开"。这里给两条路：
-  //   browser（默认）→ 打开 turbowarp.org/editor。桥只驱动得了这一种。
-  //   desktop        → 起本地 TurboWarp Desktop（Electron）。
+  //   browser（默认）→ 打开 turbowarp.org/editor，走**浏览器扩展**那条路（用户要装扩展 + 填 token）。
+  //   desktop        → 起本地 TurboWarp Desktop（Electron），走 **CDP 直连**那条路（零安装、零 token）。
   // ⚠️ Desktop 装不了浏览器扩展（它只有自己的 userscript addon 系统，实测 app.asar 里
-  //    没有任何 session.loadExtension 调用），所以**桥连不上 Desktop**。那条路只用于
-  //    "帮用户把软件打开自己玩"，返回值里必须说清楚，免得 AI 以为连上了。
+  //    没有任何 session.loadExtension 调用），所以扩展那条路对它无解；但它接受
+  //    --remote-debugging-port，默认执行上下文里就有 window.vm，于是 cdp.js 能把同一份页面
+  //    执行器注进去直接驱动它（2026-10-17 真机打通：lab/desktop-cdp-check.mjs 54/54）。
   const sleep = (ms) => new Promise(r => setTimeout(r, ms))
   const EDITOR_URL = 'https://turbowarp.org/editor'
   const DESKTOP_DOWNLOAD = 'https://desktop.turbowarp.org/'
+  // 桌面版的「可接管」固定调试端口：仓库里的 `启动TurboWarp(AI可接管).cmd` 用这个端口启动，
+  // 插件每次 app=desktop 都会先探它 —— 于是**用户自己开的窗口**也能被 AI 接管（不用 AI 再开一个）。
+  // 想换端口：插件配置 desktopDebugPort。
+  const DESKTOP_DEBUG_PORT = 31821
 
   /** 找本地 TurboWarp Desktop：配置 > 环境变量 > 注册表卸载项 > 常见路径 */
   function findDesktopApp() {
@@ -522,10 +551,135 @@ export function apply(ctx, config) {
       token: bridgeToken,
       tokenFile: bridgeTokenFile,
       tokenIsNew: bridgeTokenIsNew || undefined,
-      step1: 'Chrome 打开 chrome://extensions → 开发者模式 → 加载已解压的扩展程序 → 选 packages/tw-bridge-extension',
+      step1: '（只用 app=browser 这条路才需要）Chrome/Edge 打开 chrome://extensions → 开发者模式 → 加载已解压的扩展程序 → 选 packages/tw-bridge-extension',
       step2: `点扩展的「详情 → 扩展程序选项」，把 token 粘进去保存：${bridgeToken}`,
       step3: '打开 https://turbowarp.org/editor ，F12 应看到 [dsh-bridge] connected & authenticated',
+      // 零安装的那条路：本机有 TurboWarp Desktop 就用它，不需要扩展也不需要 token
+      easierAlternative: '不想装扩展就用 scratch_open_editor({ app: "desktop" })：启动本机 TurboWarp Desktop 并走 CDP 直连（零安装、零 token），AI 一样能读写积木；'
+        + '用户想自己开窗口也行 —— 用仓库里的「启动TurboWarp(AI可接管).cmd」启动，我照样能接管他开的那份',
       recentRejected: rejectedConnections.length ? rejectedConnections : undefined
+    }
+  }
+
+  // ---------------- CDP 直连：不需要扩展的第二种会话 ----------------
+  // 执行器源码 = 扩展用的那份 content-main.js 的同步副本（lab/sync-executor.mjs 保证一致，
+  // test-tools.mjs 有逐字节断言）。CDP 会话把它注进编辑器进程的默认上下文即可。
+  const executorPath = join(dirname(fileURLToPath(import.meta.url)), 'vm-executor.js')
+  let executorSource = ''
+  try {
+    executorSource = readFileSync(executorPath, 'utf8')
+  } catch (e) {
+    log.warn('vm-executor.js 读不到，CDP 直连（桌面版那条路）不可用：%s', e.message)
+  }
+
+  /**
+   * 把一个已连上的 CDP 端点注册成**普通会话**：19 个工具全都照常工作，无需改工具层。
+   * 会话的 socket 接口只需要一个 send(text) —— 正好对上 call() 的用法。
+   */
+  async function registerCdpSession(handle, meta, { waitPongMs = 4000 } = {}) {
+    const id = 'cd-' + (++sessionSeq)
+    const session = {
+      // 复用 call() 的发送接口。tagForPage 补的是"扩展路径里 relay/SW 那层"干的活：
+      // 给 op 消息贴 __dshBridgeRelay 标签（少了它页面执行器不认，op 会全部超时）。
+      socket: { send: (text) => handle.deliver(tagForPage(text)) },
+      meta: Object.assign({ transport: 'cdp', kind: 'desktop' }, meta),
+      watchEvents: [], userEvents: [], cdp: handle
+    }
+    sessions.set(id, session)
+    cdpHandles.set(id, handle)
+    const push = (obj) => { try { handle.deliver(JSON.stringify(obj)) } catch { /* 断线由 close 事件兜 */ } }
+    // 页面执行器要知道"可以往外推帧了"（扩展路径里这条由 SW 发；这里由我们发）
+    // via:'cdp' 让页面自报状态时说清"谁在跟我说话"（否则它会一直自称 transport=sw）
+    push({ __dshBridgeRelay: 'link', ok: true, tokenSet: true, via: 'cdp' })
+    // 心跳：既是保活，也是"页面还活着吗"的探针（页面收到 ping 必回 pong）
+    session.pingTimer = setInterval(() => push({ __dshBridgeRelay: 'ping' }), 20000)
+    if (session.pingTimer.unref) session.pingTimer.unref()
+    push({ __dshBridgeRelay: 'ping' })
+    const deadline = Date.now() + waitPongMs
+    while (Date.now() < deadline && !(handle.raw && handle.raw.pongs > 0)) await sleep(100)
+    session.pageResponded = !!(handle.raw && handle.raw.pongs > 0)
+    log.info('CDP 会话已注册: %s（%s，页面应答=%s）', id, handle.target && handle.target.url, session.pageResponded)
+    return id
+  }
+
+  // 插件卸载/热替换时把 CDP 通道关掉（编辑器进程本身不动 —— 那是用户的窗口）
+  ctx.effect(() => () => {
+    for (const [, h] of cdpHandles) { try { h.close() } catch {} }
+    cdpHandles.clear()
+  })
+
+  /**
+   * 连上一个 CDP 端点 → 注册成会话 → 等编辑器就绪 →（可选）装入作品 → 组装返回值。
+   * 「AI 自己开的桌面版」和「用户自己开的可接管实例」两条路共用这一段。
+   */
+  async function cdpAttachAndReport({ port, launched, wantPath, waitMs = 20000 }) {
+    // 等 CDP 的时间用 waitMs 兜住（桌面版冷启动实测 2-6s；waitMs=0 表示"别等"，
+    // 但还是给 3s —— 完全不试就下结论没有意义）
+    const cdpTimeoutMs = waitMs === 0 ? 3000 : Math.max(waitMs, 5000)
+    let sid = null
+    let handle = null
+    try {
+      handle = await attachCdp({
+        port,
+        executorSource,
+        timeoutMs: cdpTimeoutMs,
+        log: (m) => log.info('CDP: %s', m),
+        onMessage: (msg) => { if (sid) dispatchClientMessage(sid, msg) },
+        onClose: () => { if (sid) dropSession(sid, 'CDP 通道关闭（桌面版被关了？）') }
+      })
+      sid = await registerCdpSession(handle, {
+        app: 'TurboWarp Desktop',
+        url: handle.target && handle.target.url,
+        debugPort: port
+      })
+      const sess = sessions.get(sid)
+      // ⚠️ 桌面版冷启动是"GUI 先出来、项目后加载"：刚接上时 vm 里可能**一个角色都没有**。
+      //    这时候回报"就绪"会误导 AI 往不存在的角色里塞积木（真机踩过）。所以等 vm 里
+      //    真有角色了再回报 ready（上限也用 waitMs 兜住）。
+      let meta = null
+      const readyDeadline = Date.now() + Math.max(cdpTimeoutMs, 8000)
+      while (Date.now() < readyDeadline) {
+        meta = await call(sid, 'project_meta').catch((e) => ({ error: e.message }))
+        if (meta && Array.isArray(meta.targets) && meta.targets.length) break
+        await sleep(500)
+      }
+      const ready = !!(meta && Array.isArray(meta.targets) && meta.targets.length)
+      const out = {
+        launched,
+        connected: true,
+        transport: 'cdp-desktop', // 零安装那套：没有扩展、没有 token
+        sessionId: sid,
+        pageResponded: !!(sess && sess.pageResponded),
+        ready,
+        targets: meta && meta.targets,
+        editingTarget: meta && (meta.editingTarget || meta.target),
+        target: handle.target && handle.target.url,
+        meta,
+        path: wantPath || undefined
+      }
+      if (wantPath) {
+        try { out.loaded = await loadFileIntoSess(sid, wantPath) } catch (e) { out.loadError = e.message }
+      }
+      out.hint = ready
+        ? (launched.attached
+            ? '已经接上**用户自己开的**那份桌面版（CDP 直连，没动他的窗口）：可以直接 scratch_snapshot / scratch_read_script / scratch_add_blocks 干活。'
+            : '桌面版已经接上了（CDP 直连）：可以直接 scratch_snapshot / scratch_read_script / scratch_add_blocks 干活，')
+          + '改完用 scratch_save_project 存盘（默认不覆盖原文件）。'
+        : '桌面版接上了，但编辑器里**还没有项目/角色**（冷启动时 GUI 先出来、项目后加载）。'
+          + '等一下再调 scratch_list_sessions 看，或者让用户在桌面版里新建一个作品。'
+      return out
+    } catch (e) {
+      // 接不上就把 CDP 通道关掉，别留一条半死的连接（桌面版窗口本身不动，那是用户的窗口）
+      if (handle) { try { handle.close() } catch {} }
+      return {
+        launched,
+        connected: false,
+        error: e.message,
+        hint: (launched.attached
+          ? '那个端口上确实有个 CDP 端点，但接不上（可能不是 TurboWarp 的编辑器页）。'
+          : '桌面版启动了但 CDP 没接上（可能刚启动就退出 / 调试端口没起来）。')
+          + '可以再试一次，或改用 app=browser（浏览器扩展那条路）。'
+      }
     }
   }
 
@@ -556,86 +710,155 @@ export function apply(ctx, config) {
     }
   }))
 
+  /** 把一个本机作品文件装进指定会话（scratch_open_editor(path) 与 scratch_load_project 共用） */
+  async function loadFileIntoSess(sid, filePath) {
+    const p = resolve(String(filePath))
+    if (!existsSync(p)) throw new Error(`文件不存在：${p}`)
+    const st = statSync(p)
+    if (!st.isFile()) throw new Error(`不是文件：${p}`)
+    const MAX_MB = 200
+    if (st.size > MAX_MB * 1024 * 1024) throw new Error(`文件太大（${(st.size / 1048576).toFixed(1)}MB > ${MAX_MB}MB），浏览器端解压会卡死`)
+    const buf = readFileSync(p)
+    const head = buf.subarray(0, 1).toString('utf8')
+    const isJson = /\.json$/i.test(p) || head === '{'
+    // 先快照：开文件是破坏性操作（顶掉当前项目），后悔药必须有
+    const snap = await takeSnapshot(sid, 'pre-load_project')
+    let r
+    if (isJson) {
+      let parsed
+      try { parsed = JSON.parse(buf.toString('utf8')) } catch (e) { throw new Error(`project.json 解析失败：${e.message}`) }
+      r = await call(sid, 'load_project', { projectJson: parsed, filename: basename(p) }, 60000)
+    } else {
+      r = await call(sid, 'load_project', { sb3Base64: buf.toString('base64'), filename: basename(p) }, 120000)
+    }
+    return Object.assign({
+      loadedFrom: p,
+      bytes: st.size,
+      format: isJson ? 'json' : 'sb3',
+      snapshotAt: snap.at
+    }, r)
+  }
+
   ctx.tools.register(defineTool({
     name: 'scratch_open_editor',
-    description: '主动帮用户打开 TurboWarp 编辑器（用户说「打开 TurboWarp」「我想做 Scratch」，而你这边还没有会话时用这个，别让用户自己去点）。'
-      + 'app=browser（默认）打开 turbowarp.org/editor，打开后 AI 就能直接读写积木；'
-      + 'app=desktop 启动本地 TurboWarp Desktop（**已经在运行就不会重复开**，除非传 force）。'
-      + '⚠️ Desktop 是 Electron，装不了浏览器扩展，所以**桥驱动不了它**（只能帮用户把软件开起来，AI 改不了里面的项目）。'
-      + '打开后会等一段时间看会话有没有连上，返回值里的 connected 就是结论。',
+    description: '帮用户把 TurboWarp 打开、并把作品装进去 —— 「AI 帮我打开我的作品」就是这一条。'
+      + '两条路：app=browser（默认）打开 turbowarp.org/editor，走**浏览器扩展**那套（用户要装扩展 + 填 token），装好后 AI 能读写积木；'
+      + 'app=desktop 启动本机 TurboWarp Desktop，走 **CDP 直连**那套（零安装、零 token，我给进程带上调试端口后直接驱动它），AI 一样能读写里面的积木；'
+      + '已经在跑的那份桌面版没带调试端口，接不进去，会如实告诉你，并给出重启的办法。'
+      + 'path 传 .sb3 / .sb2 / project.json 绝对路径就顺手把作品打开（等于用户手动拖文件进去）；'
+      + '已经有会话时不重复开，直接把文件装进那个会话。'
+      + '不传 path 只开编辑器也行。返回值里的 connected / transport 是结论，别自己猜。',
     parameters: {
-      app: { type: 'string', description: 'browser（默认）| desktop' },
-      url: { type: 'string', description: '要打开的地址（默认 https://turbowarp.org/editor，也可以传具体作品链接）' },
+      app: { type: 'string', description: 'browser（默认，扩展那条路）| desktop（CDP 直连，零安装）' },
+      path: { type: 'string', description: '要打开的作品文件绝对路径（.sb3/.sb2/project.json），可选' },
+      url: { type: 'string', description: 'app=browser 时要打开的地址（默认 https://turbowarp.org/editor，也可以传具体作品链接）' },
       waitMs: { type: 'number', description: '打开后等多久看会话连上，默认 20000，上限 60000' },
-      force: { type: 'boolean', description: '已经有会话时也照样再开一个' }
+      force: { type: 'boolean', description: '已经有会话 / 桌面版已在运行时，照样再开一个' }
     },
     output: jsonOut,
     async execute(args) {
       const app = String(args?.app || 'browser').toLowerCase()
+      const wantPath = args?.path ? resolve(String(args.path)) : null
+      if (wantPath && !existsSync(wantPath)) throw new Error(`文件不存在：${wantPath}`)
+
+      // 已经有会话：不重复开窗口，直接把文件装进现有会话（这才是用户要的效果）
       if (sessions.size && !args?.force) {
-        return {
-          alreadyConnected: true,
-          sessions: [...sessions.keys()],
-          hint: '已经有连着的编辑器了，直接干活就行（想再开一个就传 force: true）'
+        const sid = activeSession()
+        const out = { alreadyConnected: true, sessionId: sid, sessions: [...sessions.keys()], path: wantPath || undefined }
+        if (wantPath) {
+          try { out.loaded = await loadFileIntoSess(sid, wantPath) } catch (e) { out.loadError = e.message }
         }
+        out.hint = wantPath
+          ? (out.loaded ? '已经装进现有编辑器了（想开新窗口就传 force: true）' : '装文件失败，看 loadError（想开新窗口就传 force: true）')
+          : '已经有连着的编辑器了，直接干活就行（想再开一个就传 force: true）'
+        return out
       }
       const waitMs = Math.min(Math.max(Number(args?.waitMs ?? 20000) || 0, 0), 60000)
-      const launched = { app }
-      let error = null
 
+      // ============ 桌面版：CDP 直连（不需要扩展，也不需要 token） ============
       if (app === 'desktop') {
         const found = findDesktopApp()
+        // 先看"固定调试端口"上有没有一个现成的可接管实例 —— 用户可以用仓库里的
+        // `启动TurboWarp(AI可接管).cmd` 自己开一份（那条启动命令带 --remote-debugging-port=31821），
+        // 之后 AI 就能直接接管**用户自己开的那份**，而不是非要 AI 再开一个窗口。
+        const probePort = Number(config.desktopDebugPort) || DESKTOP_DEBUG_PORT
+        const existing = await probeCdp(probePort)
+        if (existing.ok) {
+          log.info('发现可接管的桌面版实例（调试端口 %d：%s）', probePort, existing.browser)
+          return await cdpAttachAndReport({
+            port: probePort,
+            launched: { app, attached: true, via: 'existing-debug-port', debugPort: probePort, browser: existing.browser },
+            wantPath,
+            waitMs
+          })
+        }
         if (!found.path) {
           return {
             launched: { app, ok: false },
             connected: false,
             desktopNotFound: true,
             triedPaths: found.tried,
-            hint: `本地没找到 TurboWarp Desktop。可以告诉用户去 ${DESKTOP_DOWNLOAD} 下载（Windows 选 Setup x64），`
-              + '或者把安装路径写进插件配置 desktopPath。注意：Desktop 装不了浏览器扩展，桥驱动不了它——'
-              + '要让 AI 改积木，还是用 app=browser 打开 turbowarp.org。'
+            hint: `本地没找到 TurboWarp Desktop。可以让用户去 ${DESKTOP_DOWNLOAD} 下载（Windows 选 Setup x64），`
+              + '或者把安装路径写进插件配置 desktopPath。'
+              + '不想装桌面版就用 app=browser（需要浏览器扩展）。'
           }
         }
-        // 已经在跑就别再拉一个 —— 桌面版没有单实例锁，重复调就会满屏窗口（踩过）
+        if (!executorSource) {
+          return {
+            launched: { app, ok: false, path: found.path },
+            connected: false,
+            error: '插件的 vm-executor.js 缺失，CDP 直连不可用',
+            hint: '在仓库里跑 `node lab/sync-executor.mjs` 同步执行器，或改用 app=browser'
+          }
+        }
         const running = countRunning(found.path)
         if (running > 0 && !args?.force) {
+          // 已经在跑的那份是**没有**调试端口的进程，我们没法给运行中的进程补启动参数
           return {
             launched: { app, path: found.path, via: found.via, skipped: true },
             alreadyRunning: true,
             runningProcesses: running,
             connected: false,
-            bridgeCanDrive: false,
-            why: 'TurboWarp Desktop 已经在运行了，没有重复启动。',
-            hint: '桌面版是 Electron 应用，装不了浏览器扩展，桥驱动不了它——'
-              + '要让 AI 读写积木请用 turbowarp.org（app=browser）。真想再开一个窗口就传 force: true。'
+            why: 'TurboWarp Desktop 已经在运行，而且那份没带 --remote-debugging-port，CDP 接不进去。',
+            hint: '三个办法：1) 让用户先存盘、关掉桌面版，再调一次这个工具（我启动时会带调试端口，之后 AI 就能直接读写它）；'
+              + `想让我直接接管就传 force: true —— 注意会先关掉现有窗口，**未保存的改动会丢**，务必先让用户存盘。`
+              + ` 2) 让用户以后改用仓库里的「启动TurboWarp(AI可接管).cmd」（= 带 --remote-debugging-port=${probePort} 启动），`
+              + '这样他自己开的窗口我也能直接接管。 3) 改用网页版 app=browser。'
           }
         }
-        try { spawnDetached(found.path, []); launched.path = found.path; launched.via = found.via } catch (e) { error = e.message }
-        return {
-          launched,
-          connected: false,
-          bridgeCanDrive: false,
-          why: 'TurboWarp Desktop 是 Electron 应用，不支持 Chrome 扩展（它只有自己的 userscript addon 系统），所以桥连不上它。',
-          hint: '已经帮用户把桌面版打开了，但 AI 改不了里面的项目。要让我能读写积木，请用 turbowarp.org（app=browser）那一路。'
-            + (error ? '（启动时出错：' + error + '）' : '')
+        if (running > 0 && args?.force) {
+          // 用户明确要求接管：先关掉那份没有调试端口的旧窗口，再带调试端口开一份。
+          // ⚠️ 这是**破坏性**动作（未保存的改动会丢），所以只在 force=true 时做，
+          //    而且工具的 description/hint 里必须讲清楚。
+          const exeName = basename(found.path)
+          try { execFileSync('taskkill', ['/IM', exeName, '/F'], { stdio: 'ignore', windowsHide: true }) } catch {}
+          for (let i = 0; i < 20 && countRunning(found.path) > 0; i++) await sleep(300)
         }
+        const port = await findFreePort()
+        const launched = { app, path: found.path, via: found.via, debugPort: port }
+        try { launched.pid = spawnDetached(found.path, [`--remote-debugging-port=${port}`]) } catch (e) { launched.error = e.message }
+        return await cdpAttachAndReport({ port, launched, wantPath, waitMs })
       }
 
+      // ============ 浏览器版：扩展那条路 ============
       const url = String(args?.url || EDITOR_URL)
       if (!/^https?:\/\//i.test(url)) {
         throw new Error(`只允许 http/https 地址，收到：${url}`)
       }
-      launched.url = url
+      const launched = { app, url }
+      let error = null
       try { launched.pid = openTarget(url, 'browser') } catch (e) { error = e.message }
 
       // 等会话连上（浏览器冷启动 + 编辑器加载 + 扩展握手，真机实测十几秒是常态）
       const deadline = Date.now() + waitMs
       while (Date.now() < deadline && !sessions.size) await sleep(400)
       const connected = sessions.size > 0
-      return Object.assign({
+      const out = Object.assign({
         launched,
         connected,
+        transport: connected ? 'extension-bridge' : undefined,
         sessions: [...sessions.keys()],
+        path: wantPath || undefined,
         waitedMs: waitMs - Math.max(0, deadline - Date.now())
       }, connected
         ? { hint: '编辑器已连上，可以直接 scratch_snapshot 看项目了' }
@@ -644,7 +867,12 @@ export function apply(ctx, config) {
             setup: setupPayload(),
             hint: '已经帮用户把 turbowarp.org 打开了，但桥还没连上：要么扩展没装，要么 token 没填。'
               + '把 setup 里的步骤念给用户（token 一定要原样给出），填完不用刷新页面，几秒内会自己连上——可以再调一次 scratch_list_sessions 确认。'
+              + '（不想装扩展就走 setup.easierAlternative：桌面版 + CDP 直连）'
           })
+      if (connected && wantPath) {
+        try { out.loaded = await loadFileIntoSess(activeSession(), wantPath) } catch (e) { out.loadError = e.message }
+      }
+      return out
     }
   }))
 
@@ -662,31 +890,8 @@ export function apply(ctx, config) {
     async execute(args) {
       const sid = needSession(args?.session)
       if (!args?.path) throw new Error('path 必填（要打开的 .sb3 绝对路径）')
-      const p = resolve(String(args.path))
-      if (!existsSync(p)) throw new Error(`文件不存在：${p}`)
-      const st = statSync(p)
-      if (!st.isFile()) throw new Error(`不是文件：${p}`)
-      const MAX_MB = 200
-      if (st.size > MAX_MB * 1024 * 1024) throw new Error(`文件太大（${(st.size / 1048576).toFixed(1)}MB > ${MAX_MB}MB），浏览器端解压会卡死`)
-
-      const buf = readFileSync(p)
-      const head = buf.subarray(0, 1).toString('utf8')
-      const isJson = /\.json$/i.test(p) || head === '{'
-      // 先快照：开文件是破坏性操作（顶掉当前项目），后悔药必须有
-      const snap = await takeSnapshot(sid, 'pre-load_project')
-      let r
-      if (isJson) {
-        let parsed
-        try { parsed = JSON.parse(buf.toString('utf8')) } catch (e) { throw new Error(`project.json 解析失败：${e.message}`) }
-        r = await call(sid, 'load_project', { projectJson: parsed, filename: basename(p) }, 60000)
-      } else {
-        r = await call(sid, 'load_project', { sb3Base64: buf.toString('base64'), filename: basename(p) }, 120000)
-      }
+      const r = await loadFileIntoSess(sid, String(args.path))
       return Object.assign({
-        loadedFrom: p,
-        bytes: st.size,
-        format: isJson ? 'json' : 'sb3',
-        snapshotAt: snap.at,
         hint: '已经打开在编辑器里了。改完记得 scratch_save_project 存回磁盘（默认不会覆盖原文件）。'
       }, r)
     }

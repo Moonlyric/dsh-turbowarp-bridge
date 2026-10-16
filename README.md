@@ -6,11 +6,27 @@
 
 ```
 dsh 插件（Node，19 个 scratch_* 工具 + WebSocket 桥 :31820）
+
+  路径一 · 扩展桥（你自己浏览器里的编辑器）
       ↕ JSON-RPC over ws（握手 token）
-浏览器扩展 MV3：service worker 持 socket + 内容脚本（MAIN world 操作 window.vm）
+  浏览器扩展 MV3：service worker 持 socket + 内容脚本（MAIN world 操作 window.vm）
       ↕
-TurboWarp 编辑器（你在屏幕上看到的一切）
+  TurboWarp 编辑器（你在屏幕上看到的一切）
+
+  路径二 · CDP 直连（TurboWarp Desktop，零安装、零 token）
+      ↕ Chrome DevTools Protocol（插件启动时给进程带 --remote-debugging-port）
+  TurboWarp Desktop（Electron）：编辑器页面 + 插件注进去的同一份执行器
 ```
+
+两条路读写的是**同一份**页面执行器，区别只在"消息怎么送到编辑器页面"：
+
+| 路径 | 要求 | 页面自报 | 会话 id | 工具返回值里的 `transport` |
+|---|---|---|---|---|
+| 扩展桥（原有） | 装 MV3 扩展 + 选项页填 token | `transport=sw` | `tw-1` | `extension-bridge` |
+| CDP 直连（新） | 只要 TurboWarp Desktop（**零安装、零 token**） | `transport=cdp` | `cd-1` | `cdp-desktop` |
+
+为什么桌面版必须走 CDP：TurboWarp Desktop 是 Electron 应用，**装不了 Chrome 扩展**
+（它只有自己的 userscript addon 系统），扩展那条路对它无解。
 
 ## 它能干什么
 
@@ -23,7 +39,7 @@ TurboWarp 编辑器（你在屏幕上看到的一切）
 | 造型 | `scratch_add_costume`（SVG → 角色造型） |
 | 文件 | `scratch_load_project`（打开本机 .sb3）、`scratch_save_project`（存回磁盘，默认不覆盖） |
 | 观察 | `scratch_watch`（变量轨迹）、`scratch_user_context`（你选中了哪块、有没有按绿旗） |
-| 唤起 | `scratch_open_editor`（AI 自己把编辑器打开，不用你点） |
+| 唤起 | `scratch_open_editor`（AI 自己把编辑器打开，不用你点；浏览器 / 桌面版两条路，还能顺手把你的 .sb3 装进去） |
 | 经验库 | `scratch_skills` / `scratch_skill_edit`（可读可写的 Scratch 实践经验，AI 自己积累） |
 
 **三档安全**（默认 `preview`）：写操作先返回一个 `planId` + 预览，你说"行"才落盘；
@@ -31,13 +47,34 @@ TurboWarp 编辑器（你在屏幕上看到的一切）
 
 ## 装
 
-> 需要 dsh（DeepSeek Harness）、Chrome / Edge、以及一个能访问 turbowarp.org 的网络。
+> 需要 dsh（DeepSeek Harness），以及下面**两条路里至少一条**：
+>
+> | 路 | 要什么 | 要装什么 |
+> |---|---|---|
+> | 浏览器 + 扩展桥 | 一个 Chromium 系浏览器（Windows 自带的 Edge 就够）+ 能访问 turbowarp.org 的网络 | MV3 扩展 + 填一次 token |
+> | TurboWarp Desktop + CDP 直连 | 只要 TurboWarp Desktop | **什么都不用装**（零安装、零 token）；想让 AI 接管你自己开的窗口，就用 `启动TurboWarp(AI可接管).cmd` 启动它 |
+>
+> 换一台没有 Chrome 的电脑：有 Edge 就能走第一条；连 Chromium 都装不了也不要紧——有 Desktop 就能走第二条。
 
 ### 1. 浏览器扩展（约 1 分钟）
 
 1. `chrome://extensions` → 右上角开**开发者模式**
 2. 「加载已解压的扩展程序」→ 选 `packages/tw-bridge-extension`
 3. 卡片上「详细信息 → 扩展程序选项」，把**桥 token** 粘进去保存
+
+任何 Chromium 系浏览器都能装（MV3）：Chrome、**Edge（Windows 自带）**、Brave、Opera、Vivaldi…，
+手动安装路径都是 `chrome://extensions` → 开发者模式 → 加载已解压 → 选 `packages/tw-bridge-extension`。
+
+| 浏览器 | 状态 |
+|---|---|
+| Chrome | ✅ 真机全链路验过（115/115） |
+| Edge | ✅ 已实测 115/115（`lab/real-machine-check.mjs` 把 `$env:CHROME_PATH` 指到 `msedge.exe`） |
+| Brave / Opera / Vivaldi 等 Chromium 系 | 同为 MV3、同一个手动安装流程，未逐个真机验 |
+| Firefox | ❌ **未支持**：MV3 的后台是事件页而不是 service worker，扩展里"SW 持 socket"这套设计要单独适配，目前没有实现也没有验证。理论上 Firefox 没有 LNA 那套限制，走 userscript 是可行方向（M3 计划里那条） |
+| Safari | ❌ 不支持 |
+
+> Edge 上唯一那条"失败"是验收脚本自己的断言：`Extensions.loadUnpacked` 是 Chrome 专属的 CDP 域，
+> Edge 没有（脚本会自动回退 `--load-extension`，扩展照样装上了）。那条断言现在改成"两条路有一条走通"。
 
 ### 2. dsh 插件
 
@@ -78,7 +115,31 @@ New-Item -ItemType Junction `
 > 本机任意进程/页面都能连它。没有握手认证的话，对面可以冒充编辑器、伪造工具返回值，
 > 甚至把文字塞进 AI 的上下文。token 只在本机、只填一次。
 
-## 两个值得知道的技术坑
+### 4. 桌面版这条路：什么都不用装
+
+对 AI 说「打开 TurboWarp 桌面版」→ 它调 `scratch_open_editor({ app: "desktop" })`：
+给 TurboWarp Desktop 带上一个空闲的 `--remote-debugging-port` 启动，再用 CDP 把同一份执行器
+注进编辑器页面。零安装、零 token，不用扩展也不用联网。
+
+- 想直接开自己的作品：`scratch_open_editor({ app: "desktop", path: "D:\\我的作品.sb3" })`
+  （`.sb3` / `.sb2` / `project.json` 都行）。**已经有会话时不重复开窗口**，直接把文件装进现有会话，
+  返回值里给 `loaded`。
+- 工具会**等编辑器里真有角色了**才回报 `ready: true`：桌面版冷启动是"GUI 先出来、项目后加载"，
+  刚接上时 `targets` 可能是空的，直接回报就绪会害 AI 往不存在的角色里塞积木。
+- **接管你自己开的那份窗口**：仓库根有个 `启动TurboWarp(AI可接管).cmd`，它和双击 TurboWarp 的
+  区别只有一个 —— 多了 `--remote-debugging-port=31821`。以后用它开桌面版，AI 每次
+  `app: "desktop"` 都会先探这个固定端口（配置项 `desktopDebugPort` 可改），探到就直接接管
+  **你正在用的那个窗口**，不会再新开一个：返回值里 `launched.attached === true`、
+  `launched.via === 'existing-debug-port'`、**没有 `pid` 字段**（因为不是它启动的）。
+  脚本会自动找常见安装路径，装在别处就把 `TurboWarp.exe` 路径当参数传给它。
+- ⚠️ 桌面版**已经在运行、但没带调试端口**时（比如你直接双击原版开的）接不进去：
+  工具会如实返回 `alreadyRunning: true`，并给出三个办法 ——
+  1) **先存盘**、关掉桌面版，再调一次这个工具（它启动时会带调试端口）；
+  2) 以后改用上面那个 `.cmd` 启动（你自己开的窗口它也能接管）；
+  3) 传 `force: true` 让它接管 —— **会先关掉现有窗口，未保存的改动会丢**。
+  不想动它就改用 `app: "browser"`。
+
+## 几个值得知道的技术坑
 
 1. **socket 必须在扩展的 service worker 里。**
    Chrome 137+ 起，公网页面连 `ws://127.0.0.1` 会被 Local Network Access 检查直接拒
@@ -94,30 +155,56 @@ New-Item -ItemType Junction `
    传 `'input'` 不报错但**静默无效**；输入框里的字面量是一个独立的影子块。
    详见 `packages/dsh-plugin-scratch/skills/sb3-json-reference.md`。
 
+3. **CDP 注入时，相邻两个 IIFE 之间必须有分号。**
+   垫片和执行器都是 `(function(){…})()`，拼在一起时 JS 会把第二个解析成"调用前一个的返回值"，
+   报 `TypeError: (intermediate value)(...) is not a function`，注入直接失败。
+   现在拼字符串时中间显式加 `;`，注完还会用 `({shim:…, executor: typeof window.__dshBridge})`
+   复查一遍——没长出 `window.__dshBridge` 就报错，不假装成功。
+
+4. **CDP 那条路得自己给消息贴协议标签。**
+   扩展那条路里"给消息贴 `__dshBridgeRelay:'op'` 标签"这层活是 relay + service worker 干的；
+   CDP 路径没有那一层，所以最初发过去的是裸 `{id, op, args}`，页面执行器完全不认识。
+   症状极具误导性：`{__dshBridgeRelay:'ping'}` 手写了标签所以 ping/pong 正常、页面自报
+   `socket=open authed=true`，但**每个 op 都超时**（project_meta 15s、snapshot 120s）。
+   现在由 `tagForPage()`（`cdp.js`）负责贴标签，并且有单测断言守着。
+
 ## 验靶（能自己复跑的自动化）
 
 ```powershell
 # 替身层：真 content-main.js 进 Node vm + 真 headless scratch-vm（112 条）
 cd lab; node test-content-ops.js
 
-# 真机层：真 Chrome + 真 turbowarp.org + 真扩展（122 条，约 4 分钟）
+# 真机层 A：真 Chrome / Edge + 真 turbowarp.org + 真扩展（115 条，约 4 分钟）
 # ⚠️ 跑之前先关 VPN，否则是假绿
-$env:SB3_FIXTURE='<某个 .sb3>'      # 可选：顺带验打开真实作品
+$env:SB3_FIXTURE='<某个 .sb3>'      # 可选：顺带验打开真实作品（断言会更多）
 node real-machine-check.mjs
+
+# 真机层 B：TurboWarp Desktop + CDP 直连（54 条，会真开一个窗口、跑完自动关掉）
+node desktop-cdp-check.mjs
 
 # 插件侧
 cd ..\packages\dsh-plugin-scratch
-node test-tools.mjs; node test-skills.mjs; node test-bridge-auth.mjs
+node test-tools.mjs          # 50 条
+node test-skills.mjs         # 23 条
+node test-bridge-auth.mjs    # 21 条
+
+# 改过扩展的执行器之后必须同步，否则 test-tools 里那条"逐字节一致"的断言会红
+cd ..\..; node lab/sync-executor.mjs
 ```
+
+`node lab/sync-executor.mjs --check` 只检查不同步；`lab/desktop-cdp-check.mjs` 检测到你已经开着
+TurboWarp 时会 SKIP，不打扰你。
 
 其它：`node lab/inspect-sb3.mjs <文件.sb3>` 离线看一个作品的结构（角色/块数/扩展/变量/广播/自定义块）。
 
 ## 目录
 
 ```
-packages/dsh-plugin-scratch/   dsh 插件：桥服务端 + 19 个工具 + 经验库 + 单测
+packages/dsh-plugin-scratch/   dsh 插件：桥服务端 + 19 个工具 + 经验库 + CDP 直连 + 单测
 packages/tw-bridge-extension/  MV3 扩展：SW 持 socket，内容脚本操作 window.vm
-lab/                           验靶：替身 VM 层 + 真机层 + sb3 离线分析
+                               （CDP 那条路注的就是这份执行器，靠 lab/sync-executor.mjs 同步副本）
+lab/                           验靶：替身 VM 层 + 真机层（Chrome/Edge）+ 桌面版 CDP 层 + 执行器同步
+启动TurboWarp(AI可接管).cmd    用带调试端口的方式开 TurboWarp Desktop，AI 能接管你正在用的窗口
 ROADMAP.md                     里程碑、设计决策、修过的真 bug
 验收清单.md                     装完之后人眼该验什么（机器验不了的部分）
 ```

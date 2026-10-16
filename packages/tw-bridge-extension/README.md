@@ -3,6 +3,9 @@
 连接 dsh-plugin-scratch 的 WebSocket 桥（默认 `ws://127.0.0.1:31820`），
 在 turbowarp.org / scratch.mit.edu 的**页面主世界（MAIN world）**里调用 `window.vm`。
 
+> 本扩展只服务**浏览器**那条路。TurboWarp Desktop 是 Electron 应用、装不了扩展，
+> 它走插件里的 **CDP 直连**那条路（零安装、零 token），不需要装这里的东西。
+
 ```
 插件 (Node) ──ws://127.0.0.1:31820──> background.js (SW)   ← Chrome 的 LNA 只豁免 SW
                                          ↕ chrome.runtime 端口（relay-isolated.js，自动重连）
@@ -23,7 +26,7 @@
 | 文件 | 作用 |
 |---|---|
 | `manifest.json` | MV3；`permissions: storage, scripting, alarms`；host 只匹配 turbowarp.org / scratch.mit.edu |
-| `content-main.js` | 核心执行器（MAIN world，`document_idle`）：15 个 op + 宿主兼容层 + 观察者 + 用户事件。**不碰网络** |
+| `content-main.js` | 核心执行器（MAIN world，`document_idle`）：15 个 op + 宿主兼容层 + 观察者 + 用户事件。**不碰网络**。这是执行器的**唯一源文件**，插件的 `vm-executor.js` 是它的逐字节副本（`lab/sync-executor.mjs` 同步，见下） |
 | `relay-isolated.js` | ISOLATED world（`document_start`）：MAIN world ⇄ SW 的双向中继（`chrome.runtime.connect` 端口 + `window.postMessage`），断线自动重连 |
 | `background.js` | service worker：**持有 WebSocket**、握手、心跳保活、多标签页路由（指令只发给当前目标页）、图标徽标 |
 | `options.html` / `options.js` | 选项页：粘贴桥 token；高级项里可改桥地址（`bridgeUrl`，验收脚本用它避开你正在跑的 dsh） |
@@ -50,6 +53,25 @@
 WebSocket 不受同源策略约束，**本机的任意进程/网页都能连 `ws://127.0.0.1:31820`**，
 没有握手认证的话那个页面可以冒充编辑器、伪造工具返回值、往 `watch`/`user_context`
 的返回里塞文本（等于一条写进 agent 上下文的注入通道）。
+
+## 能装在哪些浏览器
+
+扩展是 MV3，**任何 Chromium 系浏览器都能装**：Chrome、**Edge（Windows 自带）**、Brave、Opera、Vivaldi…
+手动安装路径都是 `chrome://extensions` → 开发者模式 → 加载已解压 → 选本文件夹（Edge 里地址同样是
+`chrome://extensions`）。
+
+| 浏览器 | 状态 |
+|---|---|
+| Chrome | ✅ 真机全链路验过 115/115（`lab/real-machine-check.mjs`） |
+| Edge | ✅ 已实测 115/115：把 `$env:CHROME_PATH` 指到 `msedge.exe` 跑同一个脚本 |
+| Brave / Opera / Vivaldi 等 Chromium 系 | 同为 MV3 + 同一个手动安装流程，未逐个真机验 |
+| Firefox | ❌ **未支持**：MV3 的后台是事件页而不是 service worker，而本扩展"SW 持 socket"这套设计要单独适配，目前没有实现也没有验证。理论上 Firefox 没有 LNA 那套限制，走 userscript 是可行方向（M3 计划里那条） |
+| Safari | ❌ 不支持 |
+
+> Edge 上有一条"失败"是验收脚本自己的断言：`Extensions.loadUnpacked` 是 Chrome 专属的 CDP 域，
+> Edge 没有（脚本会自动回退 `--load-extension`，扩展照样装上了）。那条断言现在改成
+> "两条路有一条走通"。另外 Chrome 137+ 品牌版会忽略 `--load-extension`（见下面第 7 条），
+> 这条路在自动化里本来也只是兜底。
 
 ## 调试
 
@@ -84,11 +106,29 @@ WebSocket 不受同源策略约束，**本机的任意进程/网页都能连 `ws
 8. **TurboWarp Desktop（Electron）装不了本扩展。** 实测它的 `app.asar` 里没有任何
    `session.loadExtension` 调用（只有它自己的 userscript addon 系统，比如那个叫
    `load-extensions` 的 addon 是"自动添加音乐/画笔分类"的意思，跟 Chrome 扩展无关），
-   而且桌面版的编辑器页面是本地资源，也不匹配本扩展的 `host_permissions`。
-   所以**桥驱动不了桌面版**——桌面版要接 AI，得把执行器改写成 TurboWarp userscript（M3）。
+   而且桌面版的编辑器页面是本地资源（`tw-editor://./gui/gui.html`），也不匹配本扩展的
+   `host_permissions`。**但这不等于桌面版接不了 AI**：插件那条 **CDP 直连**会把**同一份执行器**
+   注进桌面版页面的默认执行上下文，零安装、零 token 就能读写积木 —— 桌面版不需要、
+   也装不了本扩展（细节见 `packages/dsh-plugin-scratch/README.md`）。
+   用仓库根的 `启动TurboWarp(AI可接管).cmd` 启动桌面版，AI 还能直接接管用户自己开的那个窗口。
 
 ## 宿主兼容层
 
 `content-main.js` 里的 `toLiveBlocks` / `getBlocklyWorkspace` / `snapshotJson` / `safeEmitWorkspaceUpdate`
 就是为上面这些差异写的。**别绕过它直接调 `window.vm`**——两条宿主分支的实测差异都记在
 `research.md` 和 `lab/README.md` 里。
+
+## 这份执行器有两个宿主（改之前先看这条）
+
+`content-main.js` 是页面执行器的**唯一源文件**，现在有两个宿主在用它：
+
+| 宿主 | 消息怎么进去 | 用的是哪份 |
+|---|---|---|
+| 本扩展（浏览器） | `relay-isolated.js` ⇄ SW ⇄ `ws://127.0.0.1:31820` | 就是这个文件 |
+| 插件 CDP 直连（桌面版） | `cdp.js` 的垫片拦下 `postMessage` → CDP binding | `packages/dsh-plugin-scratch/vm-executor.js`（逐字节副本） |
+
+- 执行器本身**不认 CDP 也不认扩展**：它只在 `window.postMessage` 上讲 `__dshBridgeRelay` 协议，
+  谁给它转发消息它不管（CDP 侧那个垫片就是干这个的）。
+- 所以改了这里 → **必须**跑 `node lab/sync-executor.mjs` 把副本同步过去；
+  `packages/dsh-plugin-scratch/test-tools.mjs` 里有一条**逐字节一致**的断言守着，忘了同步测试会红。
+  只检查不动手：`node lab/sync-executor.mjs --check`。
