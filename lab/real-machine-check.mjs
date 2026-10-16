@@ -262,9 +262,13 @@ async function main() {
   process.env.DSH_HOME = HOME
   let chrome = null
   let editorCdp = null
+  // 放外面是为了在 cleanup 里也能删：中途抛错时 try 末尾那行 rmSync 根本执行不到，
+  // 会在 %TEMP% 里留下 dsh-sb3-out-* （踩过，跑了五六轮攒了一堆）。
+  let sb3OutDir = null
 
   const cleanup = async () => {
     if (editorCdp) editorCdp.close()
+    if (sb3OutDir) { try { rmSync(sb3OutDir, { recursive: true, force: true }) } catch {} }
     if (KEEP_OPEN) return
     if (chrome) {
       try { spawnSync('taskkill', ['/PID', String(chrome.pid), '/T', '/F'], { stdio: 'ignore' }) } catch {}
@@ -920,6 +924,7 @@ async function main() {
     // ---- 19. 存成 .sb3 文件（本机落盘） ----
     step('19. scratch_save_project（编辑器 → 磁盘上的 .sb3）')
     const outDir = mkdtempSync(join(tmpdir(), 'dsh-sb3-out-'))
+    sb3OutDir = outDir
     const outPath = join(outDir, 'harness-save.sb3')
     const sv = await call('scratch_save_project', { path: outPath })
     t('save_project 写出了文件并回报路径', !!(sv && sv.savedTo === outPath && sv.bytes > 0),
@@ -1014,7 +1019,7 @@ async function main() {
       !!(opAfterIdle && opAfterIdle.project && Array.isArray(opAfterIdle.project.targets)),
       JSON.stringify(opAfterIdle).slice(0, 200))
 
-    try { rmSync(outDir, { recursive: true, force: true }) } catch {}
+    // 清理挪到 cleanup() 里（中途抛错也能删干净）
 
   } catch (e) {
     t('脚本执行到底（没有中途抛错）', false, e.stack ? e.stack.split('\n').slice(0, 3).join(' | ') : e.message)
