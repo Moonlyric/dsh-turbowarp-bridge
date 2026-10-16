@@ -1,0 +1,20 @@
+{
+  "name": "dsh-plugin-scratch",
+  "version": "0.4.0",
+  "description": "TurboWarp bridge for DeepSeek Harness: AI reads and edits sb3 blocks live in the editor, with community-derived skill library",
+  "type": "module",
+  "main": "index.js",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "dsh": ">=0.1.2"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "ws": "^8.0.0"
+  },
+  "license": "MIT"
+}

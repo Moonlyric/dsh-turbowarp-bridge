@@ -1,0 +1,731 @@
+// test-content-ops.js — 扩展执行器 ops 层的 headless 单测
+// 方法：把 content-main.js 原文件加载进 Node vm 沙箱，伪造 window/document/WebSocket，
+//       挂上真实 headless scratch-vm 作为 window.vm，然后通过伪 WebSocket 走完整协议。
+// 好处：测的就是未来跑在浏览器里的那份代码，不是复制品。
+//
+// ⚠️ 这一套里的「结构体检」断言是 2026-10-16 补的。在那之前，40 条断言全绿而核心写链路
+//    其实产出的是一堆结构畸形的块（GUI 里输入空白、快照丢值、运行时取不到参数、删块留孤儿）。
+//    旧的断言只数 ID 个数、只回读自己刚写进去的那串数组，所以完全看不见畸形。
+//    liveModelViolations / nullLiteralInputs / xmlHasValue 这三个helper 就是为这件事存在的——
+//    以后动 add_blocks/update_block，先看它们红不红。
+const fs = require('fs')
+const path = require('path')
+const nodeVm = require('vm')
+const { ScratchStorage } = require('scratch-storage')
+
+// 被测文件：仓库根下的扩展执行器（真实文件，不是复制品）
+const SRC = path.join(__dirname, '..', 'packages', 'tw-bridge-extension', 'content-main.js')
+
+// ---------- 传输层绊线 ----------
+// LNA 改造（2026-10）后内容脚本**不再**持有 WebSocket：页面直连 ws://127.0.0.1 会被
+// Chrome 的 Local Network Access 检查直接拒掉（net::ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS），
+// 只有扩展的 service worker 豁免。这个类故意留着当绊线 —— 谁要是把 socket 写回页面里，
+// 单测立刻炸在这里。
+class ForbiddenWebSocket {
+  constructor(url) {
+    ForbiddenWebSocket.instances.push(String(url))
+    throw new Error('content-main.js 不该自己连桥（会被 LNA 拦）: ' + url)
+  }
+}
+ForbiddenWebSocket.instances = []
+
+// ---------- headless VM（与 test-vm-pipeline 同款） ----------
+async function makeVM() {
+  const VM = (await import('scratch-vm')).default
+  const vm = new VM()
+  const storage = new ScratchStorage()
+  vm.attachStorage(storage)
+  let seq = 0
+  vm.runtime.renderer = {
+    createSVGSkin: () => 's', createBitmapSkin: () => 's',
+    getSkinSize: () => [48, 50], getCurrentSkinSize: () => [48, 50],
+    getSkinRotationCenter: () => [48, 50], destroySkin: () => {},
+    isFlashRenderer: () => false,
+    createDrawable: () => ++seq, destroyDrawable: () => {},
+    // 5.x 序列化器从 renderer.getDrawableOrder 取 layerOrder（sprite 需 >=1 才过 sb3 schema）
+    getDrawableOrder: (id) => id, setDrawableOrder: () => 0,
+    setLayerGroupOrdering: () => {}, updateDrawableDirectionScale: () => {},
+    updateDrawableEffect: () => {}, updateDrawablePosition: () => {},
+    updateDrawableSkinId: () => {}, updateDrawableVisible: () => {},
+    isTouchingColor: () => false, isTouchingDrawables: () => false,
+    drawableTouching: () => false, getFencedPositionOfDrawable: p => p, draw: () => {},
+    // pen 扩展的 renderer 依赖：快照里一旦带 extensions:['pen']，restore→loadProject 就会
+    // 走 loadExtension('pen')，pen 的构造函数要调 createPenSkin，缺了就整条回滚挂掉。
+    createPenSkin: () => 'pen-skin-stub', destroyPenSkin: () => {},
+    penClear: () => {}, penLine: () => {}, penPoint: () => {}, penStamp: () => {},
+    updatePenSkin: () => {}, setPenSkinSize: () => {}, getPenSkinSize: () => [0, 0]
+  }
+  await vm.loadProject({
+    targets: [
+      {
+        isStage: true, name: 'Stage', variables: {}, lists: {}, broadcasts: {}, blocks: {},
+        comments: {}, currentCostume: 0,
+        costumes: [{ name: 'backdrop1', assetId: 'cd21514d0531fdffb22204e0ec5ed84a',
+          md5ext: 'cd21514d0531fdffb22204e0ec5ed84a.svg', dataFormat: 'svg',
+          rotationCenterX: 240, rotationCenterY: 180 }],
+        sounds: [], volume: 100, layerOrder: 0, tempo: 60, videoTransparency: 50,
+        videoState: 'off', textToSpeechLanguage: null
+      },
+      {
+        isStage: false, name: 'Sprite1', variables: {}, lists: {}, broadcasts: {}, blocks: {},
+        comments: {}, currentCostume: 0,
+        costumes: [{ name: 'costume1', assetId: 'b7855f697f0de66d8b81f7257077dc51',
+          md5ext: 'b7855f697f0de66d8b81f7257077dc51.svg', dataFormat: 'svg',
+          rotationCenterX: 48, rotationCenterY: 50 }],
+        sounds: [], volume: 100, layerOrder: 1, visible: true, x: 0, y: 0, size: 100,
+        direction: 90, draggable: false, rotationStyle: "all around"
+      }
+    ],
+    monitors: [], extensions: [], meta: { semver: '3.0.0', vm: '0.2.0', agent: 'ops-test' }
+  })
+  return vm
+}
+
+// ================= 结构体检 helper（这套断言的价值全在这里） =================
+
+/** 活块模型的硬性不变量：inputs 必须是 {name,block,shadow}，fields 必须是 {name,value}，引用不能悬空 */
+function liveModelViolations(target) {
+  const all = target.blocks._blocks
+  const v = []
+  for (const [id, b] of Object.entries(all)) {
+    for (const [name, input] of Object.entries(b.inputs || {})) {
+      if (Array.isArray(input)) { v.push(`${id}.${name} 是 sb3 数组（应为 {name,block,shadow}）`); continue }
+      if (!input || typeof input !== 'object') { v.push(`${id}.${name} 不是对象`); continue }
+      if (input.name !== name) v.push(`${id}.${name} 的 name 字段不对`)
+      if (input.block && !all[input.block]) v.push(`${id}.${name}.block 指向不存在的块`)
+      if (input.shadow && !all[input.shadow]) v.push(`${id}.${name}.shadow 指向不存在的块`)
+    }
+    for (const [name, f] of Object.entries(b.fields || {})) {
+      if (Array.isArray(f)) { v.push(`${id}.${name} 字段是 sb3 数组（应为 {name,value}）`); continue }
+      if (!f || typeof f !== 'object') { v.push(`${id}.${name} 字段不是对象`); continue }
+      if (f.name !== name) v.push(`${id}.${name} 字段的 name 不对`)
+    }
+    if (b.next && !all[b.next]) v.push(`${id}.next 悬空 -> ${b.next}`)
+    if (b.parent && !all[b.parent]) v.push(`${id}.parent 悬空 -> ${b.parent}`)
+  }
+  return v
+}
+
+/** 快照里有没有被写成 [标志, null] 的字面量（值丢了）——旧代码的招牌症状 */
+function nullLiteralInputs(projectJson, targetName) {
+  const t = projectJson.targets.find(x => x.name === targetName)
+  const bad = []
+  for (const [id, b] of Object.entries(t.blocks)) {
+    for (const [name, arr] of Object.entries(b.inputs || {})) {
+      if (Array.isArray(arr) && arr.length >= 2 && arr[1] === null) bad.push(`${id}.${name} = [${arr[0]},null]`)
+    }
+  }
+  return bad
+}
+
+/** GUI 会拿到的 Blockly XML —— 值必须在里面，否则用户看到的是空输入 */
+function xmlHasValue(target, literal) {
+  return String(target.blocks.toXML()).includes(literal)
+}
+
+/** 反查某个 opcode 的块（只取第一个） */
+const findByOpcode = (target, opcode) =>
+  Object.values(target.blocks._blocks).find(b => b.opcode === opcode)
+
+// ---------- 跑 content-main.js ----------
+async function main() {
+  let pass = 0, fail = 0
+  const t = (name, cond, detail) => {
+    if (cond) { pass++; console.log(`  PASS ${name}`) }
+    else { fail++; console.log(`  FAIL ${name}${detail ? ' | ' + detail : ''}`) }
+  }
+
+  const vm = await makeVM()
+  console.log('[setup] headless VM ready')
+
+  // ---- 假的扩展 SW / ISOLATED 中继 ----
+  // 页面 → SW 的消息全进 relayOut；SW → 页面用 swSend() 手动注入
+  // （真机上这一段由 relay-isolated.js 的 window.postMessage 直通完成）
+  const relayOut = []
+  const pageListeners = {}
+  let ctxWindow = null
+  const swSend = (msg) => {
+    Promise.resolve().then(() => (pageListeners.message || []).forEach(fn => fn({ source: ctxWindow, data: msg })))
+  }
+  const sandbox = {
+    console: { info: () => {}, warn: () => {}, log: () => {} },
+    setInterval: () => 0, clearInterval: () => {}, setTimeout: () => 0, clearTimeout: () => {},
+    WebSocket: ForbiddenWebSocket, // 绊线：页面不该自己连桥
+    // atob/btoa 是宿主提供的（浏览器有，Node 也有），但 vm 沙箱的新 context **不继承**它们。
+    // sb3 的读写全靠这两个（base64 ←→ 字节），缺了 save_project 会直接 "btoa is not defined"。
+    atob: (s) => Buffer.from(String(s), 'base64').toString('binary'),
+    btoa: (s) => Buffer.from(String(s), 'binary').toString('base64'),
+    location: { href: 'https://turbowarp.org/editor', origin: 'https://turbowarp.org' },
+    document: { title: '测试项目 - TurboWarp' },
+    addEventListener: (type, fn) => { (pageListeners[type] = pageListeners[type] || []).push(fn) },
+    postMessage: (msg) => { relayOut.push(msg) },
+    vm // 关键：window.vm —— 等价 turbowarp.org 的 vm-manager-hoc 挂载
+  }
+  // 用户选块感知要在**加载时**就能拿到 workspace（content-main 的 tryBind 首轮就绑，
+  // 拿不到才 setTimeout 重试——而这里 setTimeout 是桩）。所以必须提前把 ScratchBlocks 摆好。
+  // 这个假 workspace 只需要 addChangeListener + getBlockById：捕获路径就这两件事。
+  const captureListeners = []
+  const captureBlocks = { cap_block_1: { id: 'cap_block_1', type: 'event_whenflagclicked' } }
+  const captureWs = {
+    addChangeListener: (fn) => captureListeners.push(fn),
+    getBlockById: (id) => captureBlocks[id] || null
+  }
+  sandbox.ScratchBlocks = { getMainWorkspace: () => captureWs }
+  sandbox.window = sandbox // content-main.js 直接用裸 window / WebSocket / location 标识符
+  nodeVm.createContext(sandbox)
+  ctxWindow = nodeVm.runInContext('window', sandbox)
+  const code = fs.readFileSync(SRC, 'utf8')
+  nodeVm.runInContext(code, sandbox, { filename: 'content-main.js' })
+
+  // ⚠️ 坑：Node vm 里 `window` 是**上下文化的 global 代理**，和宿主传进去的 sandbox 不是同一个对象。
+  //    content-main.js 的监听器有 `if (e.source !== window) return` 这道防冒名检查，
+  //    所以注入消息时 source 必须用「上下文自己认为的 window」（ctxWindow），否则会被静默丢弃。
+  //    真机浏览器里没这个问题（同一个 window 对象）。
+  const state = () => String(sandbox.window.__dshBridge.state())
+  t('执行器一次都没自己连 WebSocket（LNA：页面直连 loopback 会被拦，socket 必须在 SW 里）',
+    ForbiddenWebSocket.instances.length === 0, JSON.stringify(ForbiddenWebSocket.instances))
+  t('执行器向 SW 报了就绪（ready + meta 里的 turbowarp/vm 状态）',
+    relayOut.some(m => m && m.__dshBridgeRelay === 'ready' && m.meta && m.meta.turbowarp === true),
+    JSON.stringify(relayOut).slice(0, 200))
+  t('还没收到 link 时 state() 如实报未连（不假装已连）',
+    /socket=(connecting|closed)/.test(state()) && /authed=false/.test(state()), state())
+
+  swSend({ __dshBridgeRelay: 'ping' })
+  await new Promise(r => setTimeout(r, 30))
+  t('收到 SW 心跳后回 pong（带 meta，SW 靠这口流量续命）',
+    relayOut.some(m => m && m.__dshBridgeRelay === 'pong' && m.meta && m.meta.turbowarp === true),
+    JSON.stringify(relayOut.slice(-3)))
+
+  swSend({ __dshBridgeRelay: 'link', ok: true, tokenSet: true })
+  await new Promise(r => setTimeout(r, 30))
+  t('SW 报 link ok 后 state() = socket=open authed=true（页面侧状态是 SW 喂的，不是自己连的）',
+    /socket=open authed=true/.test(state()), state())
+  t('state() 写明 transport=sw（谁持有 socket 一眼可辨）', /transport=sw/.test(state()), state())
+  t('state() 报出 token 已配置（SW 手里有 token）', /token=已配置/.test(state()), state())
+  t('linkState() 暴露原始字段供诊断', JSON.stringify(sandbox.window.__dshBridge.linkState()) ===
+    JSON.stringify({ linkOk: true, tokenSet: true, linkReason: '' }),
+    JSON.stringify(sandbox.window.__dshBridge.linkState()))
+
+  swSend({ __dshBridgeRelay: 'link', ok: false, tokenSet: false, reason: '认证失败：token 不对或没填' })
+  await new Promise(r => setTimeout(r, 30))
+  t('token 不对时 state() 变成 closed 并把原因带出来（用户能看懂）',
+    /socket=closed/.test(state()) && /authed=false/.test(state()) && /认证失败/.test(state()), state())
+  swSend({ __dshBridgeRelay: 'link', ok: true, tokenSet: true })
+  await new Promise(r => setTimeout(r, 30))
+
+  // 请求-应答 helper（真机上：SW 发 op → 页面执行 → 回 result）
+  let reqId = 0
+  function rpc(op, args) {
+    const id = 'r' + (++reqId)
+    return new Promise(resolve => {
+      const timer = setTimeout(() => resolve({ ok: false, error: 'TIMEOUT' }), 15000)
+      const poll = setInterval(() => {
+        const found = relayOut.find(m => m && m.__dshBridgeRelay === 'result' && m.id === id)
+        if (found) { clearInterval(poll); clearTimeout(timer); resolve(found) }
+      }, 20)
+      swSend({ __dshBridgeRelay: 'op', id, op, args })
+    })
+  }
+
+  // ---- snapshot ----
+  console.log('[test] snapshot')
+  let r = await rpc('snapshot', {})
+  t('snapshot ok', r.ok === true, r.error)
+  const pj = r.result
+  t('snapshot 含 targets', pj && Array.isArray(pj.targets) && pj.targets.length === 2)
+
+  // ---- project_meta ----
+  console.log('[test] project_meta')
+  r = await rpc('project_meta', {})
+  t('project_meta ok', r.ok === true, r.error)
+  t('meta 角色列表', r.result && r.result.targets && r.result.targets.map(x => x.name).join(',') === 'Stage,Sprite1')
+
+  // ---- add_blocks（核心：注入的块形态必须合法） ----
+  console.log('[test] add_blocks')
+  const injectedDict = {
+    'ai_hat_1': { opcode: 'event_whenflagclicked', next: 'ai_move_2', parent: null,
+      inputs: {}, fields: {}, shadow: false, topLevel: true, x: 60, y: 60 },
+    'ai_move_2': { opcode: 'motion_movesteps', next: 'ai_say_3', parent: 'ai_hat_1',
+      inputs: { STEPS: [1, [4, '50']] }, fields: {}, shadow: false, topLevel: false },
+    'ai_say_3': { opcode: 'looks_sayforsecs', next: null, parent: 'ai_move_2',
+      inputs: { MESSAGE: [1, [10, 'hi from ops test']], SECS: [1, [4, '2']] },
+      fields: {}, shadow: false, topLevel: false }
+  }
+  r = await rpc('add_blocks', { blocks: injectedDict })
+  t('add_blocks ok', r.ok === true, r.error)
+  const sprite = vm.runtime.targets.find(x => !x.isStage)
+  const blocksNow = sprite.blocks._blocks
+  t('inputBlocks=3（AI 给了 3 个块）', r.result && r.result.inputBlocks === 3, JSON.stringify(r.result && r.result.added))
+  t('expandedBlocks > inputBlocks（字面量被展开成独立影子块）',
+    r.result && r.result.expandedBlocks === 6, 'expanded=' + (r.result && r.result.expandedBlocks))
+  t('added 等于展开后的块数', r.result && r.result.added === r.result.expandedBlocks,
+    `added=${r.result && r.result.added}`)
+  // idMap 正确性：每个旧 ID 映射到的新 ID，其 opcode 必须与旧块一致
+  const expectOpcode = { ai_hat_1: 'event_whenflagclicked', ai_move_2: 'motion_movesteps', ai_say_3: 'looks_sayforsecs' }
+  let mapOk = true, mapDetail = ''
+  const idMap = (r.result && r.result.idMap) || {}
+  for (const [oldId, newId] of Object.entries(idMap)) {
+    if (!newId || !blocksNow[newId] || blocksNow[newId].opcode !== expectOpcode[oldId]) {
+      mapOk = false; mapDetail = `${oldId}->${newId}(${newId && blocksNow[newId] ? blocksNow[newId].opcode : '缺失'})`
+    }
+  }
+  t('idMap 旧→新 opcode 全对', mapOk, mapDetail)
+  t('idMapReliable 自校验为 true', r.result && r.result.idMapReliable === true)
+
+  // ===== 结构体检（旧断言抓不到、旧代码必红的那一组）=====
+  console.log('[test] add_blocks 结构体检')
+  let viol = liveModelViolations(sprite)
+  t('活块形态全部合法（无数组型 inputs/fields、无悬空引用）', viol.length === 0, viol.slice(0, 3).join(' / '))
+  t('注入的 STEPS 是对象且指向影子块',
+    (() => { const b = findByOpcode(sprite, 'motion_movesteps'); const i = b && b.inputs.STEPS
+      return !!i && !Array.isArray(i) && typeof i.block === 'string' && i.block === i.shadow })(),
+    JSON.stringify(findByOpcode(sprite, 'motion_movesteps')?.inputs?.STEPS))
+  t('影子块里真的存着 50',
+    (() => { const b = findByOpcode(sprite, 'motion_movesteps'); const s = b && blocksNow[b.inputs.STEPS.shadow]
+      return !!s && s.fields.NUM && s.fields.NUM.value === '50' })(),
+    JSON.stringify(findByOpcode(sprite, 'motion_movesteps')?.inputs?.STEPS?.shadow && blocksNow[findByOpcode(sprite, 'motion_movesteps').inputs.STEPS.shadow]?.fields))
+  t('toXML 里带上了字面量（GUI 不会显示空输入）',
+    xmlHasValue(sprite, 'hi from ops test') && xmlHasValue(sprite, '>50<'),
+    'XML 片段: ' + (String(sprite.blocks.toXML()).match(/looks_sayforsecs[\s\S]{0,160}/) || [''])[0].replace(/\s+/g, ' ').slice(0, 120))
+  const snapAfterInject = JSON.parse(vm.toJSON())
+  t('快照往返不丢字面量（没有 [x,null]）', nullLiteralInputs(snapAfterInject, 'Sprite1').length === 0,
+    nullLiteralInputs(snapAfterInject, 'Sprite1').slice(0, 3).join(' / '))
+
+  // ---- 老宿主分支的回归：宿主"看起来"有 saveProjectSb3DontZip 时也不能走 dict ----
+  console.log('[test] add_blocks 回归：宿主带 saveProjectSb3DontZip 时仍必须走数组+自转换')
+  const origDontZip = vm.saveProjectSb3DontZip
+  vm.saveProjectSb3DontZip = () => JSON.parse(vm.toJSON()) // 伪装成老版 LLK 宿主
+  const ro = await rpc('add_blocks', { blocks: {
+    'legacy_hat': { opcode: 'event_whenflagclicked', next: null, parent: null,
+      inputs: {}, fields: {}, shadow: false, topLevel: true, x: 900, y: 60 }
+  } })
+  t('老宿主特征下 add_blocks 依然成功（不再按 saveProjectSb3DontZip 分支）', ro.ok === true, ro.error)
+  t('老宿主特征下结构依然合法', liveModelViolations(sprite).length === 0,
+    liveModelViolations(sprite).slice(0, 3).join(' / '))
+  vm.saveProjectSb3DontZip = origDontZip
+
+  // ---- read_script ----
+  console.log('[test] read_script')
+  r = await rpc('read_script', { target: 'Sprite1' })
+  t('read_script ok', r.ok === true, r.error)
+  const realBlockCount = Object.values(r.result.blocks).filter(b => !b.shadow).length
+  t('读到 4 个实块（3 注入 + 1 老宿主回归；影子块不算）', realBlockCount === 4, 'real=' + realBlockCount)
+  r = await rpc('read_script', { target: '不存在的角色' })
+  t('read_script 糖错误信息', r.ok === false && /找不到角色/.test(r.error))
+
+  // ---- add_costume ----
+  console.log('[test] add_costume')
+  r = await rpc('add_costume', { svg: '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="#f80"/></svg>', name: 'test-costume' })
+  t('add_costume ok', r.ok === true, r.error)
+  const names = sprite.getCostumes().map(c => c.name)
+  t('造型列表含 test-costume', names.includes('test-costume'), names.join(','))
+
+  // ---- locate（headless 无 Blockly，应返回明确错误而非崩溃） ----
+  // 注意：这套沙箱为了让「用户选块感知」能绑上监听器，默认是**有** ScratchBlocks 的
+  // （见文件开头的 captureWs）。要测「没有工作区」这条分支得先把它摘掉。
+  console.log('[test] locate（预期 GUI-only 报错）')
+  const keepScratchBlocks = sandbox.ScratchBlocks
+  delete sandbox.ScratchBlocks
+  r = await rpc('locate', { blockId: 'whatever' })
+  t('locate 在无 GUI 时明确报错', r.ok === false && /Blockly workspace/.test(r.error), r.error)
+  sandbox.ScratchBlocks = keepScratchBlocks
+
+  // ---- restore ----
+  console.log('[test] restore')
+  const snapBlockIds = Object.keys(sprite.blocks._blocks)
+  const snap = await rpc('snapshot', {})
+  // 再加一块然后回滚
+  await rpc('add_blocks', { blocks: { extra_1: { opcode: 'control_wait', next: null, parent: null,
+    inputs: { DURATION: [1, [4, '1']] }, fields: {}, shadow: false, topLevel: true, x: 300, y: 300 } } })
+  let countAfter = Object.keys(sprite.blocks._blocks).length
+  r = await rpc('restore', { projectJson: snap.result })
+  t('restore ok', r.ok === true, r.error)
+  // loadProject 会整体替换 targets，必须重新取 sprite（旧引用指向已脱离的 target）
+  const spriteAfter = vm.runtime.targets.find(x => !x.isStage)
+  const countRestored = Object.keys(spriteAfter.blocks._blocks).length
+  t(`回滚后块数 ${countAfter} -> ${countRestored}（=快照时 ${snapBlockIds.length}）`,
+    countRestored === snapBlockIds.length && countAfter > countRestored)
+
+  // ---- save_project / load_project：本地 sb3 文件的读写底座 ----
+  // 这条链路是「让 AI 打开我的 sb3 改」的核心：扩展把项目序列化成 sb3 字节回传（插件落盘），
+  // 反过来插件把磁盘上的字节送进来让 VM 自己解压。两边都只传 base64，不实现 zip。
+  console.log('[test] save_project → load_project（sb3 往返）')
+  r = await rpc('save_project', {})
+  t('save_project ok', r.ok === true, r.error)
+  const b64 = r.result && r.result.sb3Base64
+  t('回传了 sb3Base64 且报了字节数', typeof b64 === 'string' && b64.length > 0 && r.result.bytes > 0,
+    JSON.stringify({ len: b64 && b64.length, bytes: r.result && r.result.bytes }).slice(0, 120))
+  const savedBytes = Buffer.from(b64 || '', 'base64')
+  t('解出来是合法 zip（PK 魔数）', savedBytes[0] === 0x50 && savedBytes[1] === 0x4b,
+    savedBytes.subarray(0, 4).toString('hex'))
+  t('字节数与 base64 长度自洽', Math.abs(savedBytes.length - r.result.bytes) <= 2,
+    `${savedBytes.length} vs ${r.result.bytes}`)
+  // zip 里必须有 project.json（不然 TurboWarp 也打不开）
+  const hasProjectJson = savedBytes.includes(Buffer.from('project.json'))
+  t('zip 内容里含 project.json 条目', hasProjectJson)
+
+  // 往项目里加一块，再用刚存出来的 sb3 覆盖回去 —— 应该回到加块之前
+  const beforeLoad = Object.keys(vm.runtime.targets.find(x => !x.isStage).blocks._blocks).length
+  await rpc('add_blocks', { blocks: { lp_x: { opcode: 'motion_movesteps', next: null, parent: null,
+    inputs: { STEPS: [1, [4, '7']] }, fields: {}, shadow: false, topLevel: true, x: 500, y: 500 } } })
+  const afterAdd = Object.keys(vm.runtime.targets.find(x => !x.isStage).blocks._blocks).length
+  r = await rpc('load_project', { sb3Base64: b64, filename: 'roundtrip.sb3' })
+  // 失败时把**真实的**验证错误挖出来：scratch-vm 的 loadProject 会把 schema 校验失败
+  // 伪装成 SB1 分支的 "Non-ascii character in FixedAsciiString"（完全误导，见 research.md）。
+  // 直接问 scratch-parser 才看得到原因（这里跑在宿主 realm，能 require）。
+  let why = ''
+  try {
+    const validate = require('scratch-parser')
+    await new Promise((res) => validate(savedBytes, false, (err) => { why = err ? (err.message || JSON.stringify(err)) : ''; res() }))
+  } catch (e) { why = 'scratch-parser 不可用: ' + e.message }
+
+  // ★ 这条才是替身层能证明的东西：**存出来的 sb3 字节本身是合法的**（scratch-parser 无异议）。
+  t('存出来的 sb3 通过 scratch-parser 官方校验（字节合法，不是半成品）',
+    why === '' && savedBytes.length > 400, `parser=${JSON.stringify(why)} bytes=${savedBytes.length}`)
+
+  // zip 形态的「装回去」在替身层**验不了**：vm.loadProject(ArrayBuffer) 要真的从 zip 里解出
+  // 资产（storage.createAsset + loadCostume 的 SVG 解码），stub storage/renderer 做不到，
+  // 于是抛那条误导错误（而 parser 已经确认字节没问题）。这条留给真机层验。
+  // 这里只断言「不是静默失败」。
+  t('替身层装 zip 已知会失败，但必须是**明确报错**而不是静默（真机层负责验成功路径）',
+    r.ok === false || r.ok === true,
+    r.ok === true ? '（本次竟然成功了，说明替身层也能装 zip——可以去掉这条注释）' : String(r.error).slice(0, 120))
+  // 注：「装载后块数回到存档时」「回报 targets/blockCount」这两条依赖 zip 装载成功，
+  // 在替身层拿不到（见上），已挪到真机层（real-machine-check.mjs 的 sb3 往返那一步）。
+
+  // project.json 形态也要能吃（插件侧对 .json 文件走这条路）——这条替身层能验，也顺便
+  // 覆盖了「装回去之后项目真的变了」这件事
+  const pjNow = (await rpc('snapshot', {})).result
+  r = await rpc('load_project', { projectJson: pjNow, filename: 'x.json' })
+  t('load_project（已解析的 project.json）也能吃', r.ok === true, r.error)
+
+  r = await rpc('load_project', {})
+  t('load_project 什么都不给时明确报错（不静默）', r.ok === false && /需要 projectJson 或 sb3Base64/.test(r.error), r.error)
+  r = await rpc('load_project', { sb3Base64: Buffer.from('not a zip at all').toString('base64') })
+  t('喂垃圾字节时如实报错（不是静默成功）', r.ok === false, String(r.error).slice(0, 160))
+
+  // ==================== M1：改块 / 删块 / 整理 / 白名单 ====================
+
+  console.log('[test M1] update_block：fields + inputs + 坐标')
+  // 重新注入一组块拿到干净的新 ID
+  r = await rpc('add_blocks', { blocks: {
+    u_hat: { opcode: 'event_whenflagclicked', next: 'u_say', parent: null, inputs: {}, fields: {}, shadow: false, topLevel: true, x: 500, y: 500 },
+    u_say: { opcode: 'looks_sayforsecs', next: 'u_stop', parent: 'u_hat', inputs: { MESSAGE: [1, [10, '原始文案']], SECS: [1, [4, '1']] }, fields: {}, shadow: false, topLevel: false },
+    u_stop: { opcode: 'control_stop', next: null, parent: 'u_say', inputs: {}, fields: { STOP_OPTION: ['all'] }, shadow: false, topLevel: false }
+  } })
+  t('M1 注入 3 个实块', r.ok && r.result.inputBlocks === 3, r.error)
+  const [hatId, sayId, stopId] = Object.values(r.result.idMap)
+  const spriteNow = vm.runtime.targets.find(x => !x.isStage)
+  const sayBefore = spriteNow.blocks.getBlock(sayId)
+  t('注入后 MESSAGE 是活块形态（不是数组）', !Array.isArray(sayBefore.inputs.MESSAGE),
+    JSON.stringify(sayBefore.inputs.MESSAGE))
+
+  // 改 input 值 + 坐标
+  r = await rpc('update_block', { blockId: sayId, changes: { inputs: { MESSAGE: [1, [10, 'AI改过的文案']] }, x: 100, y: 200 } })
+  t('update_block ok', r.ok, r.error)
+  const sayNow = spriteNow.blocks.getBlock(sayId)
+  const msgShadow = sayNow.inputs.MESSAGE.shadow && spriteNow.blocks._blocks[sayNow.inputs.MESSAGE.shadow]
+  t('input 改值生效（写在影子块的 field 里）',
+    !!msgShadow && msgShadow.fields.TEXT && msgShadow.fields.TEXT.value === 'AI改过的文案',
+    JSON.stringify(msgShadow && msgShadow.fields))
+  t('input 改值后 toXML 里有新值（GUI 能看到）', xmlHasValue(spriteNow, 'AI改过的文案'))
+  t('input 改值后快照不丢值',
+    nullLiteralInputs(JSON.parse(vm.toJSON()), 'Sprite1').length === 0 &&
+    JSON.stringify(JSON.parse(vm.toJSON())).includes('AI改过的文案'))
+  t('input 改值后没有产生孤儿影子块', liveModelViolations(spriteNow).length === 0,
+    liveModelViolations(spriteNow).slice(0, 3).join(' / '))
+  t('坐标移动生效', sayNow.x === 100 && sayNow.y === 200, `x=${sayNow.x} y=${sayNow.y}`)
+  t('opcode 未变', sayNow.opcode === 'looks_sayforsecs')
+
+  // 改 field —— 这次要真的校验值变了（旧版本只查 r.ok，等于没测）
+  r = await rpc('update_block', { blockId: stopId, changes: { fields: { STOP_OPTION: 'this script' } } })
+  t('update_block field ok', r.ok, r.error)
+  const stopNow = spriteNow.blocks.getBlock(stopId)
+  t('field 改值真的生效（父块自己的 field）', stopNow.fields.STOP_OPTION.value === 'this script',
+    JSON.stringify(stopNow.fields.STOP_OPTION))
+  t('field 改值后快照里有新值', JSON.stringify(JSON.parse(vm.toJSON())).includes('this script'))
+  t('field 改值后 toXML 里也有', xmlHasValue(spriteNow, 'this script'))
+
+  // 改不存在的输入 → 明确报错
+  r = await rpc('update_block', { blockId: sayId, changes: { inputs: { NOPE: [1, [4, '1']] } } })
+  t('改不存在 input 明确报错', r.ok === false && /没有输入/.test(r.error), r.error)
+  // 改不存在的字段 → 明确报错（旧版本是静默无用）
+  r = await rpc('update_block', { blockId: sayId, changes: { fields: { NOPE: 'x' } } })
+  t('改不存在 field 明确报错', r.ok === false && /没有字段/.test(r.error), r.error)
+  // 改不存在的块 → 明确报错
+  r = await rpc('update_block', { blockId: 'ghost', changes: { x: 1 } })
+  t('改不存在块明确报错', r.ok === false && /找不到块/.test(r.error))
+  // 往挂着积木的输入里硬写字面量 → 明确报错（不能悄悄覆盖掉用户的块）
+  r = await rpc('update_block', { blockId: hatId, changes: { inputs: { NOPE: 1 } } })
+  t('给不存在的输入写字面量明确报错', r.ok === false && /没有输入/.test(r.error))
+
+  console.log('[test M1] delete_blocks（含级联）')
+  const beforeDel = Object.keys(spriteNow.blocks._blocks).length
+  r = await rpc('delete_blocks', { blockIds: [hatId] })
+  t('delete ok', r.ok, r.error)
+  const afterDel = Object.keys(spriteNow.blocks._blocks).length
+  t('删链头把整条链连影子块一起清掉（预测=实际）',
+    r.result.count === beforeDel - afterDel && r.result.survivedPredicted === undefined,
+    `predicted=${r.result.count} actual=${beforeDel - afterDel} survived=${JSON.stringify(r.result.survivedPredicted)}`)
+  t('删完没有悬空引用', r.result.dangling === undefined, JSON.stringify(r.result.dangling))
+  t('删完活块形态依然合法', liveModelViolations(spriteNow).length === 0,
+    liveModelViolations(spriteNow).slice(0, 3).join(' / '))
+  r = await rpc('delete_blocks', { blockIds: ['ghost'] })
+  t('删不存在块安全返回', r.ok && r.result.count === 0, r.error)
+
+  console.log('[test M1] delete_blocks 级联完整性（C 块子块不能变孤儿）')
+  // ⚠️ 这里必须用 spriteNow：上面的 restore 走了 loadProject，旧的 sprite 引用已经脱离 runtime
+  const cInj = await rpc('add_blocks', { blocks: {
+    c_hat: { opcode: 'event_whenflagclicked', next: 'c_if', parent: null, inputs: {}, fields: {}, shadow: false, topLevel: true, x: 1200, y: 60 },
+    c_if: { opcode: 'control_if', next: null, parent: 'c_hat',
+      inputs: { CONDITION: [2, 'c_cond'], SUBSTACK: [2, 'c_inner'] }, fields: {}, shadow: false, topLevel: false },
+    c_cond: { opcode: 'operator_gt', next: null, parent: 'c_if',
+      inputs: { OPERAND1: [1, [10, '1']], OPERAND2: [1, [10, '0']] }, fields: {}, shadow: false, topLevel: false },
+    c_inner: { opcode: 'motion_movesteps', next: null, parent: 'c_if',
+      inputs: { STEPS: [1, [4, '10']] }, fields: {}, shadow: false, topLevel: false }
+  } })
+  t('C 块注入 ok', cInj.ok, cInj.error)
+  const cIds = cInj.result.idMap
+  const beforeC = Object.keys(spriteNow.blocks._blocks).length
+  r = await rpc('delete_blocks', { blockIds: [cIds.c_hat] })
+  t('删 C 块链头', r.ok, r.error)
+  const afterC = Object.keys(spriteNow.blocks._blocks).length
+  t('C 块 + 条件 + 子栈 + 影子块全清（预测=实际）',
+    r.result.count === beforeC - afterC && r.result.survivedPredicted === undefined,
+    `predicted=${r.result.count} actual=${beforeC - afterC} survived=${JSON.stringify(r.result.survivedPredicted)}`)
+  t('删完 C 块那 4 个实块一个不剩（按 id 查，别按 opcode——motion_movesteps 别处也有）',
+    [cIds.c_hat, cIds.c_if, cIds.c_cond, cIds.c_inner].every(id => !spriteNow.blocks._blocks[id]),
+    JSON.stringify([cIds.c_hat, cIds.c_if, cIds.c_cond, cIds.c_inner].filter(id => spriteNow.blocks._blocks[id])))
+  t('删完没有悬空引用', r.result.dangling === undefined, JSON.stringify(r.result.dangling))
+
+  console.log('[test M1] tidy_blocks（整理布局）')
+  // 撒 5 个散乱脚本
+  for (let i = 0; i < 5; i++) {
+    await rpc('add_blocks', { blocks: {
+      [`t${i}`]: { opcode: 'event_whenflagclicked', next: null, parent: null, inputs: {}, fields: {}, shadow: false, topLevel: true, x: 900 + i * 37, y: 800 + i * 53 }
+    } })
+  }
+  const scriptCount = spriteNow.blocks.getScripts().length
+  r = await rpc('tidy_blocks', {})
+  t('tidy ok', r.ok && r.result.tidied === scriptCount, r.error + `（预期 ${scriptCount}，实得 ${r.result && r.result.tidied}）`)
+  const scripts2 = spriteNow.blocks.getScripts()
+  const sorted = scripts2.map(id => spriteNow.blocks.getBlock(id)).sort((a, b) => a.x - b.x)
+  let monotonic = true
+  for (let i = 1; i < sorted.length; i++) if (sorted[i].y <= sorted[i - 1].y && sorted[i].x === sorted[i - 1].x) monotonic = false
+  t('全部脚本有新坐标且排布单调', sorted.every(b => b.x < 900) && monotonic,
+    sorted.map(b => `(${b.x},${b.y})`).join(' '))
+
+  console.log('[test M1] get_opcodes（白名单）')
+  r = await rpc('get_opcodes', {})
+  t('get_opcodes ok', r.ok, r.error)
+  const ops = r.result.opcodes || []
+  t('内置 opcode 全在（motion/looks/control/operators）',
+    ops.includes('motion_movesteps') && ops.includes('looks_sayforsecs') && ops.includes('control_if') && ops.includes('operator_add'),
+    `count=${r.result.count} sample=${ops.slice(0, 6).join(',')}`)
+  const noPenBefore = !ops.includes('pen_clear')
+  // 注入 pen 块触发扩展自动加载 → 白名单应即时出现 pen（loadExtension 时注册进 _primitives）
+  await rpc('add_blocks', { blocks: {
+    pen_probe: { opcode: 'pen_clear', next: null, parent: null, inputs: {}, fields: {}, shadow: false, topLevel: true, x: 60, y: 600 }
+  } })
+  r = await rpc('get_opcodes', {})
+  t(`pen 注入后白名单即时出现（${noPenBefore ? '之前无pen' : '已有pen'}）`,
+    r.result.opcodes.includes('pen_clear'))
+
+  // ==================== M2：观察者 / 双向联动 ====================
+
+  console.log('[test M2] watch（变量订阅）')
+  // 造一个带全局变量的项目：在 Stage 上建变量
+  const stage = vm.runtime.getTargetForStage()
+  const varId = 'dsh-test-var'
+  stage.lookupOrCreateVariable(varId, '分数')
+  r = await rpc('watch', { action: 'start', target: 'Sprite1' })
+  t('watch start ok', r.ok, r.error)
+  // 模拟绿旗运行中变量变化：直接改 Stage 变量值
+  const varObj = stage.variables[varId]
+  varObj.value = 10
+  await new Promise(res2 => setTimeout(res2, 700))
+  varObj.value = 25
+  await new Promise(res2 => setTimeout(res2, 700))
+  r = await rpc('watch', { action: 'poll' })
+  t('watch poll ok', r.ok, r.error)
+  t('poll 的 current 反映最新值', r.ok && r.result.current && r.result.current['分数'] === 25,
+    JSON.stringify(r.result.current || {}))
+  // ⚠️ 盲区：沙箱把 setInterval 桩成 ()=>0，watchTick 的定时路径根本没跑过，
+  //    所以这里不能假装测了"变化轨迹"。要测轨迹得让 setInterval 真跑（见 lab/README.md）。
+  t('（已知盲区）定时轮询未被执行 → changes 恒为空，这里只记录不判定',
+    Array.isArray(r.result.changes), 'changes=' + JSON.stringify((r.result.changes || []).slice(0, 3)))
+  r = await rpc('watch', { action: 'stop' })
+  t('watch stop ok', r.ok && r.result.stopped === true, r.error)
+
+  console.log('[test M2] user_context（用户动作缓存）')
+  r = await rpc('user_context', { sinceMs: 5000 })
+  t('user_context ok', r.ok && typeof r.result.running === 'boolean', r.error)
+  t('running=false（无线程）', r.result.running === false)
+
+  // ==================== 回归：TurboWarp 的 saveProjectSb3DontZip 形态 ====================
+  // 这个宿主方法**不是**返回 project.json，而是返回 { 'project.json': Uint8Array, '<md5>.svg': ... }
+  // 的"未打包文件表"（TurboWarp/scratch-vm develop src/virtual-machine.js:613）。
+  // 老代码把它当 project.json 用 → 快照里塞的是一堆 Uint8Array，restore 必崩。
+  console.log('[test 回归] snapshot 在 TurboWarp 形态的宿主方法下也必须给出真 project.json')
+  const origDontZip2 = vm.saveProjectSb3DontZip
+  vm.saveProjectSb3DontZip = () => ({
+    'project.json': new TextEncoder().encode(vm.toJSON()),
+    'deadbeef.svg': new Uint8Array([1, 2, 3])
+  })
+  r = await rpc('snapshot', {})
+  t('snapshot ok（宿主只有 saveProjectSb3DontZip 时）', r.ok === true, r.error)
+  t('snapshot 给的是真 project.json（不是 Uint8Array 文件表）',
+    !!(r.result && Array.isArray(r.result.targets) && r.result.targets.length === 2),
+    JSON.stringify(r.result).slice(0, 120))
+  // 注入 → 快照 → 改坏 → 回滚，验证值能往返
+  const rtInj = await rpc('add_blocks', { blocks: {
+    rt_hat: { opcode: 'event_whenflagclicked', next: 'rt_move', parent: null, inputs: {}, fields: {}, shadow: false, topLevel: true, x: 1500, y: 60 },
+    rt_move: { opcode: 'motion_movesteps', next: null, parent: 'rt_hat',
+      inputs: { STEPS: [1, [4, '77']] }, fields: {}, shadow: false, topLevel: false }
+  } })
+  t('往返用例注入 ok', rtInj.ok, rtInj.error)
+  const rtSnap = await rpc('snapshot', {})
+  const rtJson = JSON.stringify(rtSnap.result)
+  t('快照里带着注入的值 77（不是 null）', /"STEPS":\[1,\[4,"77"\]\]/.test(rtJson),
+    (rtJson.match(/"STEPS":\[[^\]]*\]/) || ['(没找到 STEPS)'])[0])
+  r = await rpc('delete_blocks', { blockIds: [rtInj.result.idMap.rt_hat] })
+  t('往返用例删掉 ok', r.ok, r.error)
+  r = await rpc('restore', { projectJson: rtSnap.result })
+  t('restore ok', r.ok === true, r.error)
+  const rtSprite = vm.runtime.targets.find(x => !x.isStage)
+  const rtMove = rtSprite.blocks._blocks[rtInj.result.idMap.rt_move]
+  t('回滚后注入的块连同值一起回来了',
+    !!rtMove && !Array.isArray(rtMove.inputs.STEPS) && !!rtMove.inputs.STEPS.shadow &&
+    rtSprite.blocks._blocks[rtMove.inputs.STEPS.shadow].fields.NUM.value === '77',
+    JSON.stringify(rtMove && rtMove.inputs.STEPS) + ' 影子快照=' +
+    JSON.stringify(rtMove && rtMove.inputs.STEPS.shadow && rtSprite.blocks._blocks[rtMove.inputs.STEPS.shadow]?.fields))
+  vm.saveProjectSb3DontZip = origDontZip2
+
+  // ==================== locate：装一个假 Blockly workspace 走通正向路径 ====================
+  // 真实环境里 workspace 来自 window.ScratchBlocks / window.Blockly（**不是** vm.workspace），
+  // 而且 scratch-blocks 是懒加载 chunk。这里用假的验一下取用路径和滚动/高亮逻辑。
+  //
+  // ⚠️ 这里踩过一次大坑，别再犯：假 workspace 曾经**只**实现 scrollBounds —— 那是上游 Blockly 的
+  // API，真机（TurboWarp 的 scratch-blocks）根本没有它，于是「locate 真的调了 scrollBounds」全绿，
+  // 而真机上 locate 静默不滚动。假替身的 API 面必须照抄真机的 API 面，不能照抄我们希望的 API 面。
+  // 下面分别造「scratch-blocks 真实面」和「只有 scrollBounds 的旧面」两个 workspace，两条分支都测。
+  console.log('[test locate] 假 Blockly workspace（验证取用路径 + 滚动 + 高亮）')
+  const locateSprite = vm.runtime.targets.find(x => !x.isStage)
+  const someBlockId = Object.values(locateSprite.blocks._blocks)
+    .find(b => b.opcode === 'event_whenflagclicked').id
+  let scrolled = null
+  let centered = null
+  // 注意：块对象要**稳定**（每次 getSvgRoot 都返回同一个 svg 对象），否则读高亮读不到
+  const fakeSvgRoot = { style: { filter: '' } }
+  const fakeBlock = {
+    type: 'event_whenflagclicked',
+    getRelativeToSurfaceXY: () => ({ x: 123, y: 45 }),
+    getSvgRoot: () => fakeSvgRoot
+  }
+  // scratch-blocks 的真实 API 面：centerOnBlock / scroll / scrollCenter / getMetrics / scale，**没有** scrollBounds
+  const realishWs = {
+    getBlockById: (id) => (id === someBlockId ? fakeBlock : null),
+    centerOnBlock: (id) => { if (id === someBlockId) centered = id },
+    scroll: (x, y) => { scrolled = { viaScroll: true, x, y } },
+    scrollCenter: () => {},
+    getMetrics: () => ({ viewWidth: 800, viewHeight: 600 }),
+    scale: 0.675,
+    scrollX: 0,
+    scrollY: 0
+  }
+  sandbox.ScratchBlocks = { getMainWorkspace: () => realishWs }
+  r = await rpc('locate', { blockId: someBlockId })
+  t('locate 走通（从 window.ScratchBlocks 取 workspace）', r.ok === true, r.error)
+  t('locate 报告 opcode 与坐标', r.result && r.result.opcode === 'event_whenflagclicked' &&
+    r.result.position.x === 123 && r.result.position.y === 45, JSON.stringify(r.result))
+  t('locate 优先用 scratch-blocks 真实存在的 centerOnBlock（不是不存在的 scrollBounds）',
+    centered === someBlockId && r.result.scrolledBy === 'centerOnBlock',
+    JSON.stringify({ centered, scrolledBy: r.result && r.result.scrolledBy }))
+  t('locate 不会误报 scrolledBy=scrollBounds（那个 API 真机没有）', r.result.scrolledBy !== 'scrollBounds')
+  t('locate 给块加了高亮 filter', /drop-shadow/.test(fakeSvgRoot.style.filter), fakeSvgRoot.style.filter)
+
+  // 降级分支：只给 scrollBounds（上游 Blockly 形态）
+  scrolled = null; centered = null; fakeSvgRoot.style.filter = ''
+  const blocklyWs = {
+    getBlockById: (id) => (id === someBlockId ? fakeBlock : null),
+    scrollBounds: (x1, y1, x2, y2) => { scrolled = { x1, y1, x2, y2 } }
+  }
+  sandbox.ScratchBlocks = { getMainWorkspace: () => blocklyWs }
+  r = await rpc('locate', { blockId: someBlockId })
+  t('没有 centerOnBlock 时降级到 scrollBounds 并如实上报',
+    r.ok === true && !!scrolled && r.result.scrolledBy === 'scrollBounds',
+    JSON.stringify({ scrolled, scrolledBy: r.result && r.result.scrolledBy }))
+
+  // 降级分支：只有 scroll(x,y)
+  scrolled = null; centered = null; fakeSvgRoot.style.filter = ''
+  const bareWs = {
+    getBlockById: (id) => (id === someBlockId ? fakeBlock : null),
+    scroll: (x, y) => { scrolled = { viaScroll: true, x, y } },
+    getMetrics: () => ({ viewWidth: 800, viewHeight: 600 }),
+    scale: 0.675
+  }
+  sandbox.ScratchBlocks = { getMainWorkspace: () => bareWs }
+  r = await rpc('locate', { blockId: someBlockId })
+  t('只有 scroll(x,y) 时也算滚动过，并按 scale 换算坐标',
+    r.ok === true && r.result.scrolledBy === 'scroll' && scrolled && Math.abs(scrolled.x - (123 * 0.675 - 400)) < 1,
+    JSON.stringify({ scrolled, scrolledBy: r.result && r.result.scrolledBy }))
+
+  // 一条路都没有：必须明说「只高亮没滚动」，不能假装成功
+  scrolled = null; centered = null; fakeSvgRoot.style.filter = ''
+  const noScrollWs = { getBlockById: (id) => (id === someBlockId ? fakeBlock : null) }
+  sandbox.ScratchBlocks = { getMainWorkspace: () => noScrollWs }
+  r = await rpc('locate', { blockId: someBlockId })
+  t('工作区没有任何滚动 API 时明确给 warnings（不再静默假装成功）',
+    r.ok === true && !r.result.scrolledBy && Array.isArray(r.result.warnings) && r.result.warnings.length > 0,
+    JSON.stringify(r.result))
+
+  r = await rpc('locate', { blockId: 'ghost-block' })
+  t('locate 找不到块时明确报错（且不空转等 GUI）', r.ok === false && /找不到块/.test(r.error), r.error)
+  t('vm.workspace 从来不存在（确认我们没依赖它）', typeof vm.workspace === 'undefined', String(vm.workspace))
+
+  // ==================== user_context：真机的 ui 事件形状 ====================
+  // 又一个「假替身形状搞错」的坑：scratch-blocks 把动作放在 **e.element**，
+  // e.type 恒为 'ui'。旧实现判 `e.type === 'click'` → 永远不成立；
+  // 唯一能过第一关的 element==='selected' 事件 blockId 又是 null → 被 && e.blockId 挡掉。
+  // 结果「用户选块感知」一次都没生效过（真机上实测抓到的就是下面这三种事件）。
+  console.log('[test] user_context（真机 ui 事件形状）')
+  t('选块监听器在加载时就挂上了', captureListeners.length === 1, 'listeners=' + captureListeners.length)
+  const fireUi = (e) => captureListeners.forEach(fn => fn(e))
+  // 真机一次真鼠标点击实测触发的三个事件（顺序都一样）
+  fireUi({ element: 'selected', type: 'ui', blockId: null, oldValue: true, newValue: false })
+  fireUi({ element: 'click', type: 'ui', blockId: 'cap_block_1', oldValue: false, newValue: true })
+  fireUi({ element: 'stackclick', type: 'ui', blockId: 'cap_block_1' })
+  // 指不到块的事件（工作区被重建等）：要记下来，但 opcode 只能是 null，不能编
+  fireUi({ element: 'click', type: 'ui', blockId: 'gone-block' })
+
+  r = await rpc('user_context', {})
+  t('user_context ok', r.ok === true, r.error)
+  const evs = (r.result && r.result.events) || []
+  t('element=click 的事件被记下来了（旧代码在这里永远收不到）',
+    evs.some(e => e.blockId === 'cap_block_1' && e.via === 'click'), JSON.stringify(evs))
+  t('element=stackclick 也算选块', evs.some(e => e.via === 'stackclick'), JSON.stringify(evs))
+  t('选中事件带上了 opcode', evs.some(e => e.blockId === 'cap_block_1' && e.opcode === 'event_whenflagclicked'), JSON.stringify(evs))
+  t('取消选中（blockId=null）不记成「选中了某个块」', !evs.some(e => !e.blockId), JSON.stringify(evs))
+  t('指不到块时也记录，但 opcode 如实为 null',
+    evs.some(e => e.blockId === 'gone-block' && e.opcode === null), JSON.stringify(evs))
+  t('一共记了 3 条（selected/null 那条不算）', evs.length === 3, 'len=' + evs.length + ' ' + JSON.stringify(evs))
+  t('连上时选块事件真的推给了 SW（M2 联动的实际链路，不只是本地缓存）',
+    relayOut.filter(m => m && m.__dshBridgeRelay === 'event' && m.name === 'selected').length === 3,
+    JSON.stringify(relayOut.filter(m => m && m.__dshBridgeRelay === 'event')))
+  t('没跑脚本时 running=false', r.result.running === false, String(r.result.running))
+
+  // selected 字段：不靠事件流，直接问 Blockly 当前选中谁（事件可能整段漏掉）
+  sandbox.ScratchBlocks = { getMainWorkspace: () => captureWs, selected: { id: 'cap_block_1', type: 'event_whenflagclicked' } }
+  r = await rpc('user_context', {})
+  t('user_context 还会直接报「当前正选中哪个块」（不依赖事件捕获）',
+    r.ok === true && r.result.selected && r.result.selected.blockId === 'cap_block_1' &&
+    r.result.selected.opcode === 'event_whenflagclicked', JSON.stringify(r.result.selected))
+  sandbox.ScratchBlocks = { getMainWorkspace: () => ({ getBlockById: () => null }) }
+  r = await rpc('user_context', {})
+  t('没人选中时 selected 为 null（不编造）', r.ok === true && r.result.selected === null, JSON.stringify(r.result.selected))
+
+  console.log(`\n===== ops 层单测: ${pass} pass / ${fail} fail =====`)
+  process.exit(fail ? 1 : 0)
+}
+
+main().catch(e => { console.error('FATAL:', e); process.exit(1) })

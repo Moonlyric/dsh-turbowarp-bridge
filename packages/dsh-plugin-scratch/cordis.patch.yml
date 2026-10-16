@@ -1,0 +1,26 @@
+# 组合包层：把本插件插入 cordis 插件列表
+#
+# name 的取值（三种都行，dsh 0.1.2-rc.1 实测）：
+#   1) 包名             name: dsh-plugin-scratch      ← 从 profile 目录做 ESM 解析（需已 pnpm/npm 装进 profile）
+#   2) 相对路径         name: ../local-plugins/dsh-plugin-scratch/index.js
+#                                                     ← 相对本补丁文件所在目录；插件必须位于 harness\profiles\ 之下
+#                                                        （否则上溯不到 profiles\node_modules，@deepseek-ai/* 解析失败）
+#   3) file:// 绝对 URL name: file:///C:/path/to/index.js
+# ⚠️ 裸 Windows 路径（G:\...\index.js）不被支持，会被当成 g: 协议。
+- insert:
+    - id: scratch
+      name: dsh-plugin-scratch
+      config:
+        # 安全档位：auto（直接落盘）| preview（默认，先 diff 后应用）| suggest（只给建议）
+        safety: preview
+        # 桥监听端口（浏览器扩展连接用）
+        bridgePort: 31820
+        # 快照上限（防止巨型项目刷爆磁盘）
+        maxSnapshots: 50
+        # Skill 经验库总开关（false 时 scratch_skills 返回 disabled，工具本体不受影响）
+        skillsEnabled: true
+        # 唤起编辑器（scratch_open_editor）用哪个浏览器；留空 = 系统默认浏览器
+        # browserPath: C:\Program Files\Google\Chrome\Application\chrome.exe
+        # 本地 TurboWarp Desktop 的 exe；留空 = 自动找（常见目录 + 注册表卸载项）
+        # 注意：桌面版装不了浏览器扩展，桥驱动不了它，配了也只是能帮用户把软件打开
+        # desktopPath: G:\09 Eutopia\scr\TurboWarp\TurboWarp.exe

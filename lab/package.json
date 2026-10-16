@@ -1,0 +1,16 @@
+{
+  "name": "dsh-tw-bridge-lab",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Headless verification harness for the TurboWarp x DSH bridge (scratch-vm based, no browser needed)",
+  "scripts": {
+    "test": "node test-content-ops.js",
+    "test:ops": "node test-content-ops.js",
+    "test:real": "node real-machine-check.mjs",
+    "smoke": "node test-vm-pipeline.js"
+  },
+  "devDependencies": {
+    "scratch-storage": "^5.0.0",
+    "scratch-vm": "^5.0.0"
+  }
+}

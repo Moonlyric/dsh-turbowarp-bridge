@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "TurboWarp Bridge for DSH",
+  "version": "0.4.0",
+  "description": "Connect TurboWarp editor to DeepSeek Harness (dsh) — AI reads and edits your blocks live",
+  "minimum_chrome_version": "116",
+  "permissions": ["storage", "scripting", "alarms"],
+  "host_permissions": [
+    "https://turbowarp.org/*",
+    "https://scratch.mit.edu/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": ["https://turbowarp.org/*", "https://scratch.mit.edu/*"],
+      "js": ["relay-isolated.js"],
+      "run_at": "document_start",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": ["https://turbowarp.org/*", "https://scratch.mit.edu/*"],
+      "js": ["content-main.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ],
+  "action": {
+    "default_title": "DSH TurboWarp Bridge（点击查看状态）"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "tw-bridge@dsh.local",
+      "strict_min_version": "128.0"
+    }
+  }
+}

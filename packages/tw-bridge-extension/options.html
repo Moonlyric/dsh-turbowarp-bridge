@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>DSH TurboWarp Bridge — 设置</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font: 14px/1.6 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      max-width: 640px; margin: 32px auto; padding: 0 20px;
+    }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    .sub { opacity: .7; margin: 0 0 24px; }
+    label { display: block; font-weight: 600; margin-bottom: 6px; }
+    input[type=text] {
+      width: 100%; box-sizing: border-box; padding: 9px 11px;
+      font: 13px/1.4 ui-monospace, Consolas, monospace;
+      border: 1px solid #8884; border-radius: 6px; background: transparent; color: inherit;
+    }
+    .row { display: flex; gap: 8px; margin-top: 10px; }
+    button {
+      padding: 8px 16px; border-radius: 6px; border: 1px solid #8884;
+      background: #4c6ef5; color: #fff; font-weight: 600; cursor: pointer;
+    }
+    button.ghost { background: transparent; color: inherit; }
+    button:disabled { opacity: .5; cursor: default; }
+    #status { margin-top: 14px; min-height: 22px; font-weight: 600; }
+    .ok { color: #2f9e44; } .bad { color: #e03131; }
+    ol { padding-left: 20px; } li { margin: 4px 0; }
+    code { background: #8882; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+    details { margin-top: 26px; } summary { cursor: pointer; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>DSH TurboWarp Bridge</h1>
+  <p class="sub">把 TurboWarp 编辑器接到 DeepSeek Harness，让 AI 读改你的积木。</p>
+
+  <label for="token">桥 token</label>
+  <input id="token" type="text" spellcheck="false" autocomplete="off" placeholder="32 位十六进制，例如 3f9a...">
+  <div class="row">
+    <button id="save">保存</button>
+    <button id="clear" class="ghost">清空</button>
+  </div>
+  <div id="status"></div>
+
+  <details>
+    <summary>高级：桥地址（一般不用改）</summary>
+    <p>默认 <code>ws://127.0.0.1:31820</code>。只有当插件跑在别的端口时才需要改
+    （比如并行跑验收脚本、或者你同时开了两个 dsh profile）。</p>
+    <label for="bridgeUrl" style="margin-top:10px">桥地址</label>
+    <input id="bridgeUrl" type="text" spellcheck="false" autocomplete="off" placeholder="ws://127.0.0.1:31820">
+    <div class="row"><button id="saveUrl" class="ghost">保存地址</button></div>
+  </details>
+
+  <details open>
+    <summary>token 从哪来？</summary>
+    <ol>
+      <li>对 dsh 里的 AI 说一句「我的 TurboWarp 连不上」，它调 <code>scratch_list_sessions</code> 会把 token 念给你。</li>
+      <li>或者看 dsh 的启动日志：有一行 <code>桥 token: xxxx</code>。</li>
+      <li>也可以直接开这个文件看：<code>%APPDATA%\dsh-desktop\harness\scratch-bridge-token.txt</code>（CLI 版是 <code>~/.dsh/scratch-bridge-token.txt</code>）。</li>
+    </ol>
+  </details>
+
+  <details>
+    <summary>为什么要 token？</summary>
+    <p>桥是本地 WebSocket（<code>ws://127.0.0.1:31820</code>）。WebSocket 不受同源策略限制，
+    你访问的<b>任意网页</b>都能去连它。没有 token 的话，那个页面可以冒充编辑器、伪造工具返回值，
+    甚至把文字塞进 AI 的上下文里。填了 token 之后，只有拿着正确 token 的连接会被接受。</p>
+  </details>
+
+  <details>
+    <summary>填完还是连不上？</summary>
+    <ol>
+      <li>确认 dsh 正在运行（插件已加载），否则没人监听 31820。</li>
+      <li>刷新一次 turbowarp.org 页面；F12 看 <code>[dsh-bridge]</code> 开头的日志。</li>
+      <li>日志里出现 <code>认证失败</code> = token 不对，回上面重新复制一份。</li>
+    </ol>
+  </details>
+
+  <script src="options.js"></script>
+</body>
+</html>
