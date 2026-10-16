@@ -113,38 +113,48 @@ DSH Desktop 内部固定用自己的单个 `--patch`，所以用户侧没有 `--
 
 ## Skill 区（Scratch 实践经验库）
 
-基于 10 个社区高完成度作品（15 块 ~ 10164 块）逆向提炼，8 篇经验文档：
+对社区高完成度作品**做法**的总结，8 篇经验文档：
 `getting-started` / `code-patterns` / `animation-visual` / `architecture` /
 `performance` / `sb3-json-reference` / `project-planning` / `recipes`。
+
+> 这里**刻意不记**「哪个作品有多少积木」——数字对"怎么写"没有帮助。要量规模自己调
+> `scratch_snapshot` 或 `lab/inspect-sb3.mjs`；文档只留能照着做的经验。
 
 - **不强制注入**——工具返回只带一行 skillHint，agent 自主选读
 - **三层开关**——`skillsEnabled` 总闸 → `.enabled.json` 单篇开关 → agent 自主
 - **agent 可自编辑**——学到新经验就用 `scratch_skill_edit` 沉淀
-- 首启复制到 `$DSH_HOME/scratch-skills/`，升级不覆盖用户改过的
+- 首启复制到 `$DSH_HOME/scratch-skills/`，**升级默认不覆盖**用户改过的版本；
+  想强制回到内置版：在 skill 目录里放一个 `.reset` 空文件，下次加载整份覆盖
 
 ## 文件
 
-- `index.js` — 入口：桥 + 握手 + 17 工具 + 快照持久化 + skill 区
+- `index.js` — 入口：桥 + 握手 + 19 工具 + 快照持久化 + skill 区
 - `skills/` — 内置 8 篇经验 + `INDEX.md`
 - `cordis.patch.yml` — dsh 插件层（`name` 三种写法见注释）
 - `test-skills.mjs` — skill 区单测（23 断言）
 - `test-bridge-auth.mjs` — 桥的握手认证与应答来源校验（21 断言，别删）
-- `test-tools.mjs` — 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重，27 断言）
+- `test-tools.mjs` — 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 /
+  桥端口被占自愈 / 返回值无损 JSON，36 断言）
 
-## 测试状态（2026-10-16）
+## 测试状态（2026-10-17）
 
 | 套件 | 结果 |
 |---|---|
 | `test-skills.mjs` | 23/23 ✅ |
 | `test-bridge-auth.mjs` | 21/21 ✅ |
-| `test-tools.mjs` | 27/27 ✅ |
-| `../lab/test-content-ops.js` | 97/97 ✅ |
-| `../lab/real-machine-check.mjs`（真 Chrome + 真 turbowarp.org） | 98/98 ✅ |
+| `test-tools.mjs` | 36/36 ✅ |
+| `../lab/test-content-ops.js` | 112/112 ✅ |
+| `../lab/real-machine-check.mjs`（真 Chrome + 真 turbowarp.org） | 122/122 ✅ |
 
-真机那一轮跑的是完整闭环，**17 个工具全覆盖**：唤起编辑器（含"没有会话时给 token 步骤"这条路）
+真机那一轮跑的是完整闭环，**19 个工具全覆盖**：唤起编辑器（含"没有会话时给 token 步骤"这条路）
 → 装扩展 → 填 token → 打开 turbowarp.org/editor → 握手认证 → list_sessions → snapshot
 → add_blocks（preview→apply）→ 直接读真 VM 的活块模型校验 → update_block → locate（含滚动/高亮）
 → delete_blocks → 再快照查孤儿 → rollback → get_opcodes → tidy_blocks → add_costume
-→ watch（真定时器轮询）→ user_context（真鼠标点块 + 绿旗）→ 已有会话时不重复开标签页。
+→ watch（真定时器轮询）→ user_context（真鼠标点块 + 绿旗）→ save_project（落盘 .sb3）
+→ load_project（打开真实作品，14.6MB）→ 大项目往返 + 回滚 → 空闲 45s 连接不许断。
+
+⛔ **跑真机层之前先关 VPN**：开着时 turbowarp.org 会被解析成 fake-IP（私网段），
+Chrome 会认为"本页也是本地"从而绕过 Local Network Access 检查 —— 那样跑出来的绿是**假绿**
+（上一版的 98/98 就是这么来的）。脚本第 0 步会检测并直接判 FAIL。
 
 详见 `../ROADMAP.md` 与 `../lab/README.md`（含验靶盲区清单）。
