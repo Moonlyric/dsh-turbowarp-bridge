@@ -384,7 +384,7 @@ export function apply(ctx, config) {
   const builtinSkillDir = join(dirname(fileURLToPath(import.meta.url)), 'skills')
   const skillStateFile = join(skillDir, '.enabled.json')
   const builtinVersionFile = join(skillDir, '.builtin-version')
-  const SKILL_BUILTIN_VERSION = '1' // 升级内置 skill 时 bump
+  const SKILL_BUILTIN_VERSION = '2' // 升级内置 skill 时 bump（2 = 去掉块数普查、只留做法）
 
   function skillEnabledMap() {
     try { return JSON.parse(readFileSync(skillStateFile, 'utf8')) } catch { return {} }
@@ -396,16 +396,25 @@ export function apply(ctx, config) {
   function initSkillDir() {
     try {
       mkdirSync(skillDir, { recursive: true })
-      // 首次（或版本升级）：复制内置 skill，不动已存在的（用户/agent 可能改过）
+      // 首次（或版本升级）：复制内置 skill，**不动已存在的**（用户/agent 可能改过）。
+      // 想强制回到内置版本：在 skill 目录里放一个 `.reset` 空文件，下次加载就整份覆盖
+      // （插件升级后内置文档会更新，但按契约不覆盖用户改过的版本 —— 这个标记是那个出口）。
       let ver = ''
       try { ver = readFileSync(builtinVersionFile, 'utf8').trim() } catch {}
-      if (ver !== SKILL_BUILTIN_VERSION && existsSync(builtinSkillDir)) {
+      const resetMark = join(skillDir, '.reset')
+      const force = existsSync(resetMark)
+      if ((ver !== SKILL_BUILTIN_VERSION || force) && existsSync(builtinSkillDir)) {
+        let copied = 0
         for (const f of readdirSync(builtinSkillDir)) {
           if (!f.endsWith('.md')) continue
           const dst = join(skillDir, f)
-          if (!existsSync(dst)) copyFileSync(join(builtinSkillDir, f), dst)
+          if (force || !existsSync(dst)) { copyFileSync(join(builtinSkillDir, f), dst); copied++ }
         }
         writeFileSync(builtinVersionFile, SKILL_BUILTIN_VERSION)
+        if (force) {
+          try { unlinkSync(resetMark) } catch {}
+          log.info('skill 区已按 .reset 标记重置（覆盖 %d 篇内置文档）', copied)
+        }
       }
     } catch (e) {
       log.warn('skill 区初始化失败（不影响核心功能）: %s', e.message)
