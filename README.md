@@ -41,7 +41,7 @@ dsh 插件（Node，30 个 scratch_* 工具 + WebSocket 桥 :31820）
 | 造型 | `scratch_add_costume`（SVG → 角色造型） |
 | 文件 | `scratch_load_project`（打开本机 .sb3）、`scratch_save_project`（存回磁盘，默认不覆盖） |
 | 跑起来 | `scratch_run`（绿旗/停止）、`scratch_click`（点角色，按造型包围盒算中心）、`scratch_press_key`（按键） |
-| 看得到 | `scratch_state`（线程/克隆/坐标/页变量/fps）、`scratch_profile`（每步耗时 p50/p95）、`scratch_screenshot`（截编辑器，桌面版） |
+| 看得到 | `scratch_state`（线程/克隆/坐标/页变量/fps）、`scratch_profile`（每步耗时 p50/p95 + **热点归因**：哪条脚本在吃帧）、`scratch_screenshot`（截编辑器，桌面版） |
 | 省往返 | `scratch_batch`（一次做多件事，只读/运行期白名单）、`scratch_selftest`（全链路自检） |
 | 观察 | `scratch_watch`（变量轨迹，列表默认只报长度）、`scratch_user_context`（你选中了哪块、有没有按绿旗） |
 | 唤起 | `scratch_open_editor`（AI 自己把编辑器打开，不用你点；浏览器 / 桌面版两条路，`port` 可接管你手动开的实例，`show:false` 只接管不弹窗） |

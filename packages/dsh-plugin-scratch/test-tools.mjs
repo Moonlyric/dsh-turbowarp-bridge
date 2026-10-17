@@ -477,6 +477,16 @@ t('locate 会跨角色搜索并在错误里列出找过谁',
   executorSrc.includes('个角色/舞台里都没有'))
 t('窗口探针额外报 active + screen 工作区（判断"被别的窗口盖住/跑到屏幕外"）',
   psProbe.includes('"active"') && psProbe.includes('"screen"') && psProbe.includes('GetForegroundWindow'))
+// v0.8.0：profile 带归因（量出"慢"之后要能说出"哪条脚本慢"）
+t('scratch_profile 带 attribution/topN 参数（归因开关与榜单长度）',
+  ['attribution', 'topN'].every(k => paramNames('scratch_profile').includes(k)),
+  paramNames('scratch_profile').join(','))
+t('执行器里 profile 真的采样线程栈（peekStack → 顺着 parent 链归到脚本根）',
+  executorSrc.includes('peekStack') && executorSrc.includes('rootOf(target, blockId, blocks)'))
+t('归因把「等 N 秒」这类空转单列（waitPct），不混进热点排行',
+  executorSrc.includes('control_wait_until') && executorSrc.includes('waitPct'))
+t('归因有采样上限（几千个克隆体时别让采样本身变成瓶颈）',
+  executorSrc.includes('threads.length > 400'))
 
 // ==================== 12. v0.8.0：背包 ====================
 // 背包的存在意义是「AI 自己攒可复用的整块积木」（用户提的需求）。这里守的是**契约**：

@@ -144,7 +144,7 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 | `scratch_state` | 读 | 运行期快照：`running`/`threads`/`targets`/`clones`/`stepMs`/`fps`/标量页变量；带 `target` 时附坐标/大小/可见/局部变量 |
 | `scratch_click` | 运行 | 点角色（按可见性→造型名筛克隆体，取包围盒中心）或点舞台坐标；`via` 说明走的是真 `pick` 还是退化的点击帽子 |
 | `scratch_press_key` | 运行 | 按键（空格 `" "`、`"ArrowUp"`、字母 `"a"`），可按住 `holdMs` |
-| `scratch_profile` | 读 | 采样 VM 每步耗时 → avg/p50/p95/max + 反推 fps（别信项目里的 `fps` 变量） |
+| `scratch_profile` | 读 | 采样 VM 每步耗时 → avg/p50/p95/max + 反推 fps（别信项目里的 `fps` 变量）；**默认带热点归因** `attribution.hot`（哪条脚本/哪些 opcode 在吃帧，空转单列 `waitPct`） |
 | `scratch_screenshot` | 读 | 截编辑器窗口（CDP；180-208ms 量级）落盘给路径 —— 给用户看效果 / 自己核对画面 |
 | `scratch_list_scripts` | 读 | 顶层脚本清单（opcode/块数/调用的自定义积木/名字），**区分真脚本与游离块**（判定用 `runtime._hats`） |
 | `scratch_batch` | 读/运行 | 一次往返做多件事（≤12 条，白名单只放只读/运行期 op；写操作不许进来） |
@@ -264,7 +264,7 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 - `test-tools.mjs` — 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 /
   CDP 桌面分支的启动参数与诚实报错 / `tagForPage` 四连 / 执行器副本一致性 / 桥端口被占自愈 /
   返回值无损 JSON / 打包契约（组合包字段、volatile 配置、浏览器半侧格式、窗口探针）+
-  v0.7.0 运行控制契约 + v0.8.0 背包契约，103 断言）
+  v0.7.0 运行控制契约 + v0.8.0 背包与归因契约，107 断言）
 
 ## 测试状态（2026-10-18 本轮实测，VPN 全程关闭）
 
@@ -273,10 +273,10 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 | `test-skills.mjs` | 23/23 ✅ |
 | `test-bridge-auth.mjs` | 21/21 ✅ |
 | `test-backpack.mjs` | 36/36 ✅ |
-| `test-tools.mjs` | 103/103 ✅（含打包契约：组合包 / volatile 配置 / 浏览器半侧 / 窗口探针 + v0.7.0 运行控制 + v0.8.0 背包契约） |
+| `test-tools.mjs` | 107/107 ✅（含打包契约：组合包 / volatile 配置 / 浏览器半侧 / 窗口探针 + v0.7.0 运行控制 + v0.8.0 背包与归因契约） |
 | `../lab/test-content-ops.js` | 163/163 ✅（含瘦身体积断言：5000 项列表场景 < 64KB） |
 | `../lab/real-machine-check.mjs`（真 Chrome / Edge + 真 turbowarp.org；不传 `SB3_FIXTURE`） | 115/115 ✅（Chrome、Edge 各一遍） |
-| `../lab/desktop-cdp-check.mjs`（TurboWarp Desktop + CDP；真开一个窗口、跑完自动关） | 83/83 ✅（含窗口可见性交叉验证 + 绿旗后角色真位移） |
+| `../lab/desktop-cdp-check.mjs`（TurboWarp Desktop + CDP；真开一个窗口、跑完自动关） | 99/99 ✅（含窗口可见性交叉验证 + 绿旗后角色真位移） |
 
 真机那一轮跑的是完整闭环，**28 个工具全覆盖**：唤起编辑器（含"没有会话时给 token 步骤"这条路）
 → 装扩展 → 填 token → 打开 turbowarp.org/editor → 握手认证 → list_sessions → snapshot

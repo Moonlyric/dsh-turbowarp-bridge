@@ -50,7 +50,7 @@ AI 侧的入口是 `scratch_open_editor`：用户说「打开 TurboWarp」时，
 | **审计 + 修** | 全项目审查：修掉「核心注入在真机上根本不工作」等 7 个真 bug，补断言防回归 | ✅ 2026-10-16 |
 | **LNA 改造** | socket 从页面搬进扩展 service worker + 心跳保活 + `lab` 加 LNA/保活断言 | ✅ 2026-10-17（这次绿才算数） |
 | **M0.5 真机** | 真 Chrome/Edge + 真 turbowarp.org 全链路自动验收（30 工具 + 存/读 sb3） | ✅ **115/115**（2026-10-17 关 VPN 实测，Chrome 与 Edge 各一遍；旧的 98/98 是假绿） |
-| **CDP 直连** | TurboWarp Desktop 零安装路径：带调试端口启动 + 注默认上下文 + 接管用户自己开的窗口 | ✅ 2026-10-17（v0.8.0 后 96/96，见下） |
+| **CDP 直连** | TurboWarp Desktop 零安装路径：带调试端口启动 + 注默认上下文 + 接管用户自己开的窗口 | ✅ 2026-10-17（v0.8.0 后 99/99，见下） |
 | **主动唤起** | `scratch_open_editor`：AI 自己开浏览器/桌面版并等会话连上；新增 `path` 装作品 | ✅ 2026-10-16 / 扩展于 2026-10-17 |
 | **文件往返** | `scratch_load_project` / `scratch_save_project`（打开本机 .sb3、存回磁盘、默认不覆盖） | ✅ |
 | **M3** | 断链/接链（moveBlock 的 parent 系）、变量/列表增删、造型删除改名、Firefox 支持（userscript 方向） | 未开始 |
@@ -187,14 +187,14 @@ hint 里说明"没动他的窗口"。
 
 | 套件 | 覆盖 | 结果 |
 |---|---|---|
-| `lab/test-content-ops.js` | 扩展执行器全协议（真实 `content-main.js` 进 Node vm 沙箱 + 真 headless scratch-vm）+ v0.7.0 瘦身体积断言 + v0.8.0 背包（导出/注入/变量落地/**与官方序列化器逐块对拍**） | 187/187 ✅ |
+| `lab/test-content-ops.js` | 扩展执行器全协议（真实 `content-main.js` 进 Node vm 沙箱 + 真 headless scratch-vm）+ v0.7.0 瘦身体积断言 + v0.8.0 背包（导出/注入/变量落地/**与官方序列化器逐块对拍**） | 197/197 ✅ |
 | `lab/real-machine-check.mjs` | **真 Chrome/Edge + 真 turbowarp.org 全链路**（装扩展 → token 握手 → 30 工具 + 存/读 sb3 + 45s 保活） | **115/115** ✅（Chrome、Edge 各一遍；不传 `SB3_FIXTURE`，传了真实 sb3 会更多） |
-| `lab/desktop-cdp-check.mjs` | **TurboWarp Desktop + CDP 直连**端到端（独立 CDP 连接读真 VM + 存盘往返 + 接管用户实例 + 关掉后会话自动掉线 + v0.7.0 运行控制 + v0.8.0 背包往返） | 96/96 ✅ |
+| `lab/desktop-cdp-check.mjs` | **TurboWarp Desktop + CDP 直连**端到端（独立 CDP 连接读真 VM + 存盘往返 + 接管用户实例 + 关掉后会话自动掉线 + v0.7.0 运行控制 + v0.8.0 背包往返） | 99/99 ✅ |
 | `lab/sync-executor.mjs` | 把扩展 `content-main.js` 同步成插件包的 `vm-executor.js`（`--check` 只检查） | 工具 ✅ |
 | `lab/test-vm-pipeline.js` | scratch-vm 管线冒烟（无断言，打印型） | 跑通 ✅ |
 | `lab/inspect-sb3.mjs` | 离线读 sb3/project.json：同时报**真块数**和**含影子块数**（引用块数必须写清数法） | 工具 ✅ |
 | `packages/dsh-plugin-scratch/test-skills.mjs` | skill 区 | 23/23 ✅ |
-| `packages/dsh-plugin-scratch/test-tools.mjs` | 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 / CDP 启动参数与诚实报错 / `tagForPage` / 执行器副本一致性 / 打包契约 / v0.7.0 新工具契约 / v0.8.0 背包契约） | 103/103 ✅ |
+| `packages/dsh-plugin-scratch/test-tools.mjs` | 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 / CDP 启动参数与诚实报错 / `tagForPage` / 执行器副本一致性 / 打包契约 / v0.7.0 新工具契约 / v0.8.0 背包与归因契约） | 107/107 ✅ |
 | `packages/dsh-plugin-scratch/test-backpack.mjs` | **背包集成**（假页面连真桥：存 → 落盘 → list/read → 注入（x/y 平移、变量声明、variableValues）→ preview 不落盘 → 删除进 `_trash` → 名字穿越防护） | 36/36 ✅ |
 | `packages/dsh-plugin-scratch/test-bridge-auth.mjs` | 握手认证 + 跨会话伪造防护 + ping/pong 保活 | 21/21 ✅ |
 
@@ -227,7 +227,7 @@ CDP 那条路也有它自己的盲区：`desktop-cdp-check.mjs` 只在装了 Tur
 | 怎么用 | `scratch_backpack_load({ name })` 就是 `add_blocks` 的入参形态；坐标整体平移、变量按名字接上或补建 |
 | 两个工具 | `scratch_backpack`（list/read/save/delete）+ `scratch_backpack_load`（注入，受 `safety` 档位管） |
 | 删除 | 不真删，挪进 `_trash/`（存进去的东西可能是几小时的活） |
-| 验收 | 替身层 187/187（含**与官方序列化器逐块对拍**）、桌面真机 96/96（存→换角色取→独立 CDP 读块） |
+| 验收 | 替身层 197/197（含**与官方序列化器逐块对拍**）、桌面真机 99/99（存→换角色取→独立 CDP 读块） |
 
 ### 这一轮踩到的两个真坑（都写进断言了）
 
@@ -256,6 +256,7 @@ CDP 那条路也有它自己的盲区：`desktop-cdp-check.mjs` 只在装了 Tur
 | 可观测 | `scratch_state` / `scratch_profile` / `scratch_screenshot` | 状态读 `runtime.threads`/`clones`/`currentStepTime`；截图走 CDP `Page.captureScreenshot`（页面里做不到） |
 | 结构视图 | `scratch_list_scripts` | 用 `runtime._hats` 判定真脚本 vs 游离块（不靠 opcode 前缀猜） |
 | 省往返 | `scratch_batch` / `scratch_selftest` | 批处理**白名单只放只读/运行期 op**：写操作走批处理 = 绕过 preview 确认 |
+| 可观测·加料 | `scratch_profile` 的归因 | 每 100ms 采线程栈 → 归到脚本根（`hot`）+ 最热 opcode；「等 N 秒」单列 `waitPct`，不当热点 |
 | 瘦身 | `read_script` / `watch` 加参数 | 见下 |
 
 ### 三条「以前没人守得住」的契约，现在有断言

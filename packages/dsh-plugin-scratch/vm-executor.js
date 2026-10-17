@@ -642,22 +642,16 @@
   /** live input（{name, block, shadow}）→ sb3 输入描述数组 */
   function inputToSb3(inp, all) {
     if (!inp || typeof inp !== 'object') return null
-    const block = inp.block || null
-    const shadow = inp.shadow || null
-    if (block && shadow && block === shadow) {
-      const p = primitiveDesc(block, all)
-      return [1, p || block] // p 命中 = 字面量；否则是菜单影子块（looks_costume 这类），当块引用
-    }
-    if (block && shadow) {
-      const p = primitiveDesc(shadow, all)
-      return [3, block, p || shadow]
-    }
-    if (block) return [2, block]
-    if (shadow) {
-      const p = primitiveDesc(shadow, all)
-      return [1, p || shadow]
-    }
-    return null
+    const block = inp.block
+    const shadow = inp.shadow
+    // 顺序和官方 serializeInputs 一致（block===shadow → 1；shadow 就是 null → 2；其余 → 3），
+    // 否则跟官方输出对不上：shareBlocksToTarget 建出来的语句输入 shadow 是 **undefined**
+    // 而不是 null，官方会把它当"有影子"写成 [3, block, null]。
+    const done = (id) => (id === undefined || id === null ? id : (primitiveDesc(id, all) || id))
+    if (block === shadow) return [1, done(block)]
+    if (shadow === null) return [2, done(block)]
+    const s = done(shadow)
+    return [3, done(block), s === undefined ? null : s]
   }
 
   function liveBlockToSb3(b, all) {
@@ -1707,21 +1701,83 @@
       }
 
       case 'profile': {
-        // 采样 VM 自己报的步进耗时（runtime.currentStepTime），比项目里那个 fps 变量可信
+        // 采样 VM 自己报的步进耗时（runtime.currentStepTime），比项目里那个 fps 变量可信。
+        // 默认还做**归因**（attribution）：每隔 100ms 看一眼每个线程正卡在哪个块，
+        // 顺着 parent 链归到"哪条脚本"。这样 AI 量出 p95 高之后，下一步就知道去改哪条，
+        // 而不是笼统地说"项目慢"。纯只读，不改 VM 任何状态。
         const secs = Math.min(Math.max(Number(args && args.seconds) || 3, 0.5), 10)
+        const wantAttr = args.attribution !== false
+        const topN = Math.min(Math.max(Number(args && args.topN) || 8, 1), 20)
         const samples = []
         const threadPeak = { n: 0 }
+        const attr = {
+          ticks: 0, base: 0, wait: 0, opcodes: Object.create(null),
+          scripts: Object.create(null), roots: new Map()
+        }
+        /** 当前线程栈顶块 → 它所属脚本的根（父链走到底）。按 (target,blockId) 缓存，别每次重走 */
+        const rootOf = (target, blockId, blocks) => {
+          const ck = target.id + '|' + blockId
+          const hit = attr.roots.get(ck)
+          if (hit !== undefined) return hit
+          let cur = blocks[blockId]
+          let rootId = blockId
+          let guard = 0
+          while (cur && cur.parent && blocks[cur.parent] && guard++ < 4000) {
+            rootId = cur.parent
+            cur = blocks[cur.parent]
+          }
+          attr.roots.set(ck, rootId)
+          return rootId
+        }
+        const tick = () => {
+          attr.ticks++
+          const threads = (vm.runtime.threads || []).filter(th => th.status !== 4)
+          if (threads.length > threadPeak.n) threadPeak.n = threads.length
+          // 极端情况（几千个克隆体同时跑）别把采样本身变成瓶颈：每轮最多看 400 个线程
+          const cap = threads.length > 400 ? 400 : threads.length
+          const stride = threads.length > 400 ? Math.ceil(threads.length / 400) : 1
+          for (let i = 0; i < cap; i += 1) {
+            const th = threads[i * stride]
+            if (!th) continue
+            let blockId = null
+            try { blockId = typeof th.peekStack === 'function' ? th.peekStack() : null } catch { blockId = null }
+            if (!blockId) continue
+            const target = th.target
+            const blocks = target && target.blocks && target.blocks._blocks
+            if (!blocks || !blocks[blockId]) continue
+            const b = blocks[blockId]
+            // 「等 1 秒」「等条件」这类是空转，不是吃帧；单独计数，别让它们污染热点排名
+            if (b.opcode === 'control_wait' || b.opcode === 'control_wait_until' || b.opcode === 'control_glide_to') {
+              attr.wait++
+              continue
+            }
+            attr.base++
+            attr.opcodes[b.opcode] = (attr.opcodes[b.opcode] || 0) + 1
+            const rootId = rootOf(target, blockId, blocks)
+            const root = blocks[rootId] || b
+            const key = target.getName() + '#' + rootId
+            let s = attr.scripts[key]
+            if (!s) {
+              s = attr.scripts[key] = {
+                target: target.getName(), blockId: rootId, hat: root.opcode,
+                label: scriptLabel(blocks, { opcode: root.opcode, blockId: rootId }),
+                count: 0, opcodes: Object.create(null)
+              }
+            }
+            s.count++
+            s.opcodes[b.opcode] = (s.opcodes[b.opcode] || 0) + 1
+          }
+        }
         const t0 = Date.now()
         while (Date.now() - t0 < secs * 1000) {
           const v = vm.runtime.currentStepTime
           if (typeof v === 'number' && v > 0) samples.push(v)
-          const active = (vm.runtime.threads || []).filter(th => th.status !== 4).length
-          if (active > threadPeak.n) threadPeak.n = active
+          if (wantAttr) tick()
           await sleepMs(100)
         }
         const pct = (p) => (samples.length ? samples.slice().sort((x, y) => x - y)[Math.min(samples.length - 1, Math.floor((samples.length - 1) * p))] : null)
         const avg = samples.length ? samples.reduce((x, y) => x + y, 0) / samples.length : null
-        return {
+        const out = {
           seconds: secs,
           samples: samples.length,
           stepMs: {
@@ -1732,6 +1788,31 @@
           threadsPeak: threadPeak.n,
           note: 'stepMs = VM 每帧步进耗时（含所有脚本）。fps 由它反推；项目自己的 fps 变量常常是存档残留值，别信。'
         }
+        if (wantAttr) {
+          const total = attr.base + attr.wait
+          const top = (obj, n) => Object.entries(obj).sort((a, b) => b[1] - a[1]).slice(0, n).map(([k, v]) => [k, v])
+          out.attribution = {
+            ticks: attr.ticks,
+            samples: total,
+            // 热脚本排行：pct 是"有线程卡在这条脚本上的采样占比"
+            hot: Object.values(attr.scripts).sort((a, b) => b.count - a.count).slice(0, topN).map(s => ({
+              target: s.target,
+              blockId: s.blockId,
+              hat: s.hat,
+              label: s.label,
+              count: s.count,
+              pct: total ? Number((s.count / total * 100).toFixed(1)) : 0,
+              topOpcodes: top(s.opcodes, 3).map(([op, n]) => op + '×' + n)
+            })),
+            topOpcodes: top(attr.opcodes, topN).map(([op, n]) => ({ opcode: op, count: n, pct: total ? Number((n / total * 100).toFixed(1)) : 0 })),
+            waitPct: total ? Number((attr.wait / total * 100).toFixed(1)) : 0,
+            idlePct: total ? 0 : 100
+          }
+          if (!total) {
+            out.attribution.hint = '这一轮没有线程在跑（没点绿旗 / 项目是静态的），所以归因为空。先 scratch_run greenflag 再量'
+          }
+        }
+        return out
       }
 
       case 'user_context': {

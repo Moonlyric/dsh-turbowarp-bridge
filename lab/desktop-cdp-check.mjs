@@ -321,10 +321,31 @@ try {
   t('截图是合法 PNG（魔数 89 50 4E 47）', shotBuf[0] === 0x89 && shotBuf[1] === 0x50 && shotBuf[2] === 0x4e && shotBuf[3] === 0x47,
     shotBuf.subarray(0, 4).toString('hex'))
 
+  // 归因要真机验：先注入一条"每帧都在跑"的循环，再量 —— 这样热点榜里必须出现它。
+  // （只量不跑的项目，归因返回 samples=0 并提示先点绿旗，那种情况在这里单独断言。）
+  const idleProf = await call('scratch_profile', { seconds: 0.6 })
+  t('没线程在跑时归因为空，并提示先点绿旗（不编造热点）',
+    idleProf.attribution && idleProf.attribution.samples === 0 && /绿旗/.test(idleProf.attribution.hint || ''),
+    J(idleProf.attribution, 200))
+  const loopBlocks = {
+    lhat: { opcode: 'event_whenflagclicked', next: 'llo', parent: null, inputs: {}, fields: {}, shadow: false, topLevel: true, x: 400, y: 60 },
+    llo: { opcode: 'control_forever', next: null, parent: 'lhat', inputs: { SUBSTACK: [2, 'lstep'] }, fields: {}, shadow: false, topLevel: false },
+    lstep: { opcode: 'motion_changexby', next: null, parent: 'llo', inputs: { DX: [1, [4, '1']] }, fields: {}, shadow: false, topLevel: false }
+  }
+  const loopPreview = await call('scratch_add_blocks', { target: workTarget, blocks: loopBlocks })
+  const loopApplied = await call('scratch_apply', { planId: loopPreview.planId })
+  const loopHatId = loopApplied.idMap && loopApplied.idMap.lhat
+  await call('scratch_run', { action: 'greenflag', waitMs: 500 })
   const prof = await call('scratch_profile', { seconds: 1 })
   t('scratch_profile 采到了真实步进耗时（stepMs.avg 是正数）',
     prof.stepMs && typeof prof.stepMs.avg === 'number' && prof.stepMs.avg > 0, J(prof.stepMs, 160))
   t('profile 反推出的 fps 是合理值（1~1000）', prof.fps > 0 && prof.fps <= 1000, String(prof.fps))
+  const hotLoop = (prof.attribution && prof.attribution.hot || []).find(h => h.blockId === loopHatId)
+  t('归因认出了那条每帧都在跑的脚本（真机上的线程栈采样）',
+    !!hotLoop && hotLoop.target === workTarget && hotLoop.pct > 0, J(hotLoop || (prof.attribution && prof.attribution.hot), 260))
+  t('归因里带它最热的 opcode（知道该改哪几块）',
+    !!hotLoop && Array.isArray(hotLoop.topOpcodes) && hotLoop.topOpcodes.length > 0, J(hotLoop && hotLoop.topOpcodes, 160))
+  await call('scratch_run', { action: 'stopall', waitMs: 150 })
 
   const scripts = await call('scratch_list_scripts', { target: workTarget })
   t('scratch_list_scripts 找到刚注入的绿旗脚本',

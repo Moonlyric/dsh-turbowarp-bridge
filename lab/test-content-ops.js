@@ -139,6 +139,8 @@ async function main() {
     if (cond) { pass++; console.log(`  PASS ${name}`) }
     else { fail++; console.log(`  FAIL ${name}${detail ? ' | ' + detail : ''}`) }
   }
+  /** 打诊断用：JSON.stringify(undefined) 返回 undefined，直接 .slice 会把测试自己搞崩 */
+  const J2 = (v, n = 200) => String(JSON.stringify(v === undefined ? null : v)).slice(0, n)
 
   const vm = await makeVM()
   console.log('[setup] headless VM ready')
@@ -872,6 +874,53 @@ async function main() {
   t('profile ok 且回 stepMs 的 avg/p50/p95/max', r.ok === true && r.result.stepMs &&
     ['avg', 'p50', 'p95', 'max'].every(k => k in r.result.stepMs), r.error)
   t('profile 如实标注采样秒数（不假装采了很久）', r.result.seconds === 0.5, String(r.result.seconds))
+
+  // ---- profile 归因（v0.8.0）：量出"慢"之后要能说出"哪条脚本慢" ----
+  // 造两条脚本：A 每帧都在跑（热点），B 大部分时间卡在「等 0.1 秒」（空转，不该算热点）
+  const loopTpl = {
+    lp_hatA: { opcode: 'event_whenflagclicked', next: 'lp_foreverA', parent: null, inputs: {}, fields: {}, shadow: false, topLevel: true, x: 900, y: 40 },
+    lp_foreverA: { opcode: 'control_forever', next: null, parent: 'lp_hatA', inputs: { SUBSTACK: [2, 'lp_stepA'] }, fields: {}, shadow: false, topLevel: false },
+    lp_stepA: { opcode: 'motion_changexby', next: null, parent: 'lp_foreverA', inputs: { DX: [1, [4, '1']] }, fields: {}, shadow: false, topLevel: false },
+    lp_hatB: { opcode: 'event_whenflagclicked', next: 'lp_foreverB', parent: null, inputs: {}, fields: {}, shadow: false, topLevel: true, x: 900, y: 300 },
+    lp_foreverB: { opcode: 'control_forever', next: null, parent: 'lp_hatB', inputs: { SUBSTACK: [2, 'lp_waitB'] }, fields: {}, shadow: false, topLevel: false },
+    lp_waitB: { opcode: 'control_wait', next: null, parent: 'lp_foreverB', inputs: { DURATION: [1, [5, '0.1']] }, fields: {}, shadow: false, topLevel: false }
+  }
+  r = await rpc('add_blocks', { target: 'Sprite1', blocks: loopTpl })
+  t('注入两条常驻循环（热点 + 空转各一条）', r.ok === true, r.error)
+  const lpHotHat = r.result.idMap.lp_hatA
+  const lpWaitHat = r.result.idMap.lp_hatB
+  await rpc('run', { action: 'greenflag', waitMs: 300 })
+  r = await rpc('profile', { seconds: 1 })
+  const attrOk = r.ok === true && r.result.attribution && r.result.attribution.samples > 0
+  t('profile 默认带 attribution（归因：哪个块/哪条脚本在吃帧）', attrOk, J2(r.result && r.result.attribution, 200))
+  t('归因里 hot 是按采样数排序的（第一条 pct 最高）',
+    r.result.attribution.hot.length > 0 &&
+    r.result.attribution.hot.every((h, i, arr) => i === 0 || arr[i - 1].count >= h.count),
+    JSON.stringify((r.result.attribution.hot || []).slice(0, 3)))
+  const hotA = (r.result.attribution.hot || []).find(h => h.blockId === lpHotHat)
+  t('热点榜里认出了那条每帧都在跑的脚本（按脚本根 blockId 归因，不是只报 opcode）',
+    !!hotA && hotA.target === 'Sprite1' && hotA.hat === 'event_whenflagclicked' && hotA.pct > 0,
+    JSON.stringify(hotA || {}))
+  t('热点脚本还带它内部最热的 opcode（知道该改哪几块）',
+    !!hotA && Array.isArray(hotA.topOpcodes) && hotA.topOpcodes.length > 0, JSON.stringify(hotA && hotA.topOpcodes))
+  const waitEntry = (r.result.attribution.hot || []).find(h => h.blockId === lpWaitHat)
+  t('「等 N 秒」这类空转单独算 waitPct，且不会把空转脚本排到第一（否则永远在喊 wait 慢）',
+    r.result.attribution.waitPct > 0 && hotA && hotA.pct > (waitEntry ? waitEntry.pct : 0),
+    `waitPct=${r.result.attribution.waitPct} 热点=${hotA && hotA.pct} 空转脚本=${waitEntry && waitEntry.pct}`)
+  t('归因的 pct 不超过 100%（占比口径没写错）',
+    (r.result.attribution.hot || []).every(h => h.pct >= 0 && h.pct <= 100) &&
+    r.result.attribution.topOpcodes.every(o => o.pct >= 0 && o.pct <= 100),
+    JSON.stringify(r.result.attribution.topOpcodes.slice(0, 3)))
+  t('归因返回体积可控（< 8KB）', Buffer.byteLength(JSON.stringify(r.result)) < 8192,
+    Buffer.byteLength(JSON.stringify(r.result)) + ' bytes')
+  await rpc('run', { action: 'stopall', waitMs: 100 })
+  r = await rpc('profile', { seconds: 0.5, attribution: false })
+  t('attribution:false 时不返回归因（省体积的开关真的生效）',
+    r.ok === true && r.result.attribution === undefined, JSON.stringify(Object.keys(r.result || {})))
+  r = await rpc('profile', { seconds: 0.5 })
+  t('没线程在跑时归因为空，并给出"先点绿旗"的提示（不编造热点）',
+    r.ok === true && r.result.attribution.samples === 0 && /绿旗/.test(r.result.attribution.hint || ''),
+    J2(r.result.attribution, 200))
 
   // ---- click ----
   r = await rpc('click', { target: 'Sprite1' })

@@ -1890,15 +1890,24 @@ export function apply(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'scratch_profile',
     description: '量性能：采样 VM 每一步的耗时（runtime.currentStepTime），给 avg/p50/p95/max 和反推的 fps。'
-      + '比项目里那个 fps 变量可信（那个常常是存档残留值）。',
+      + '比项目里那个 fps 变量可信（那个常常是存档残留值）。'
+      + '**默认还做归因**（attribution）：每隔 100ms 看每个线程正卡在哪个块、顺着父链归到哪条脚本 —— '
+      + '于是「p95 是 12ms」这种数字能接着回答「是哪条脚本吃的帧」。'
+      + 'attribution 里的 pct 是有线程卡在这条脚本上的采样占比；「等 1 秒」这类空转单独算 waitPct，不算热点。',
     parameters: {
       session: { type: 'string' },
-      seconds: { type: 'number', description: '采样几秒（缺省 3，上限 10）' }
+      seconds: { type: 'number', description: '采样几秒（缺省 3，上限 10）' },
+      attribution: { type: 'boolean', description: 'false = 只量总耗时，不做热点归因' },
+      topN: { type: 'number', description: '热点榜取前几名（缺省 8，上限 20）' }
     },
     output: jsonOut,
     async execute(args) {
       const sid = needSession(args?.session)
-      return await call(sid, 'profile', { seconds: args?.seconds }, 30000)
+      return await call(sid, 'profile', {
+        seconds: args?.seconds,
+        attribution: args?.attribution === false ? false : undefined,
+        topN: args?.topN
+      }, 30000)
     }
   }))
 
