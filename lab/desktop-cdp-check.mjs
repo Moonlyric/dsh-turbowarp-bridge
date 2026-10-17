@@ -341,10 +341,27 @@ try {
     prof.stepMs && typeof prof.stepMs.avg === 'number' && prof.stepMs.avg > 0, J(prof.stepMs, 160))
   t('profile 反推出的 fps 是合理值（1~1000）', prof.fps > 0 && prof.fps <= 1000, String(prof.fps))
   const hotLoop = (prof.attribution && prof.attribution.hot || []).find(h => h.blockId === loopHatId)
-  t('归因认出了那条每帧都在跑的脚本（真机上的线程栈采样）',
-    !!hotLoop && hotLoop.target === workTarget && hotLoop.pct > 0, J(hotLoop || (prof.attribution && prof.attribution.hot), 260))
-  t('归因里带它最热的 opcode（知道该改哪几块）',
-    !!hotLoop && Array.isArray(hotLoop.topOpcodes) && hotLoop.topOpcodes.length > 0, J(hotLoop && hotLoop.topOpcodes, 160))
+  // ⚠️ 真实 TurboWarp 默认开着「编译器」：脚本被编译成 JS，线程栈不移动（实测 stack 恒为 [帽子块]、
+  //    blockGlowInFrame 也不动、runtime.profiler 是 null）。所以这里验的是**它有没有如实降级** ——
+  //    硬要求块级热点，等于要求它撒谎。
+  console.log('  归因模式: ' + JSON.stringify({
+    compiled: prof.attribution && prof.attribution.compiled,
+    granularity: prof.attribution && prof.attribution.granularity
+  }))
+  if (prof.attribution && prof.attribution.compiled) {
+    const scriptHit = (prof.attribution.scripts || []).find(s => s.blockId === loopHatId)
+    t('编译器开着时如实报 compiled=true + granularity=script（不冒充块级热点）',
+      prof.attribution.granularity === 'script' && prof.attribution.hot === undefined, J(prof.attribution, 200))
+    t('脚本级归因里认出了那条在跑的脚本（活跃线程占比）',
+      !!scriptHit && scriptHit.target === workTarget && scriptHit.pct > 0, J(scriptHit || prof.attribution.scripts, 240))
+    t('并用大白话告诉用户怎么才能拿到块级（关掉编译器）',
+      /编译器/.test(prof.attribution.note || '') && /关掉/.test(prof.attribution.note || ''), String(prof.attribution.note).slice(0, 120))
+  } else {
+    t('归因认出了那条每帧都在跑的脚本（真机上的线程栈采样）',
+      !!hotLoop && hotLoop.target === workTarget && hotLoop.pct > 0, J(hotLoop || (prof.attribution && prof.attribution.hot), 260))
+    t('归因里带它最热的 opcode（知道该改哪几块）',
+      !!hotLoop && Array.isArray(hotLoop.topOpcodes) && hotLoop.topOpcodes.length > 0, J(hotLoop && hotLoop.topOpcodes, 160))
+  }
   await call('scratch_run', { action: 'stopall', waitMs: 150 })
 
   const scripts = await call('scratch_list_scripts', { target: workTarget })

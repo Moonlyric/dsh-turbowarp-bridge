@@ -47,9 +47,12 @@
   `scratch_snapshot` 是整项目 project.json，大项目别整份拉（token 会爆）
 - 性能问题用 `scratch_profile({seconds:3})` 量（读 VM 自己的步进耗时），别信项目里那个 `fps` 变量；
   量法写进 runtime-control.md
-- **量出"慢"之后要用归因说清"哪条脚本慢"**：`profile` 默认带 `attribution.hot`
-  （每隔 100ms 看每个线程卡在哪个块、顺父链归到脚本根），字段：
-  `target` / `blockId`（脚本根，可直接 `read_script({scriptId})`）/ `hat` / `pct` / `topOpcodes`。
-  `waitPct` 是「等 N 秒」这类空转占比 —— **别把 wait 当热点去优化**，那是设计不是 bug。
-  没线程在跑时归因为空并提示先点绿旗（先 `scratch_run` 再量，否则数字是假的）
+- **量出"慢"之后要用归因说清"哪条脚本慢"**：`profile` 默认带 `attribution`，先看 `granularity`：
+  - `block`（编译器关着）：`hot` 每条含 `target` / `blockId`（脚本根，可直接
+    `read_script({scriptId})`）/ `hat` / `pct` / `topOpcodes`。`waitPct` 是「等 N 秒」这类空转占比
+    —— **别把 wait 当热点优化**，那是设计不是 bug。
+  - `script`（**编译器开着，TurboWarp 桌面版默认**）：脚本被编译成 JS 跑，线程栈不移动，
+    所以只能给「哪条脚本的线程活着」（`scripts`），**拿不到块级热点**。要用块级就让用户在设置里
+    关掉「编译器」再量，或者用 `stepMs` 做改前/改后对比 —— 这种模式下**别编造"哪个块最慢"**。
+  - 没线程在跑时归因为空并提示先点绿旗（先 `scratch_run` 再量，否则数字是假的）
 - 改动前快照是自动的（scratch_add_blocks 内置），但**连续多次改**建议口头告知用户每步要改什么——preview 档的存在意义就是这个

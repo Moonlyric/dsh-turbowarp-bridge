@@ -487,6 +487,12 @@ t('归因把「等 N 秒」这类空转单列（waitPct），不混进热点排�
   executorSrc.includes('control_wait_until') && executorSrc.includes('waitPct'))
 t('归因有采样上限（几千个克隆体时别让采样本身变成瓶颈）',
   executorSrc.includes('threads.length > 400'))
+t('执行器源码按 mtime 重读（改完 sync-executor 不用重启 dsh，重开编辑器就生效）',
+  /function executorSourceNow\(\)/.test(indexSrc) && /executorSource: executorSourceNow\(\)/.test(indexSrc) &&
+  !/let executorSource\s*=\s*''/.test(indexSrc))
+t('编译器开着时的降级契约写在执行器里（compiled/granularity=script，不给 hot 冒充块级）',
+  executorSrc.includes("granularity: 'script'") && executorSrc.includes("granularity: 'block'") &&
+  executorSrc.includes('compilerOptions'))
 
 // ==================== 12. v0.8.0：背包 ====================
 // 背包的存在意义是「AI 自己攒可复用的整块积木」（用户提的需求）。这里守的是**契约**：

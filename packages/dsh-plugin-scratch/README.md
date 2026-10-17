@@ -264,7 +264,7 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 - `test-tools.mjs` — 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 /
   CDP 桌面分支的启动参数与诚实报错 / `tagForPage` 四连 / 执行器副本一致性 / 桥端口被占自愈 /
   返回值无损 JSON / 打包契约（组合包字段、volatile 配置、浏览器半侧格式、窗口探针）+
-  v0.7.0 运行控制契约 + v0.8.0 背包与归因契约，107 断言）
+  v0.7.0 运行控制契约 + v0.8.0 背包与归因契约，109 断言）
 
 ## 测试状态（2026-10-18 本轮实测，VPN 全程关闭）
 
@@ -273,10 +273,10 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 | `test-skills.mjs` | 23/23 ✅ |
 | `test-bridge-auth.mjs` | 21/21 ✅ |
 | `test-backpack.mjs` | 36/36 ✅ |
-| `test-tools.mjs` | 107/107 ✅（含打包契约：组合包 / volatile 配置 / 浏览器半侧 / 窗口探针 + v0.7.0 运行控制 + v0.8.0 背包与归因契约） |
+| `test-tools.mjs` | 109/109 ✅（含打包契约：组合包 / volatile 配置 / 浏览器半侧 / 窗口探针 + v0.7.0 运行控制 + v0.8.0 背包与归因契约） |
 | `../lab/test-content-ops.js` | 163/163 ✅（含瘦身体积断言：5000 项列表场景 < 64KB） |
 | `../lab/real-machine-check.mjs`（真 Chrome / Edge + 真 turbowarp.org；不传 `SB3_FIXTURE`） | 115/115 ✅（Chrome、Edge 各一遍） |
-| `../lab/desktop-cdp-check.mjs`（TurboWarp Desktop + CDP；真开一个窗口、跑完自动关） | 99/99 ✅（含窗口可见性交叉验证 + 绿旗后角色真位移） |
+| `../lab/desktop-cdp-check.mjs`（TurboWarp Desktop + CDP；真开一个窗口、跑完自动关） | 100/100 ✅（含窗口可见性交叉验证 + 绿旗后角色真位移） |
 
 真机那一轮跑的是完整闭环，**28 个工具全覆盖**：唤起编辑器（含"没有会话时给 token 步骤"这条路）
 → 装扩展 → 填 token → 打开 turbowarp.org/editor → 握手认证 → list_sessions → snapshot

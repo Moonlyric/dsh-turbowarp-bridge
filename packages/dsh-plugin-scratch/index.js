@@ -694,13 +694,26 @@ export function apply(ctx, config) {
   // ---------------- CDP 直连：不需要扩展的第二种会话 ----------------
   // 执行器源码 = 扩展用的那份 content-main.js 的同步副本（lab/sync-executor.mjs 保证一致，
   // test-tools.mjs 有逐字节断言）。CDP 会话把它注进编辑器进程的默认上下文即可。
+  // ⚠️ 每次注入前按 mtime 重读：以前是在插件加载时读一次就缓存 —— 结果改完执行器
+  //    （sync-executor + 重启编辑器）注进去的还是旧代码，真机上白验一轮。
   const executorPath = join(dirname(fileURLToPath(import.meta.url)), 'vm-executor.js')
-  let executorSource = ''
-  try {
-    executorSource = readFileSync(executorPath, 'utf8')
-  } catch (e) {
-    log.warn('vm-executor.js 读不到，CDP 直连（桌面版那条路）不可用：%s', e.message)
+  const executorCache = { at: 0, bytes: 0, source: '' }
+  function executorSourceNow() {
+    try {
+      const st = statSync(executorPath)
+      if (executorCache.source && executorCache.at === st.mtimeMs && executorCache.bytes === st.size) return executorCache.source
+      const src = readFileSync(executorPath, 'utf8')
+      executorCache.at = st.mtimeMs
+      executorCache.bytes = st.size
+      executorCache.source = src
+      return src
+    } catch (e) {
+      log.warn('vm-executor.js 读不到，CDP 直连（桌面版那条路）不可用：%s', e.message)
+      return executorCache.source || ''
+    }
   }
+  // 保留这个名字：有几处（selftest / 文档）读的是「有没有执行器」
+  const executorSource = executorSourceNow()
 
   /**
    * 把一个已连上的 CDP 端点注册成**普通会话**：28 个工具全都照常工作，无需改工具层。
@@ -757,7 +770,7 @@ export function apply(ctx, config) {
     try {
       handle = await attachCdp({
         port,
-        executorSource,
+        executorSource: executorSourceNow(),
         timeoutMs: cdpTimeoutMs,
         log: (m) => log.info('CDP: %s', m),
         onMessage: (msg) => { if (sid) dispatchClientMessage(sid, msg) },
@@ -1893,7 +1906,9 @@ export function apply(ctx, config) {
       + '比项目里那个 fps 变量可信（那个常常是存档残留值）。'
       + '**默认还做归因**（attribution）：每隔 100ms 看每个线程正卡在哪个块、顺着父链归到哪条脚本 —— '
       + '于是「p95 是 12ms」这种数字能接着回答「是哪条脚本吃的帧」。'
-      + 'attribution 里的 pct 是有线程卡在这条脚本上的采样占比；「等 1 秒」这类空转单独算 waitPct，不算热点。',
+      + 'attribution 里的 pct 是有线程卡在这条脚本上的采样占比；「等 1 秒」这类空转单独算 waitPct，不算热点。'
+      + '⚠️ TurboWarp 的「编译器」开着时（桌面版默认开）脚本被编译成 JS、线程栈不移动，'
+      + '这时只能给脚本级（granularity:"script"，看哪条脚本的线程活着），要块级热点得先在设置里关掉编译器。',
     parameters: {
       session: { type: 'string' },
       seconds: { type: 'number', description: '采样几秒（缺省 3，上限 10）' },

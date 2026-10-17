@@ -913,6 +913,26 @@ async function main() {
     JSON.stringify(r.result.attribution.topOpcodes.slice(0, 3)))
   t('归因返回体积可控（< 8KB）', Buffer.byteLength(JSON.stringify(r.result)) < 8192,
     Buffer.byteLength(JSON.stringify(r.result)) + ' bytes')
+
+  // ---- 归因的降级契约：TurboWarp 的编译器开着时线程栈不移动（真机实测 stack 恒为 [帽子块]）----
+  // 这条是**真机踩出来的**：桌面版默认 compilerOptions.enabled=true，脚本被编译成 JS 跑，
+  // 采样只能看到"哪条脚本的线程活着"。必须如实降级，不能把 100% 挂在帽子块上冒充块级热点。
+  vm.runtime.compilerOptions = { enabled: true }
+  r = await rpc('profile', { seconds: 0.6 })
+  t('编译器开着时如实降级成「脚本级」（granularity=script，不给 hot/topOpcodes 以免误导）',
+    r.ok === true && r.result.attribution.compiled === true && r.result.attribution.granularity === 'script' &&
+    r.result.attribution.hot === undefined && r.result.attribution.topOpcodes === undefined &&
+    Array.isArray(r.result.attribution.scripts) && r.result.attribution.scripts.length > 0,
+    J2(r.result.attribution, 240))
+  t('降级时用大白话说明为什么给不了块级、以及怎么才能拿到',
+    /编译器/.test(r.result.attribution.note || '') && /关掉/.test(r.result.attribution.note || ''),
+    String(r.result.attribution.note))
+  delete vm.runtime.compilerOptions
+  r = await rpc('profile', { seconds: 0.5 })
+  t('编译器关掉后又回到块级归因（granularity=block，两种模式各说各的）',
+    r.ok === true && r.result.attribution.compiled === false && r.result.attribution.granularity === 'block' &&
+    Array.isArray(r.result.attribution.hot), J2(r.result.attribution, 200))
+
   await rpc('run', { action: 'stopall', waitMs: 100 })
   r = await rpc('profile', { seconds: 0.5, attribution: false })
   t('attribution:false 时不返回归因（省体积的开关真的生效）',

@@ -2,7 +2,9 @@
 node_modules/
 
 # 快照 / 运行期产物（$DSH_HOME/scratch-snapshots 默认在 ~/.dsh，这里兜底）
+# scratch-shots 是截图落盘目录（默认在快照目录同级，本项目配置里就在仓库根）
 scratch-snapshots/
+scratch-shots/
 *.log
 
 # ---- 以下只留在本地，不公开 ----

@@ -1791,22 +1791,51 @@
         if (wantAttr) {
           const total = attr.base + attr.wait
           const top = (obj, n) => Object.entries(obj).sort((a, b) => b[1] - a[1]).slice(0, n).map(([k, v]) => [k, v])
-          out.attribution = {
-            ticks: attr.ticks,
-            samples: total,
-            // 热脚本排行：pct 是"有线程卡在这条脚本上的采样占比"
-            hot: Object.values(attr.scripts).sort((a, b) => b.count - a.count).slice(0, topN).map(s => ({
-              target: s.target,
-              blockId: s.blockId,
-              hat: s.hat,
-              label: s.label,
-              count: s.count,
-              pct: total ? Number((s.count / total * 100).toFixed(1)) : 0,
-              topOpcodes: top(s.opcodes, 3).map(([op, n]) => op + '×' + n)
-            })),
-            topOpcodes: top(attr.opcodes, topN).map(([op, n]) => ({ opcode: op, count: n, pct: total ? Number((n / total * 100).toFixed(1)) : 0 })),
-            waitPct: total ? Number((attr.wait / total * 100).toFixed(1)) : 0,
-            idlePct: total ? 0 : 100
+          // ⚠️ TurboWarp 的「编译器」开着时（compilerOptions.enabled=true —— 桌面版默认就是），
+          // 脚本被编译成 JS 执行，线程栈**不再移动**：真机实测 stack 恒等于 [帽子块]，
+          // blockGlowInFrame 也停在帽子上，runtime.profiler 是 null。
+          // 所以这时只能给「哪条脚本的线程活着」，给不出块级热点。必须如实说 ——
+          // 否则就会把 100% 挂在帽子上，冒充"热点是 event_whenflagclicked"。
+          let compiled = false
+          try { compiled = !!(vm.runtime.compilerOptions && vm.runtime.compilerOptions.enabled) } catch { compiled = false }
+          if (compiled) {
+            out.attribution = {
+              compiled: true,
+              granularity: 'script',
+              ticks: attr.ticks,
+              samples: total,
+              scripts: Object.values(attr.scripts).sort((a, b) => b.count - a.count).slice(0, topN).map(s => ({
+                target: s.target,
+                blockId: s.blockId,
+                hat: s.hat,
+                label: s.label,
+                count: s.count,
+                pct: total ? Number((s.count / total * 100).toFixed(1)) : 0
+              })),
+              note: 'TurboWarp 的编译器开着（compilerOptions.enabled=true）：脚本被编译成 JS 跑，线程栈不移动，'
+                + '所以只能看「哪条脚本的线程活着」，看不到块级热点（连"在算还是在等"都分不出来）。'
+                + '要块级热点：在 TurboWarp 设置里关掉「编译器」再量一次；或者用 stepMs 做改前/改后对比。'
+            }
+          } else {
+            out.attribution = {
+              compiled: false,
+              granularity: 'block',
+              ticks: attr.ticks,
+              samples: total,
+              // 热脚本排行：pct 是"有线程卡在这条脚本上的采样占比"
+              hot: Object.values(attr.scripts).sort((a, b) => b.count - a.count).slice(0, topN).map(s => ({
+                target: s.target,
+                blockId: s.blockId,
+                hat: s.hat,
+                label: s.label,
+                count: s.count,
+                pct: total ? Number((s.count / total * 100).toFixed(1)) : 0,
+                topOpcodes: top(s.opcodes, 3).map(([op, n]) => op + '×' + n)
+              })),
+              topOpcodes: top(attr.opcodes, topN).map(([op, n]) => ({ opcode: op, count: n, pct: total ? Number((n / total * 100).toFixed(1)) : 0 })),
+              waitPct: total ? Number((attr.wait / total * 100).toFixed(1)) : 0,
+              idlePct: total ? 0 : 100
+            }
           }
           if (!total) {
             out.attribution.hint = '这一轮没有线程在跑（没点绿旗 / 项目是静态的），所以归因为空。先 scratch_run greenflag 再量'
