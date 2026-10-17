@@ -20,10 +20,15 @@ AI 通过 `scratch_*` 工具读取/修改 Scratch 项目，用户在 TurboWarp �
         ↕ window.vm
 ```
 
-| 路径 | 要求 | 页面自报 | 会话 id | 工具返回值里的 `transport` |
-|---|---|---|---|---|
-| 扩展桥 | 装 MV3 扩展 + 选项页填 token | `transport=sw` | `tw-1` | `extension-bridge` |
-| CDP 直连 | 只要 TurboWarp Desktop，**零安装、零 token** | `transport=cdp` | `cd-1` | `cdp-desktop` |
+| 路径 | 定位 | 要求 | 页面自报 | 会话 id | 工具返回值里的 `transport` |
+|---|---|---|---|---|---|
+| CDP 直连 | **主力** | 只要 TurboWarp Desktop，**零安装、零 token** | `transport=cdp` | `cd-1` | `cdp-desktop` |
+| 扩展桥 | 备用 | 装 MV3 扩展 + 选项页填 token | `transport=sw` | `tw-1` | `extension-bridge` |
+
+> **取舍已定**：有 TurboWarp Desktop 就一律走桌面版（零安装零 token、离线可用、
+> **只有它能截图**）。扩展桥进**维护态** —— 修 bug，不加新功能；它只在三种情况下更好用：
+> 没装桌面版的机器、改浏览器里已开着的**在线作品**、同时开多个作品（多标签）。
+> Firefox / `captureVisibleTab`（浏览器路截图）都**不计划**。
 
 > 为什么桌面版必须走 CDP：TurboWarp Desktop 是 Electron 应用，**装不了 Chrome 扩展**
 > （它只有自己的 userscript addon 系统），扩展那条路对它根本无解。
@@ -145,7 +150,7 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 | `scratch_click` | 运行 | 点角色（按可见性→造型名筛克隆体，取包围盒中心）或点舞台坐标；`via` 说明走的是真 `pick` 还是退化的点击帽子 |
 | `scratch_press_key` | 运行 | 按键（空格 `" "`、`"ArrowUp"`、字母 `"a"`），可按住 `holdMs` |
 | `scratch_profile` | 读 | 采样 VM 每步耗时 → avg/p50/p95/max + 反推 fps（别信项目里的 `fps` 变量）；**默认带热点归因** `attribution.hot`（哪条脚本/哪些 opcode 在吃帧，空转单列 `waitPct`） |
-| `scratch_screenshot` | 读 | 截编辑器窗口（CDP；180-208ms 量级）落盘给路径 —— 给用户看效果 / 自己核对画面 |
+| `scratch_screenshot` | 读 | 截编辑器窗口（CDP；180-208ms 量级）落盘给路径 —— 给用户看效果 / 自己核对画面。**只有桌面版那条路能截**，扩展会话会明确拒绝（不打算给扩展加 `captureVisibleTab`） |
 | `scratch_list_scripts` | 读 | 顶层脚本清单（opcode/块数/调用的自定义积木/名字），**区分真脚本与游离块**（判定用 `runtime._hats`） |
 | `scratch_batch` | 读/运行 | 一次往返做多件事（≤12 条，白名单只放只读/运行期 op；写操作不许进来） |
 | `scratch_selftest` | 读 | 全链路自检：桥监听 / 会话 / CDP 注入 / 项目就绪 / Blockly / 窗口可见 |
@@ -159,11 +164,12 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 - **`path`（新参数）**：传 `.sb3` / `.sb2` / `project.json` 的绝对路径，就顺手把作品装进去
   （等于用户手动拖文件进去）。**已经有会话时不重复开窗口**，直接把文件装进现有会话，
   返回值里给 `loaded`。
-- `app=browser`（默认）：用**默认浏览器**打开 `turbowarp.org/editor`（也可传 `url` 打开指定作品），
+- `app=browser`（参数默认值，**备用路**）：用**默认浏览器**打开 `turbowarp.org/editor`（也可传 `url` 打开指定作品），
   然后在 `waitMs`（默认 20000，上限 60000）内等会话连上，返回 `connected`。
-  **这一条行为不变**——走的就是原来的扩展那条路。
+  **这一条行为不变**——走的就是原来的扩展那条路。只在该机器没装桌面版、或要改浏览器里已开着的
+  在线作品时才用它（这条路**不能截图**）。
   没连上时会把 token + 三步配置指引一起返回——AI 直接念给用户，用户填完**不用刷新**就会自己连上。
-- `app=desktop`（**CDP 直连**，零安装、零 token）：启动本地 TurboWarp Desktop 并给它带一个空闲的
+- `app=desktop`（**CDP 直连，主力路**；零安装、零 token）：启动本地 TurboWarp Desktop 并给它带一个空闲的
   `--remote-debugging-port`，再用 CDP 把同一份执行器注进编辑器页面的**默认执行上下文**
   （隔离上下文里没有 `window.vm`）。
   - 接上后**等编辑器里真有角色了才回报 `ready: true`**：桌面版冷启动是"GUI 先出来、项目后加载"，

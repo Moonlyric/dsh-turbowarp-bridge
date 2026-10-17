@@ -936,8 +936,8 @@ export function apply(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'scratch_open_editor',
     description: '帮用户把 TurboWarp 打开、并把作品装进去 —— 「AI 帮我打开我的作品」就是这一条。'
-      + '两条路：app=browser（默认）打开 turbowarp.org/editor，走**浏览器扩展**那套（用户要装扩展 + 填 token），装好后 AI 能读写积木；'
-      + 'app=desktop 启动本机 TurboWarp Desktop，走 **CDP 直连**那套（零安装、零 token，我给进程带上调试端口后直接驱动它），AI 一样能读写里面的积木；'
+      + '两条路：**装了 TurboWarp Desktop 就优先 app=desktop**（CDP 直连，零安装、零 token，我给进程带上调试端口后直接驱动它；而且只有这条路能截图）；'
+      + 'app=browser（参数默认值）打开 turbowarp.org/editor，走**浏览器扩展**那套（用户要装扩展 + 填 token，不能截图；只在该机器没装桌面版、或要改浏览器里已开着的在线作品时用）；'
       + '已经在跑的那份桌面版没带调试端口，接不进去，会如实告诉你，并给出重启的办法。'
       + 'path 传 .sb3 / .sb2 / project.json 绝对路径就顺手把作品打开（等于用户手动拖文件进去）；'
       + '已经有会话时不重复开，直接把文件装进那个会话。'
@@ -945,7 +945,7 @@ export function apply(ctx, config) {
       + 'show:false 则只接管、不把窗口显示出来。'
       + '不传 path 只开编辑器也行。返回值里的 connected / transport 是结论，别自己猜。',
     parameters: {
-      app: { type: 'string', description: 'browser（默认，扩展那条路）| desktop（CDP 直连，零安装）' },
+      app: { type: 'string', description: 'desktop（CDP 直连，零安装零 token，**装了桌面版就用这个**）| browser（扩展那条路，参数默认值；要装扩展 + token，不能截图）' },
       path: { type: 'string', description: '要打开的作品文件绝对路径（.sb3/.sb2/project.json），可选' },
       url: { type: 'string', description: 'app=browser 时要打开的地址（默认 https://turbowarp.org/editor，也可以传具体作品链接）' },
       waitMs: { type: 'number', description: '打开后等多久看会话连上，默认 20000，上限 60000' },
@@ -1950,7 +1950,8 @@ export function apply(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'scratch_screenshot',
     description: '截当前编辑器窗口（CDP Page.captureScreenshot，实测 180-208ms），返回落盘路径 + 字节数。'
-      + '改完积木给用户看效果、或自己核对画面时用。只有桌面版 CDP 会话能用。',
+      + '改完积木给用户看效果、或自己核对画面时用。只有桌面版 CDP 会话能用'
+      + '（浏览器扩展那条路没有这个能力，也不打算加 —— 要截图就用 open_editor({app:"desktop"}) 开桌面版）。',
     parameters: {
       session: { type: 'string' },
       path: { type: 'string', description: '存到哪（缺省 <快照目录同级>/scratch-shots/时间戳.png）' },

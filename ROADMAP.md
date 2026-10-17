@@ -7,7 +7,7 @@
 ## 架构（一句话）
 
 ```
-dsh 插件（Node，19 个 scratch_* 工具 + WebSocket 桥 :31820 + CDP 直连客户端）
+dsh 插件（Node，30 个 scratch_* 工具 + WebSocket 桥 :31820 + CDP 直连客户端）
 
   路一 · 扩展桥（用户自己的浏览器）
         ↕ JSON-RPC over ws（握手 token 认证）
@@ -53,13 +53,33 @@ AI 侧的入口是 `scratch_open_editor`：用户说「打开 TurboWarp」时，
 | **CDP 直连** | TurboWarp Desktop 零安装路径：带调试端口启动 + 注默认上下文 + 接管用户自己开的窗口 | ✅ 2026-10-17（v0.8.0 后 100/100，见下） |
 | **主动唤起** | `scratch_open_editor`：AI 自己开浏览器/桌面版并等会话连上；新增 `path` 装作品 | ✅ 2026-10-16 / 扩展于 2026-10-17 |
 | **文件往返** | `scratch_load_project` / `scratch_save_project`（打开本机 .sb3、存回磁盘、默认不覆盖） | ✅ |
-| **M3** | 断链/接链（moveBlock 的 parent 系）、变量/列表增删、造型删除改名、Firefox 支持（userscript 方向） | 未开始 |
+| **M3** | 断链/接链（moveBlock 的 parent 系）、变量/列表增删、造型删除改名 | 未开始（**Firefox 支持已决定不做**，见下） |
 | **背包** | **AI 自维护的代码块背包**：把做好的可复用积木（pen 文字引擎、弹幕骨架、ECS 骨架…）预存下来，下次直接取用 | ✅ v0.8.0（36+14 条断言，见下） |
 | **M4** | 多标签页路由（SW 已按 tab 记账，还差 UI）、快照 diff 预览 UI、性能（大项目分页读） | 部分（路由已做） |
 | **M5** | 发布：npm 组合包 + `dsh plugin add`（版本锁定） | 未开始 |
 
 > Desktop 原来排在 M3（把执行器改写成 TurboWarp userscript）。**CDP 直连先落地了**，
-> 那条 userscript 路不再是刚需 —— 现在 M3 里留着它只为 Firefox（那边没有 LNA 限制）。
+> 那条 userscript 路不再是刚需 —— 现在 **M3 里只剩「断链/接链 + 变量/列表增删 + 造型删改」**，
+> Firefox 那项已决定不做（见下面「路线取舍」）。
+
+## 路线取舍（2026-10-18，用户定的）
+
+**桌面版是主力，扩展桥进维护态（修 bug、不加功能）。**
+
+理由：用户装了 TurboWarp Desktop，那条路零安装零 token、离线可用、30 个工具全通，
+而且**是唯一能截图的**（CDP `Page.captureScreenshot`）。扩展桥只在三种它做不到的场景里更好用：
+
+| 场景 | 扩展桥 | 桌面版 |
+|---|---|---|
+| 机器上没装 TurboWarp Desktop | ✅ | ❌ |
+| 改浏览器里**已经开着的在线作品**（不用存盘重开） | ✅ | ❌（要把作品下成 .sb3） |
+| 同时开好几个作品、按 `session` 选着改 | ✅ 多标签 | ❌ 单实例 |
+| **截图** | ❌ | ✅ |
+| 安装成本 / token / 离线 / 多条链路（SW 回收、LNA、心跳） | ❌ 全都要 | ✅ 全都不需要 |
+
+据此**明确不做**：① 给扩展加 `captureVisibleTab`（浏览器路截图：要 `activeTab` 每次点图标授权，
+否则得 `<all_urls>`，不值得）；② Firefox userscript；③ Safari。
+扩展桥的既有测试（真机 115 条）继续当回归网跑，**不再为它加新能力**。
 
 ## LNA 事故（2026-10-17，最重要的一条）
 
@@ -322,7 +342,8 @@ CDP 那条路也有它自己的盲区：`desktop-cdp-check.mjs` 只在装了 Tur
 | 想法 | 结论 |
 |---|---|
 | 拿 **DSH Desktop 内置的浏览器面板**当编辑器宿主 | ❌ **现在不行**。DSH Desktop 本身就是 Electron（Chromium），也**确实内置了一个浏览器面板**：`@deepseek-ai/dsh-client-ui-sidebar-browser`，包描述是 "Sandboxed Web browser tabs for the right Sidebar"（右侧边栏的沙箱化网页标签页，带地址栏、前进后退、刷新、沙箱开关）。但它是 Electron 的 `<webview>` 标签：**装不了浏览器扩展，也没法从外面注入脚本**，所以当不了编辑器宿主。能用的是那两条路：用户自己的浏览器 + 扩展、TurboWarp Desktop + CDP |
-| **Firefox 支持**（userscript 方向） | 排在 M3。MV3 在 Firefox 上后台是事件页而不是 service worker，扩展里"SW 持 socket"那套设计要单独适配 —— **目前没有实现也没有验证**。好处是 Firefox 理论上没有 Local Network Access 那套限制，userscript 直接连 loopback 是可行方向 |
+| **Firefox 支持**（userscript 方向） | ❌ **已决定不做**（2026-10-18）。技术上可行（Firefox 没有 LNA 限制，页面能直连 loopback），但桌面版那条路已经覆盖了同一批需求，再维护一套 userscript 只换来一个浏览器 —— 不划算 |
+| 给扩展加 `captureVisibleTab`（浏览器路也能截图） | ❌ **已决定不做**。要么 `activeTab`（每次截图让用户点一次扩展图标），要么 `<all_urls>`（太吓人）；而桌面版本来就免费能截。浏览器路截图的需求 → 直接改用 `app:'desktop'` |
 | Safari | ❌ 不支持（不打算做） |
 
 ## 关键设计决策（为什么这样设计）
@@ -362,6 +383,11 @@ CDP 那条路也有它自己的盲区：`desktop-cdp-check.mjs` 只在装了 Tur
     这样"用户自己开着作品、AI 来改"才不用每次多开一个窗口。
     端口可配（`desktopDebugPort`），但**改了要同步改 `启动TurboWarp(AI可接管).cmd`** ——
     两边是同一个约定，脱钩了就接管不上。
+13. **桌面版是主力，扩展桥进维护态**（2026-10-18，用户定的）：有 TurboWarp Desktop 就一律
+    `app:'desktop'` —— 零安装零 token、离线可用、30 个工具全通，而且**只有它能截图**。
+    扩展桥继续留着并跑回归（真机 115 条），是因为桌面版做不到三件事：机器上没装桌面版、
+    改浏览器里已经开着的在线作品、多标签并行。但**不再为它加新能力**
+    （`captureVisibleTab`、Firefox userscript、Safari 全部明确不做）。
 
 ## 给接手 AI 的提示
 

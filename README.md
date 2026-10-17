@@ -22,10 +22,16 @@ dsh 插件（Node，30 个 scratch_* 工具 + WebSocket 桥 :31820）
 
 两条路读写的是**同一份**页面执行器，区别只在"消息怎么送到编辑器页面"：
 
-| 路径 | 要求 | 页面自报 | 会话 id | 工具返回值里的 `transport` |
-|---|---|---|---|---|
-| 扩展桥（原有） | 装 MV3 扩展 + 选项页填 token | `transport=sw` | `tw-1` | `extension-bridge` |
-| CDP 直连（新） | 只要 TurboWarp Desktop（**零安装、零 token**） | `transport=cdp` | `cd-1` | `cdp-desktop` |
+| 路径 | 定位 | 要求 | 页面自报 | 会话 id | 工具返回值里的 `transport` |
+|---|---|---|---|---|---|
+| CDP 直连 | **主力**（装了 TurboWarp Desktop 就用它） | 只要 TurboWarp Desktop（**零安装、零 token**） | `transport=cdp` | `cd-1` | `cdp-desktop` |
+| 扩展桥 | 备用 | 装 MV3 扩展 + 选项页填 token | `transport=sw` | `tw-1` | `extension-bridge` |
+
+**怎么选**：有 TurboWarp Desktop 就一律走桌面版 —— 零安装零 token、离线可用、30 个工具全通，
+而且**只有它能截图**（`scratch_screenshot`）。扩展桥留着应付三种它做不到的情况：
+① 这台机器没装桌面版；② 你已经在浏览器标签里编辑某个**在线作品**，不想存盘重开；
+③ 要同时开好几个作品（多标签，`scratch_list_sessions` 里按 `session` 选）。
+**能力上是桌面版 ⊃ 扩展桥**，反过来只有"在线作品 / 不装桌面版 / 多标签"这三项。
 
 为什么桌面版必须走 CDP：TurboWarp Desktop 是 Electron 应用，**装不了 Chrome 扩展**
 （它只有自己的 userscript addon 系统），扩展那条路对它无解。
@@ -53,16 +59,20 @@ dsh 插件（Node，30 个 scratch_* 工具 + WebSocket 桥 :31820）
 
 ## 装
 
-> 需要 dsh（DeepSeek Harness），以及下面**两条路里至少一条**：
+> 需要 dsh（DeepSeek Harness），以及下面**两条路里至少一条**（推荐第一条）：
 >
 > | 路 | 要什么 | 要装什么 |
 > |---|---|---|
-> | 浏览器 + 扩展桥 | 一个 Chromium 系浏览器（Windows 自带的 Edge 就够）+ 能访问 turbowarp.org 的网络 | MV3 扩展 + 填一次 token |
-> | TurboWarp Desktop + CDP 直连 | 只要 TurboWarp Desktop | **什么都不用装**（零安装、零 token）；想让 AI 接管你自己开的窗口，就用 `启动TurboWarp(AI可接管).cmd` 启动它 |
+> | **TurboWarp Desktop + CDP 直连**（推荐） | 只要 TurboWarp Desktop | **什么都不用装**（零安装、零 token）；想让 AI 接管你自己开的窗口，就用 `启动TurboWarp(AI可接管).cmd` 启动它 |
+> | 浏览器 + 扩展桥（备用） | 一个 Chromium 系浏览器（Windows 自带的 Edge 就够）+ 能访问 turbowarp.org 的网络 | MV3 扩展 + 填一次 token |
 >
-> 换一台没有 Chrome 的电脑：有 Edge 就能走第一条；连 Chromium 都装不了也不要紧——有 Desktop 就能走第二条。
+> 换一台机器：装了 TurboWarp Desktop 就零安装直接能用；没有才需要下面第 1 节的浏览器 + 扩展。
+> 代价是桌面版**不能**改浏览器里开着的在线作品、也不能多标签并行 —— 那两样只有扩展桥能做，
+> 而**截图只有桌面版能做**，这才是两者的取舍点。
 
-### 1. 浏览器扩展（约 1 分钟）
+### 1. 浏览器扩展（备用路，约 1 分钟）
+
+> **装了 TurboWarp Desktop 就跳过这节**，直接用第 4 节那条（零安装零 token，还能截图）。
 
 1. `chrome://extensions` → 右上角开**开发者模式**
 2. 「加载已解压的扩展程序」→ 选 `packages/tw-bridge-extension`
@@ -76,7 +86,7 @@ dsh 插件（Node，30 个 scratch_* 工具 + WebSocket 桥 :31820）
 | Chrome | ✅ 真机全链路验过（115/115） |
 | Edge | ✅ 已实测 115/115（`lab/real-machine-check.mjs` 把 `$env:CHROME_PATH` 指到 `msedge.exe`） |
 | Brave / Opera / Vivaldi 等 Chromium 系 | 同为 MV3、同一个手动安装流程，未逐个真机验 |
-| Firefox | ❌ **未支持**：MV3 的后台是事件页而不是 service worker，扩展里"SW 持 socket"这套设计要单独适配，目前没有实现也没有验证。理论上 Firefox 没有 LNA 那套限制，走 userscript 是可行方向（M3 计划里那条） |
+| Firefox | ❌ **不计划**：MV3 的后台是事件页而不是 service worker，扩展里"SW 持 socket"这套设计要单独适配。**已经决定不做** —— 桌面版那条路已经覆盖了"Firefox 用户也想要"的全部场景，为此再维护一套 userscript 不划算 |
 | Safari | ❌ 不支持 |
 
 > Edge 上唯一那条"失败"是验收脚本自己的断言：`Extensions.loadUnpacked` 是 Chrome 专属的 CDP 域，
