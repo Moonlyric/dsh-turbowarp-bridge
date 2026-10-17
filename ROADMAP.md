@@ -50,7 +50,7 @@ AI 侧的入口是 `scratch_open_editor`：用户说「打开 TurboWarp」时，
 | **审计 + 修** | 全项目审查：修掉「核心注入在真机上根本不工作」等 7 个真 bug，补断言防回归 | ✅ 2026-10-16 |
 | **LNA 改造** | socket 从页面搬进扩展 service worker + 心跳保活 + `lab` 加 LNA/保活断言 | ✅ 2026-10-17（这次绿才算数） |
 | **M0.5 真机** | 真 Chrome/Edge + 真 turbowarp.org 全链路自动验收（19 工具 + 存/读 sb3） | ✅ **115/115**（2026-10-17 关 VPN 实测，Chrome 与 Edge 各一遍；旧的 98/98 是假绿） |
-| **CDP 直连** | TurboWarp Desktop 零安装路径：带调试端口启动 + 注默认上下文 + 接管用户自己开的窗口 | ✅ 2026-10-17（54/54，见下） |
+| **CDP 直连** | TurboWarp Desktop 零安装路径：带调试端口启动 + 注默认上下文 + 接管用户自己开的窗口 | ✅ 2026-10-17（61/61，见下） |
 | **主动唤起** | `scratch_open_editor`：AI 自己开浏览器/桌面版并等会话连上；新增 `path` 装作品 | ✅ 2026-10-16 / 扩展于 2026-10-17 |
 | **文件往返** | `scratch_load_project` / `scratch_save_project`（打开本机 .sb3、存回磁盘、默认不覆盖） | ✅ |
 | **M3** | 断链/接链（moveBlock 的 parent 系）、变量/列表增删、造型删除改名、Firefox 支持（userscript 方向） | 未开始 |
@@ -129,7 +129,7 @@ fake-IP（198.18.x.x 之类的私网段），Chrome 据此判定"本页也是本
 `node lab/sync-executor.mjs`；`test-tools.mjs` 有一条逐字节一致的断言守着（忘了同步测试会红）。
 只检查：`node lab/sync-executor.mjs --check`。
 
-**验收闭环**：`lab/desktop-cdp-check.mjs`（54 条，本轮实测全绿）真开一个 TurboWarp 窗口、
+**验收闭环**：`lab/desktop-cdp-check.mjs`（61 条，本轮实测全绿）真开一个 TurboWarp 窗口、
 跑完自动关掉；它用**另一条独立的 CDP 连接**直接读 `vm.runtime.targets[].blocks._blocks` 当证据
 （不读插件自己的返回值），还会验"存盘 → 从磁盘装回来"的往返、**接管用户自己开的实例**
 （第 8 节：接管的是那个实例、没新开窗口、没重复注册会话、收尾关干净）、以及
@@ -187,14 +187,14 @@ hint 里说明"没动他的窗口"。
 
 | 套件 | 覆盖 | 结果 |
 |---|---|---|
-| `lab/test-content-ops.js` | 扩展执行器全协议（真实 `content-main.js` 进 Node vm 沙箱 + 真 headless scratch-vm） | 112/112 ✅ |
+| `lab/test-content-ops.js` | 扩展执行器全协议（真实 `content-main.js` 进 Node vm 沙箱 + 真 headless scratch-vm） | 114/114 ✅ |
 | `lab/real-machine-check.mjs` | **真 Chrome/Edge + 真 turbowarp.org 全链路**（装扩展 → token 握手 → 19 工具 + 存/读 sb3 + 45s 保活） | **115/115** ✅（Chrome、Edge 各一遍；不传 `SB3_FIXTURE`，传了真实 sb3 会更多） |
-| `lab/desktop-cdp-check.mjs` | **TurboWarp Desktop + CDP 直连**端到端（独立 CDP 连接读真 VM + 存盘往返 + 接管用户实例 + 关掉后会话自动掉线） | 54/54 ✅ |
+| `lab/desktop-cdp-check.mjs` | **TurboWarp Desktop + CDP 直连**端到端（独立 CDP 连接读真 VM + 存盘往返 + 接管用户实例 + 关掉后会话自动掉线） | 61/61 ✅ |
 | `lab/sync-executor.mjs` | 把扩展 `content-main.js` 同步成插件包的 `vm-executor.js`（`--check` 只检查） | 工具 ✅ |
 | `lab/test-vm-pipeline.js` | scratch-vm 管线冒烟（无断言，打印型） | 跑通 ✅ |
 | `lab/inspect-sb3.mjs` | 离线读 sb3/project.json：同时报**真块数**和**含影子块数**（引用块数必须写清数法） | 工具 ✅ |
 | `packages/dsh-plugin-scratch/test-skills.mjs` | skill 区 | 23/23 ✅ |
-| `packages/dsh-plugin-scratch/test-tools.mjs` | 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 / CDP 启动参数与诚实报错 / `tagForPage` / 执行器副本一致性） | 50/50 ✅ |
+| `packages/dsh-plugin-scratch/test-tools.mjs` | 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 / CDP 启动参数与诚实报错 / `tagForPage` / 执行器副本一致性 / 打包契约） | 73/73 ✅ |
 | `packages/dsh-plugin-scratch/test-bridge-auth.mjs` | 握手认证 + 跨会话伪造防护 + ping/pong 保活 | 21/21 ✅ |
 
 ```sh
