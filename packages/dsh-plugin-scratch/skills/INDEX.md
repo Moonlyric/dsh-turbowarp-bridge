@@ -17,6 +17,7 @@
 | sb3-json-reference.md | 写 add_blocks/update_block 前查 | inputs 数组编码字典 + 高频 opcode 表 |
 | project-planning.md | 用户没说清要什么时 | 体裁谱 + 5 问 + 起手模板 |
 | recipes.md | 不确定「正确姿势」时 | 8 个可直接抄的完整脚本 |
+| runtime-control.md | 要验证改动真的生效 / 点了没反应 / 量性能时 | 绿旗→状态→截图闭环 + 读积木的省上下文姿势 |
 
 ## 使用纪律（仅有的三条软约束）
 

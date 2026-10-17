@@ -1,4 +1,4 @@
-# dsh-plugin-scratch — TurboWarp 桥插件（v0.6.0 · 组合包安装 + 插件页配置 + CDP 直连）
+# dsh-plugin-scratch — TurboWarp 桥插件（v0.7.0 · 组合包安装 + 插件页配置 + CDP 直连 + 运行控制闭环）
 
 DSH（DeepSeek Harness）插件：把 TurboWarp 编辑器接入 agent。
 AI 通过 `scratch_*` 工具读取/修改 Scratch 项目，用户在 TurboWarp 界面里**实时**看到变化。
@@ -6,7 +6,7 @@ AI 通过 `scratch_*` 工具读取/修改 Scratch 项目，用户在 TurboWarp �
 架构（两条传输路径，读写的是**同一份**页面执行器）：
 
 ```
-本插件（Node）= WebSocket 服务端（桥 :31820） + CDP 直连客户端 + 19 个 scratch_* 工具 + Skill 经验库
+本插件（Node）= WebSocket 服务端（桥 :31820） + CDP 直连客户端 + 28 个 scratch_* 工具 + Skill 经验库
 
   路一 · 扩展桥
         ↕ JSON-RPC over ws（握手 token）
@@ -117,7 +117,7 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 > **只有浏览器（扩展桥）那条路要 token。** 桌面版走 CDP 直连：不用扩展、不用 token，
 > 因为它连的是"我们自己拉起来、自己注执行器"的进程，没有"本机任意页面都能连进来"这个问题。
 
-## 工具清单（19 个）
+## 工具清单（28 个）
 
 | 工具 | 方向 | 说明 |
 |---|---|---|
@@ -136,10 +136,19 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 | `scratch_delete_blocks` | 写 | 删块（级联），返回实删清单 + 悬空引用扫描 |
 | `scratch_tidy_blocks` | 写 | 整理布局（列排布） |
 | `scratch_get_opcodes` | 读 | opcode 白名单（防 AI 编造） |
-| `scratch_watch` | 读 | 变量订阅（start/poll/stop，Stage + 角色两层） |
+| `scratch_watch` | 读 | 变量订阅（start/poll/stop，Stage + 角色两层）；**列表默认只报长度**（`includeLists:true` 才跟，且只回首个变化位 + 样本） |
 | `scratch_user_context` | 读 | 用户最近动作（选块 / 绿旗 / 运行态）+ 当前选中块 |
 | `scratch_skills` | 读 | 经验库 list / read / toggle |
 | `scratch_skill_edit` | 写 | 经验库 create / update / append / delete |
+| `scratch_run` | 运行 | 点绿旗 / 停止全部 / 起停 VM 循环，返回动作前后的线程数、克隆数、页面变量 |
+| `scratch_state` | 读 | 运行期快照：`running`/`threads`/`targets`/`clones`/`stepMs`/`fps`/标量页变量；带 `target` 时附坐标/大小/可见/局部变量 |
+| `scratch_click` | 运行 | 点角色（按可见性→造型名筛克隆体，取包围盒中心）或点舞台坐标；`via` 说明走的是真 `pick` 还是退化的点击帽子 |
+| `scratch_press_key` | 运行 | 按键（空格 `" "`、`"ArrowUp"`、字母 `"a"`），可按住 `holdMs` |
+| `scratch_profile` | 读 | 采样 VM 每步耗时 → avg/p50/p95/max + 反推 fps（别信项目里的 `fps` 变量） |
+| `scratch_screenshot` | 读 | 截编辑器窗口（CDP；180-208ms 量级）落盘给路径 —— 给用户看效果 / 自己核对画面 |
+| `scratch_list_scripts` | 读 | 顶层脚本清单（opcode/块数/调用的自定义积木/名字），**区分真脚本与游离块**（判定用 `runtime._hats`） |
+| `scratch_batch` | 读/运行 | 一次往返做多件事（≤12 条，白名单只放只读/运行期 op；写操作不许进来） |
+| `scratch_selftest` | 读 | 全链路自检：桥监听 / 会话 / CDP 注入 / 项目就绪 / Blockly / 窗口可见 |
 
 ### scratch_open_editor：让 AI 自己去开编辑器
 
@@ -202,7 +211,7 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 
 ## Skill 区（Scratch 实践经验库）
 
-对社区高完成度作品**做法**的总结，8 篇经验文档：
+对社区高完成度作品**做法**的总结，9 篇经验文档：
 `getting-started` / `code-patterns` / `animation-visual` / `architecture` /
 `performance` / `sb3-json-reference` / `project-planning` / `recipes`。
 
@@ -217,13 +226,13 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 
 ## 文件
 
-- `index.js` — 入口：桥 + 握手 + 19 工具 + 快照持久化 + skill 区 + 桌面版启动
+- `index.js` — 入口：桥 + 握手 + 28 工具 + 快照持久化 + skill 区 + 桌面版启动
 - `cdp.js` — **CDP 直连**：给桌面版带调试端口启动、注入执行器、`tagForPage()` 贴协议标签
 - `vm-executor.js` — 扩展 `content-main.js` 的**逐字节副本**（CDP 注的就是它；
   改完扩展执行器跑 `node ../lab/sync-executor.mjs` 同步，`test-tools.mjs` 有一致性断言守着）
 - `lib/client.js` — **浏览器半侧**（手写的 __ModuleLoader__ bundle：插件页里的配置表单）
 - `win32-window.ps1` — 窗口可见性探针（EnumWindows + ShowWindow，Windows only）
-- `skills/` — 内置 8 篇经验 + `INDEX.md`
+- `skills/` — 内置 9 篇经验 + `INDEX.md`
 - `cordis.patch.yml` — **组合包层**（`dsh.bundle.patch` 指向它，安装时自动插入 `scratch` 行）
 - `test-skills.mjs` — skill 区单测（23 断言）
 - `test-bridge-auth.mjs` — 桥的握手认证与应答来源校验（21 断言，别删）
@@ -237,12 +246,12 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 |---|---|
 | `test-skills.mjs` | 23/23 ✅ |
 | `test-bridge-auth.mjs` | 21/21 ✅ |
-| `test-tools.mjs` | 73/73 ✅（含打包契约：组合包 / volatile 配置 / 浏览器半侧 / 窗口探针） |
-| `../lab/test-content-ops.js` | 114/114 ✅ |
+| `test-tools.mjs` | 92/92 ✅（含打包契约：组合包 / volatile 配置 / 浏览器半侧 / 窗口探针 + v0.7.0 运行控制契约） |
+| `../lab/test-content-ops.js` | 163/163 ✅（含瘦身体积断言：5000 项列表场景 < 64KB） |
 | `../lab/real-machine-check.mjs`（真 Chrome / Edge + 真 turbowarp.org；不传 `SB3_FIXTURE`） | 115/115 ✅（Chrome、Edge 各一遍） |
-| `../lab/desktop-cdp-check.mjs`（TurboWarp Desktop + CDP；真开一个窗口、跑完自动关） | 61/61 ✅（含窗口可见性交叉验证） |
+| `../lab/desktop-cdp-check.mjs`（TurboWarp Desktop + CDP；真开一个窗口、跑完自动关） | 83/83 ✅（含窗口可见性交叉验证 + 绿旗后角色真位移） |
 
-真机那一轮跑的是完整闭环，**19 个工具全覆盖**：唤起编辑器（含"没有会话时给 token 步骤"这条路）
+真机那一轮跑的是完整闭环，**28 个工具全覆盖**：唤起编辑器（含"没有会话时给 token 步骤"这条路）
 → 装扩展 → 填 token → 打开 turbowarp.org/editor → 握手认证 → list_sessions → snapshot
 → add_blocks（preview→apply）→ 直接读真 VM 的活块模型校验 → update_block → locate（含滚动/高亮）
 → delete_blocks → 再快照查孤儿 → rollback → get_opcodes → tidy_blocks → add_costume

@@ -5,7 +5,7 @@
 //   而且 Electron 应用（TurboWarp Desktop）根本装不了扩展 —— 官方不支持，那条路对它无解。
 //   但只要编辑器进程是**我们自己拉起来的**，就能给它带上 --remote-debugging-port，
 //   然后用 CDP 把**同一份页面执行器**（vm-executor.js，与扩展用的 content-main.js 同源）
-//   注进默认执行上下文 —— 于是 19 个工具全部照常工作，零安装、零 token。
+//   注进默认执行上下文 —— 于是 28 个工具全部照常工作，零安装、零 token。
 //
 // 关键事实（2026-10 真机验证，TurboWarp Desktop 1.16.0 / Electron 42 / Chromium 148）：
 //   · TurboWarp Desktop 接受 --remote-debugging-port，/json/list 里是 tw-editor://./gui/gui.html
@@ -287,6 +287,14 @@ export async function attachCdp({ port, executorSource, onMessage, onReady, onCl
         throw new Error(ex.exception && ex.exception.description ? ex.exception.description : ex.text)
       }
       return r.result && r.result.value
+    },
+    /**
+     * 直接发一条 CDP 命令（给页面拿不到的能力用，比如 Page.captureScreenshot —— 截图是
+     * 浏览器层的事，页面里的执行器做不到）。返回原始 result。
+     */
+    async cdpSend(method, params, timeoutMs) {
+      if (st.closed) throw new Error('CDP 会话已关闭（编辑器进程没了？）')
+      return await send(method, params, timeoutMs)
     },
     async close() {
       st.closed = true

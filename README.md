@@ -3,9 +3,11 @@
 让 **DeepSeek Harness（dsh）里的 AI 直接读写你的 Scratch / TurboWarp 项目** ——
 不是生成一个 sb3 丢给你，而是**在你正开着的编辑器里**加积木、改参数、删脚本、整理排版、定位高亮，
 你实时看着它动手，不满意一句"回滚"就回到上一步。
+v0.7.0 起它还能**替你点绿旗、点角色、按键、读运行期状态、量性能、截图**，
+所以"改完到底行不行"不用你自己去点。
 
 ```
-dsh 插件（Node，19 个 scratch_* 工具 + WebSocket 桥 :31820）
+dsh 插件（Node，28 个 scratch_* 工具 + WebSocket 桥 :31820）
 
   路径一 · 扩展桥（你自己浏览器里的编辑器）
       ↕ JSON-RPC over ws（握手 token）
@@ -32,14 +34,17 @@ dsh 插件（Node，19 个 scratch_* 工具 + WebSocket 桥 :31820）
 
 | 能力 | 工具 |
 |---|---|
-| 读项目 | `scratch_snapshot`（整份 project.json）、`scratch_read_script`（按角色读，省 token） |
+| 读项目 | `scratch_snapshot`（整份 project.json）、`scratch_read_script`（按角色/按脚本读，**默认不回变量**，`summary` 只给结构） |
 | 写积木 | `scratch_add_blocks`（走官方 `shareBlocksToTarget` 管线，字面量自动展开成影子块） |
 | 改 / 删 | `scratch_update_block`、`scratch_delete_blocks`（级联）、`scratch_tidy_blocks`（排版） |
-| 找得到 | `scratch_locate`（滚到那块并高亮）、`scratch_get_opcodes`（白名单，防 AI 编造积木） |
+| 找得到 | `scratch_locate`（**跨全部角色搜**、滚到那块并高亮）、`scratch_get_opcodes`（白名单，防 AI 编造积木）、`scratch_list_scripts`（脚本清单，区分真脚本与游离块） |
 | 造型 | `scratch_add_costume`（SVG → 角色造型） |
 | 文件 | `scratch_load_project`（打开本机 .sb3）、`scratch_save_project`（存回磁盘，默认不覆盖） |
-| 观察 | `scratch_watch`（变量轨迹）、`scratch_user_context`（你选中了哪块、有没有按绿旗） |
-| 唤起 | `scratch_open_editor`（AI 自己把编辑器打开，不用你点；浏览器 / 桌面版两条路，还能顺手把你的 .sb3 装进去） |
+| 跑起来 | `scratch_run`（绿旗/停止）、`scratch_click`（点角色，按造型包围盒算中心）、`scratch_press_key`（按键） |
+| 看得到 | `scratch_state`（线程/克隆/坐标/页变量/fps）、`scratch_profile`（每步耗时 p50/p95）、`scratch_screenshot`（截编辑器，桌面版） |
+| 省往返 | `scratch_batch`（一次做多件事，只读/运行期白名单）、`scratch_selftest`（全链路自检） |
+| 观察 | `scratch_watch`（变量轨迹，列表默认只报长度）、`scratch_user_context`（你选中了哪块、有没有按绿旗） |
+| 唤起 | `scratch_open_editor`（AI 自己把编辑器打开，不用你点；浏览器 / 桌面版两条路，`port` 可接管你手动开的实例，`show:false` 只接管不弹窗） |
 | 经验库 | `scratch_skills` / `scratch_skill_edit`（可读可写的 Scratch 实践经验，AI 自己积累） |
 
 **三档安全**（默认 `preview`）：写操作先返回一个 `planId` + 预览，你说"行"才落盘；
@@ -215,7 +220,7 @@ patch 里只留一段**配置覆盖**（按 id 整段替换，所以字段要写
 ## 验靶（能自己复跑的自动化）
 
 ```powershell
-# 替身层：真 content-main.js 进 Node vm + 真 headless scratch-vm（112 条）
+# 替身层：真 content-main.js 进 Node vm + 真 headless scratch-vm（163 条）
 cd lab; node test-content-ops.js
 
 # 真机层 A：真 Chrome / Edge + 真 turbowarp.org + 真扩展（115 条，约 4 分钟）
@@ -223,12 +228,12 @@ cd lab; node test-content-ops.js
 $env:SB3_FIXTURE='<某个 .sb3>'      # 可选：顺带验打开真实作品（断言会更多）
 node real-machine-check.mjs
 
-# 真机层 B：TurboWarp Desktop + CDP 直连（61 条，会真开一个窗口、跑完自动关掉）
+# 真机层 B：TurboWarp Desktop + CDP 直连（83 条，会真开一个窗口、跑完自动关掉）
 node desktop-cdp-check.mjs
 
 # 插件侧
 cd ..\packages\dsh-plugin-scratch
-node test-tools.mjs          # 73 条（含打包契约：组合包 / volatile 配置 / 浏览器半侧）
+node test-tools.mjs          # 92 条（含打包契约：组合包 / volatile 配置 / 浏览器半侧）
 node test-skills.mjs         # 23 条
 node test-bridge-auth.mjs    # 21 条
 
@@ -244,7 +249,7 @@ TurboWarp 时会 SKIP，不打扰你。
 ## 目录
 
 ```
-packages/dsh-plugin-scratch/   dsh 插件：桥服务端 + 19 个工具 + 经验库 + CDP 直连 + 单测
+packages/dsh-plugin-scratch/   dsh 插件：桥服务端 + 28 个工具 + 经验库 + CDP 直连 + 单测
                                lib/client.js = 浏览器半侧（插件页里的配置表单，手写不用打包）
                                win32-window.ps1 = 窗口可见性探针（EnumWindows，Windows only）
 packages/tw-bridge-extension/  MV3 扩展：SW 持 socket，内容脚本操作 window.vm
@@ -253,6 +258,7 @@ lab/                           验靶：替身 VM 层 + 真机层（Chrome/Edge�
 启动TurboWarp(AI可接管).cmd    用带调试端口的方式开 TurboWarp Desktop，AI 能接管你正在用的窗口
 ROADMAP.md                     里程碑、设计决策、修过的真 bug
 验收清单.md                     装完之后人眼该验什么（机器验不了的部分）
+问题记录-处理台账.md           问题记录（699 行）里每条的下场：已修/部分修/不做 + 怎么验
 ```
 
 ## 授权

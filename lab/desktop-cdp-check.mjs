@@ -170,7 +170,7 @@ try {
   // ⚠️ Windows 上 import() 绝对路径必须转成 file:// URL，否则 "G:\..." 会被当成 g: 协议
   const mod = await import(pathToFileURL(join(ROOT, 'packages', 'dsh-plugin-scratch', 'index.js')).href)
   mod.apply(fakeCtx, { safety: 'preview', bridgePort: 31841, maxSnapshots: 3, skillsEnabled: false })
-  t('插件 apply 未抛错，注册了 19 个工具', registered.size === 19, '实际 ' + registered.size)
+  t('插件 apply 未抛错，注册了 28 个工具', registered.size === 28, '实际 ' + registered.size)
   const call = async (name, args) => {
     const tool = registered.get(name)
     if (!tool) throw new Error('没有工具 ' + name)
@@ -283,6 +283,72 @@ try {
   t('STEPS 影子块 opcode 是 math_number', shadow.stepOp === 'math_number', String(shadow.stepOp))
   t('MESSAGE 影子里是注入的文本', shadow.msg === '桌面版CDP验收', String(shadow.msg))
   t('旗帽块是 topLevel 的（脚本能在工作区看到）', shadow.hat === true, String(shadow.hat))
+
+  step('6.5 v0.7.0：运行控制 / 状态 / 截图 / 脚本清单（桌面版真机）')
+  // 这一段是「问题记录 P0-2」的验收：以前这些能力只能靠 AI 自己连裸 CDP 写脚本。
+  // 独立证据优先：点绿旗之后角色坐标真的动了（不是只看工具返回 running=true）。
+  const posBefore = await raw.evalJson(`(() => {
+    const t = window.vm.runtime.targets.find(x => x.getName() === ${JSON.stringify(workTarget)})
+    return { x: t.x, y: t.y, threads: window.vm.runtime.threads.length }
+  })()`)
+  const st0 = await call('scratch_state', {})
+  t('scratch_state 报出运行状态与角色数', st0.running === false && st0.targets >= 2, J(st0, 200))
+  const ran = await call('scratch_run', { action: 'greenflag', waitMs: 600 })
+  t('scratch_run greenflag 返回 ok', ran.ok !== false && ran.action === 'greenflag', J(ran, 200))
+  const posAfter = await raw.evalJson(`(() => {
+    const t = window.vm.runtime.targets.find(x => x.getName() === ${JSON.stringify(workTarget)})
+    return { x: t.x, y: t.y, threads: window.vm.runtime.threads.length }
+  })()`)
+  console.log(`  独立读数: x ${posBefore.x} → ${posAfter.x}`)
+  t('绿旗之后角色的 x 真的变了（脚本被执行过，不是只回了个 running）',
+    posAfter.x !== posBefore.x, `x ${posBefore.x} → ${posAfter.x}`)
+  const st1 = await call('scratch_state', { target: workTarget })
+  t('scratch_state 能读角色坐标（和独立通道读的一致）', st1.target && Math.abs(st1.target.x - posAfter.x) < 0.01,
+    J({ tool: st1.target && st1.target.x, raw: posAfter.x }, 120))
+  const stopped = await call('scratch_run', { action: 'stopall', waitMs: 200 })
+  t('scratch_run stopall 之后线程归零', stopped.after && stopped.after.running === false && stopped.after.threads === 0, J(stopped.after, 160))
+
+  const clicked = await call('scratch_click', { target: workTarget })
+  t('scratch_click 能点（返回点到了谁 + 换了画布坐标）',
+    clicked.clicked === workTarget && Number.isFinite(clicked.canvasXY.x) && Number.isFinite(clicked.canvasXY.y), J(clicked, 220))
+  t('click 在真渲染器上优先走 pick（不是一上来就退化）', ['pick', 'hat-fallback'].includes(clicked.via), String(clicked.via))
+  const keyed = await call('scratch_press_key', { key: 'ArrowRight', holdMs: 40 })
+  t('scratch_press_key ok', keyed.key === 'ArrowRight', J(keyed, 160))
+
+  const shot = await call('scratch_screenshot', { path: join(OUT, 'shot.png') })
+  t('scratch_screenshot 真的落盘了一张 PNG', existsSync(shot.path) && shot.bytes > 10000, J(shot, 200))
+  const shotBuf = readFileSync(shot.path)
+  t('截图是合法 PNG（魔数 89 50 4E 47）', shotBuf[0] === 0x89 && shotBuf[1] === 0x50 && shotBuf[2] === 0x4e && shotBuf[3] === 0x47,
+    shotBuf.subarray(0, 4).toString('hex'))
+
+  const prof = await call('scratch_profile', { seconds: 1 })
+  t('scratch_profile 采到了真实步进耗时（stepMs.avg 是正数）',
+    prof.stepMs && typeof prof.stepMs.avg === 'number' && prof.stepMs.avg > 0, J(prof.stepMs, 160))
+  t('profile 反推出的 fps 是合理值（1~1000）', prof.fps > 0 && prof.fps <= 1000, String(prof.fps))
+
+  const scripts = await call('scratch_list_scripts', { target: workTarget })
+  t('scratch_list_scripts 找到刚注入的绿旗脚本',
+    (scripts.scripts || []).some(s => s.opcode === 'event_whenflagclicked' && s.blockCount >= 3), J(scripts, 260))
+  t('list_scripts 区分真脚本与游离块（两个计数都在）',
+    typeof scripts.scriptCount === 'number' && typeof scripts.looseCount === 'number', J({ s: scripts.scriptCount, l: scripts.looseCount }, 100))
+  const rsSummary = await call('scratch_read_script', { target: workTarget, summary: true })
+  t('read_script summary 不回块体（结构视图，体积可控）', rsSummary.summary === true && !rsSummary.blocks, J(Object.keys(rsSummary), 200))
+  t('read_script 默认不回变量（7.5MB 那个坑）', rsSummary.variablesOmitted === true, String(rsSummary.variablesOmitted))
+
+  const batch = await call('scratch_batch', { calls: [
+    { op: 'state' }, { op: 'list_scripts', args: { target: workTarget } }, { op: 'screenshot', args: { path: join(OUT, 'shot2.png') } }
+  ] })
+  t('scratch_batch 一次做了 3 件事，全部成功', batch.count === 3 && batch.failed === 0, J(batch.results && batch.results.map(r2 => r2.ok), 120))
+  t('batch 里的截图也走通了（页面拿不到的能力单独分流）', existsSync(join(OUT, 'shot2.png')), J(batch, 160))
+  t('batch 逐条报了各自耗时', (batch.results || []).every(r2 => typeof r2.ms === 'number'), J(batch.results, 200))
+  const denied = await call('scratch_batch', { calls: [{ op: 'add_blocks', args: {} }] })
+  t('batch 拒绝写操作（不绕过 preview/apply 的确认）',
+    denied.failed === 1 && /白名单/.test(denied.results[0].error || ''), J(denied.results, 200))
+
+  const self = await call('scratch_selftest', {})
+  t('scratch_selftest 全绿（桥/会话/注入/项目/Blockly/窗口都在位）', self.ok === true, J(self.checks, 400))
+  const winCheck = (self.checks || []).find(c => c.check === '窗口可见')
+  t('selftest 的窗口项独立确认可见（真机上用户看得到）', !!(winCheck && winCheck.ok === true), J(winCheck, 200))
 
   step('7. 存档 → 从磁盘装回来（真走一遍文件往返）')
   const outSb3 = join(OUT, 'desktop-roundtrip.sb3')

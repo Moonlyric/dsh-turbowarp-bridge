@@ -47,6 +47,11 @@ async function makeVM() {
     setLayerGroupOrdering: () => {}, updateDrawableDirectionScale: () => {},
     updateDrawableEffect: () => {}, updateDrawablePosition: () => {},
     updateDrawableSkinId: () => {}, updateDrawableVisible: () => {},
+    // looks 扩展在 runtime._step 里真的会画气泡：没有 createTextSkin 就直接抛
+    // （v0.7.0 的 scratch_run 会 vm.start()，headless 下真的开始走帧 → 这些桩位必须齐）
+    createTextSkin: () => 'text-skin', updateTextSkin: () => {}, destroyTextSkin: () => {},
+    getNativeSize: () => [480, 360],
+    getFencedPositionOfDrawable: p => p,
     isTouchingColor: () => false, isTouchingDrawables: () => false,
     drawableTouching: () => false, getFencedPositionOfDrawable: p => p, draw: () => {},
     // pen 扩展的 renderer 依赖：快照里一旦带 extensions:['pen']，restore→loadProject 就会
@@ -149,7 +154,11 @@ async function main() {
   }
   const sandbox = {
     console: { info: () => {}, warn: () => {}, log: () => {} },
-    setInterval: () => 0, clearInterval: () => {}, setTimeout: () => 0, clearTimeout: () => {},
+    // 定时器必须是**真的**：执行器里的 sleep / 重试 / 500ms 轮询都靠它们，
+    // 桩成 no-op 会让 await 永远不 resolve（v0.7.0 的 run/click/profile 一上来就全 TIMEOUT）。
+    // 一开始桩它们是为了让 tryBind/waitVM 的重试循环别空转 —— 那两处只在「拿不到 vm/workspace」时才重试，
+    // 而这里 vm 和 ScratchBlocks 都是提前摆好的，根本不会进重试分支。
+    setInterval, clearInterval, setTimeout, clearTimeout,
     WebSocket: ForbiddenWebSocket, // 绊线：页面不该自己连桥
     // atob/btoa 是宿主提供的（浏览器有，Node 也有），但 vm 沙箱的新 context **不继承**它们。
     // sb3 的读写全靠这两个（base64 ←→ 字节），缺了 save_project 会直接 "btoa is not defined"。
@@ -732,6 +741,184 @@ async function main() {
   sandbox.ScratchBlocks = { getMainWorkspace: () => ({ getBlockById: () => null }) }
   r = await rpc('user_context', {})
   t('没人选中时 selected 为 null（不编造）', r.ok === true && r.result.selected === null, JSON.stringify(r.result.selected))
+
+  // ==================== v0.7.0：瘦身 / 运行控制 / 跨角色定位 ====================
+  // 守的是问题记录里最贵的几条：回传爆炸（P2-2、§15.4 的 7.5MB）、列表爆炸（P1-5 的 14.8MB）、
+  // 运行控制缺失（P0-2）、locate 只在当前编辑目标里找（P1-1）。
+  // 关键：这几条以前**没有任何测试**能发现 —— 功能本身都对，错的是"回传体积"和"搜索范围"。
+  console.log('\n[test v0.7.0] 运行时与瘦身（P0-2 / P1-1 / P1-5 / P2-2）')
+  const spriteT = vm.runtime.targets.find(x => !x.isStage)
+  const stageT = vm.runtime.getTargetForStage()
+  // 造「巨型列表 + 几个标量」：7.5MB / 14.8MB 那个坑的最小复现
+  const bigList = []
+  for (let i = 0; i < 5000; i++) bigList.push('cell-' + i)
+  // ⚠️ 必须造真的 Variable 实例（target.createVariable），不能塞裸对象：
+  //    vm.setEditingTarget → emitWorkspaceUpdate 会遍历变量调 toXML()，裸对象直接抛
+  const mkVar = (target, id, name, value, type) => {
+    target.createVariable(id, name, type || '')  // createVariable 不返回实例，只能按 id 取回
+    const v = target.variables[id]
+    v.value = value
+    return v
+  }
+  mkVar(stageT, 'big_list_id', '地图.细胞类别', bigList, 'list')
+  mkVar(stageT, 'score_id', '分数', 25, '')
+  mkVar(spriteT, 'local_id', '本角色计数', 7, '')
+
+  // ---- read_script 瘦身 ----
+  r = await rpc('read_script', { target: 'Sprite1' })
+  t('read_script ok（瘦身版）', r.ok === true, r.error)
+  t('默认不回变量，并明确标记 variablesOmitted（7.5MB 的根因就是它）',
+    r.result.variablesOmitted === true && !('variables' in r.result), JSON.stringify(Object.keys(r.result || {})))
+  t('默认带上脚本索引（每条有 kind + blockCount）',
+    Array.isArray(r.result.scripts) && r.result.scripts.length > 0 &&
+    r.result.scripts.every(s => 'kind' in s && typeof s.blockCount === 'number'),
+    JSON.stringify((r.result.scripts || []).slice(0, 2)))
+  const rsBytes = Buffer.byteLength(JSON.stringify(r.result))
+  t('5000 项列表没把 read_script 撑爆（< 64KB；旧实现这里是 MB 级）', rsBytes < 65536, rsBytes + ' bytes')
+  t('变量名还是给的（只是不给值）', Array.isArray(r.result.variableNames) && r.result.variableNames.includes('本角色计数'),
+    JSON.stringify(r.result.variableNames))
+  // Stage 是 7.5MB 那个坑的原始受害者（只有 26 个块，却回了 7.5MB 的列表）
+  const stageRead = await rpc('read_script', { target: 'Stage' })
+  t('Stage 的 read_script 会报列表名+长度，但不回内容',
+    stageRead.ok === true && stageRead.result.listNames && stageRead.result.listNames['地图.细胞类别'] === 5000 &&
+    stageRead.result.variablesOmitted === true, JSON.stringify(stageRead.result.listNames))
+  t('Stage 的 read_script 体积也很小（< 16KB；真机旧实现是 7.5MB）',
+    Buffer.byteLength(JSON.stringify(stageRead.result)) < 16384,
+    Buffer.byteLength(JSON.stringify(stageRead.result)) + ' bytes')
+
+  const summary = await rpc('read_script', { target: 'Sprite1', summary: true })
+  t('summary:true 不回块体，只回结构', summary.ok === true && !('blocks' in summary.result) && summary.result.summary === true, summary.error)
+  const opHist = summary.result.opcodes || {}
+  const histTotal = Object.values(opHist).reduce((a, b) => a + b, 0)
+  t('summary 的 opcode 直方图覆盖该角色全部块',
+    histTotal === Object.keys(spriteT.blocks._blocks).length, histTotal + ' vs ' + Object.keys(spriteT.blocks._blocks).length)
+  t('summary 的体积也很小（< 64KB）', Buffer.byteLength(JSON.stringify(summary.result)) < 65536,
+    Buffer.byteLength(JSON.stringify(summary.result)) + ' bytes')
+  t('summary 同样明确标 variablesOmitted，并给出变量名（不是"变量凭空消失"）',
+    summary.result.variablesOmitted === true && Array.isArray(summary.result.variableNames) &&
+    summary.result.variableNames.includes('本角色计数'), JSON.stringify(summary.result.variableNames))
+
+  const hatScript = (summary.result.scripts || []).find(s => s.kind === 'script')
+  t('summary 里至少有一段真脚本（帽子块打头）', !!hatScript, JSON.stringify((summary.result.scripts || []).slice(0, 2)))
+  r = await rpc('read_script', { target: 'Sprite1', scriptId: hatScript.blockId })
+  t('scriptId 只回这一段脚本（块数 = 索引里报的 blockCount）',
+    r.ok === true && Object.keys(r.result.blocks).length === hatScript.blockCount,
+    JSON.stringify({ got: Object.keys(r.result.blocks || {}).length, want: hatScript.blockCount }))
+  t('scriptId 回的那段里，根块一定在', !!r.result.blocks[hatScript.blockId])
+
+  // opcode 过滤：挑一个真实存在、且出现次数最少的 opcode（保证过滤后还有块）
+  const rareOpcode = Object.entries(opHist).sort((a, b) => a[1] - b[1])[0][0]
+  r = await rpc('read_script', { target: 'Sprite1', opcodes: [rareOpcode] })
+  const got = Object.values(r.result.blocks || {})
+  t('opcodes 过滤后只剩那个 opcode', r.ok === true && got.length > 0 && got.every(b => b.opcode === rareOpcode),
+    JSON.stringify({ rareOpcode, opcodes: got.map(b => b.opcode) }))
+
+  // 分页
+  const page1 = await rpc('read_script', { target: 'Sprite1', limit: 2 })
+  t('limit 生效，且 hasMore 如实报', page1.ok === true && page1.result.returned <= 2 && page1.result.hasMore === true,
+    JSON.stringify({ returned: page1.result.returned, hasMore: page1.result.hasMore }))
+  const page2 = await rpc('read_script', { target: 'Sprite1', limit: 2, offset: 2 })
+  const ids1 = Object.keys(page1.result.blocks)
+  const ids2 = Object.keys(page2.result.blocks)
+  t('offset 翻页拿到的是不同的块（不是又给一遍第一页）',
+    ids2.length > 0 && ids2.every(id => !ids1.includes(id)), JSON.stringify({ ids1, ids2 }))
+
+  r = await rpc('read_script', { target: 'Sprite1', includeVariables: true })
+  t('显式 includeVariables:true 才回 variables（还附了摘要）',
+    r.ok === true && !!r.result.variables && !!r.result.variablesSummary)
+  r = await rpc('read_script', { target: 'Sprite1', scriptId: 'no_such_script' })
+  t('scriptId 不存在时明确报错并指向 summary', r.ok === false && /找不到脚本/.test(r.error), r.error)
+
+  // ---- list_scripts ----
+  r = await rpc('list_scripts', { target: 'Sprite1' })
+  t('list_scripts ok', r.ok === true, r.error)
+  const hatsInVm = Object.values(spriteT.blocks._blocks).filter(b => !b.parent && vm.runtime._hats[b.opcode]).length
+  t('scriptCount 与 VM 里的帽子块数一致（不是靠 opcode 前缀猜的）',
+    r.result.scriptCount === hatsInVm, r.result.scriptCount + ' vs ' + hatsInVm)
+  const covered = r.result.scripts.reduce((n, s) => n + s.blockCount, 0)
+  t('每个顶层块都被归到某条（真脚本 + 游离块 = 全部块，不漏不重）',
+    covered === Object.keys(spriteT.blocks._blocks).length,
+    covered + ' vs ' + Object.keys(spriteT.blocks._blocks).length)
+  r = await rpc('list_scripts', { target: 'Sprite1', kind: 'script' })
+  t('kind=script 只回真脚本', r.ok === true && r.result.scripts.every(s => s.kind === 'script'), r.error)
+
+  // ---- state ----
+  r = await rpc('state', {})
+  t('state ok 且带 running/threads/targets', r.ok === true &&
+    typeof r.result.running === 'boolean' && typeof r.result.threads === 'number' && typeof r.result.targets === 'number', r.error)
+  t('state 的 pageVars 只放标量（列表只报长度）',
+    r.result.pageVars && r.result.pageVars['分数'] === 25 &&
+    !('地图.细胞类别' in r.result.pageVars) && r.result.pageLists['地图.细胞类别'] === 5000,
+    JSON.stringify(r.result.pageVars) + ' / ' + JSON.stringify(r.result.pageLists))
+  t('state 体积不随列表长度增长（< 8KB）', Buffer.byteLength(JSON.stringify(r.result)) < 8192,
+    Buffer.byteLength(JSON.stringify(r.result)) + ' bytes')
+  r = await rpc('state', { target: 'Sprite1' })
+  t('state 带 target 时报坐标/局部变量', r.ok === true && r.result.target && r.result.target.localVars['本角色计数'] === 7, r.error)
+
+  // ---- run（运行控制） ----
+  r = await rpc('run', { action: 'greenflag', waitMs: 100 })
+  t('run greenflag ok', r.ok === true, r.error)
+  t('点了绿旗之后确实有线程在跑（不是只看返回值骗人）', r.result.after.running === true && r.result.after.threads >= 1,
+    JSON.stringify(r.result.after))
+  t('run 报出动作前后的线程数', typeof r.result.before.threads === 'number' && typeof r.result.after.threads === 'number')
+  r = await rpc('run', { action: 'stopall', waitMs: 100 })
+  t('run stopall 后线程归零', r.ok === true && r.result.after.running === false && r.result.after.threads === 0,
+    JSON.stringify(r.result.after))
+  r = await rpc('run', { action: 'fly' })
+  t('未知 action 明确报错（不静默什么都不做）', r.ok === false && /未知 action/.test(r.error), r.error)
+
+  // ---- profile ----
+  r = await rpc('profile', { seconds: 0.5 })
+  t('profile ok 且回 stepMs 的 avg/p50/p95/max', r.ok === true && r.result.stepMs &&
+    ['avg', 'p50', 'p95', 'max'].every(k => k in r.result.stepMs), r.error)
+  t('profile 如实标注采样秒数（不假装采了很久）', r.result.seconds === 0.5, String(r.result.seconds))
+
+  // ---- click ----
+  r = await rpc('click', { target: 'Sprite1' })
+  t('click 在没有 renderer.pick 的宿主里也能完成（不整个失败）', r.ok === true, r.error)
+  t('click 如实报走的哪条路', ['pick', 'hat-fallback'].includes(r.result.via), String(r.result.via))
+  t('click 把舞台坐标换算成画布像素（(0,0) → (240,180)）',
+    Math.abs(r.result.canvasXY.x - 240) <= 1 && Math.abs(r.result.canvasXY.y - 180) <= 1,
+    JSON.stringify(r.result.canvasXY))
+  t('click 报出点了谁', r.result.clicked === 'Sprite1', String(r.result.clicked))
+  r = await rpc('click', {})
+  t('click 既没 target 也没 x/y 时明确报错', r.ok === false && /target.*x\/y/.test(r.error), r.error)
+
+  // ---- press_key ----
+  r = await rpc('press_key', { key: 'ArrowUp', holdMs: 10 })
+  t('press_key ok', r.ok === true && r.result.key === 'ArrowUp', r.error)
+
+  // ---- watch 瘦身 ----
+  r = await rpc('watch', { action: 'start', target: 'Sprite1' })
+  t('watch start 默认不跟列表（includeLists:false）', r.ok === true && r.result.includeLists === false, r.error)
+  t('watch start 仍然告诉你有哪几个列表（只给长度）',
+    r.result.listLengths && r.result.listLengths['地图.细胞类别'] === 5000, JSON.stringify(r.result.listLengths))
+  r = await rpc('watch', { action: 'poll' })
+  t('watch poll 的 current 只有标量（不把 5000 项列表塞进来）',
+    r.ok === true && r.result.current['分数'] === 25 && !('地图.细胞类别' in r.result.current),
+    JSON.stringify(Object.keys(r.result.current || {})))
+  t('watch poll 体积可控（< 8KB；旧实现是 14.8MB）', Buffer.byteLength(JSON.stringify(r.result)) < 8192,
+    Buffer.byteLength(JSON.stringify(r.result)) + ' bytes')
+  r = await rpc('watch', { action: 'stop' })
+  t('watch stop ok', r.ok === true && r.result.stopped === true, r.error)
+
+  // ---- locate 跨角色搜索（P1-1） ----
+  vm.setEditingTarget(stageT.id)
+  const spriteHatId = Object.values(spriteT.blocks._blocks).find(b => b.opcode === 'event_whenflagclicked').id
+  const locateWs = {
+    getBlockById: (id) => (id === spriteHatId ? fakeBlock : null),
+    centerOnBlock: () => {}
+  }
+  sandbox.ScratchBlocks = { getMainWorkspace: () => locateWs }
+  r = await rpc('locate', { blockId: spriteHatId })
+  t('locate 在别的角色里也能找到（跨角色搜索，不再只在当前编辑目标里翻）',
+    r.ok === true && r.result.target === 'Sprite1', r.error)
+  t('命中后自动把编辑目标切过去', vm.editingTarget && vm.editingTarget.getName() === 'Sprite1',
+    vm.editingTarget && vm.editingTarget.getName())
+  t('如实报"从哪个角色切过来"', r.result.switchedFrom === 'Stage', String(r.result.switchedFrom))
+  r = await rpc('locate', { blockId: 'no_such_block_at_all' })
+  t('找不到时列出找过谁（而不是甩锅给 add_blocks 换 ID）',
+    r.ok === false && /个角色\/舞台里都没有/.test(r.error) && /找过/.test(r.error), r.error)
 
   console.log(`\n===== ops 层单测: ${pass} pass / ${fail} fail =====`)
   process.exit(fail ? 1 : 0)

@@ -46,11 +46,11 @@ AI 侧的入口是 `scratch_open_editor`：用户说「打开 TurboWarp」时，
 | **M0** | 核心管线：读（snapshot/read_script）+ 写（add_blocks）+ 回滚 + SVG 造型 + 定位 | ✅ |
 | **M1** | 全编辑能力：update_block + delete_blocks（级联）+ tidy_blocks + opcode 白名单 + 快照持久化 | ✅ |
 | **M2** | 观察者 + 双向联动：watch（变量订阅/轮询）+ user_context（选块/绿旗感知） | ✅ |
-| **Skill 区** | Scratch 实践经验库（8 篇）+ scratch_skills / scratch_skill_edit + 三层开关 | ✅ 23/23 |
+| **Skill 区** | Scratch 实践经验库（9 篇）+ scratch_skills / scratch_skill_edit + 三层开关 | ✅ 23/23 |
 | **审计 + 修** | 全项目审查：修掉「核心注入在真机上根本不工作」等 7 个真 bug，补断言防回归 | ✅ 2026-10-16 |
 | **LNA 改造** | socket 从页面搬进扩展 service worker + 心跳保活 + `lab` 加 LNA/保活断言 | ✅ 2026-10-17（这次绿才算数） |
-| **M0.5 真机** | 真 Chrome/Edge + 真 turbowarp.org 全链路自动验收（19 工具 + 存/读 sb3） | ✅ **115/115**（2026-10-17 关 VPN 实测，Chrome 与 Edge 各一遍；旧的 98/98 是假绿） |
-| **CDP 直连** | TurboWarp Desktop 零安装路径：带调试端口启动 + 注默认上下文 + 接管用户自己开的窗口 | ✅ 2026-10-17（61/61，见下） |
+| **M0.5 真机** | 真 Chrome/Edge + 真 turbowarp.org 全链路自动验收（28 工具 + 存/读 sb3） | ✅ **115/115**（2026-10-17 关 VPN 实测，Chrome 与 Edge 各一遍；旧的 98/98 是假绿） |
+| **CDP 直连** | TurboWarp Desktop 零安装路径：带调试端口启动 + 注默认上下文 + 接管用户自己开的窗口 | ✅ 2026-10-17（v0.7.0 后 83/83，见下） |
 | **主动唤起** | `scratch_open_editor`：AI 自己开浏览器/桌面版并等会话连上；新增 `path` 装作品 | ✅ 2026-10-16 / 扩展于 2026-10-17 |
 | **文件往返** | `scratch_load_project` / `scratch_save_project`（打开本机 .sb3、存回磁盘、默认不覆盖） | ✅ |
 | **M3** | 断链/接链（moveBlock 的 parent 系）、变量/列表增删、造型删除改名、Firefox 支持（userscript 方向） | 未开始 |
@@ -187,14 +187,14 @@ hint 里说明"没动他的窗口"。
 
 | 套件 | 覆盖 | 结果 |
 |---|---|---|
-| `lab/test-content-ops.js` | 扩展执行器全协议（真实 `content-main.js` 进 Node vm 沙箱 + 真 headless scratch-vm） | 114/114 ✅ |
-| `lab/real-machine-check.mjs` | **真 Chrome/Edge + 真 turbowarp.org 全链路**（装扩展 → token 握手 → 19 工具 + 存/读 sb3 + 45s 保活） | **115/115** ✅（Chrome、Edge 各一遍；不传 `SB3_FIXTURE`，传了真实 sb3 会更多） |
-| `lab/desktop-cdp-check.mjs` | **TurboWarp Desktop + CDP 直连**端到端（独立 CDP 连接读真 VM + 存盘往返 + 接管用户实例 + 关掉后会话自动掉线） | 61/61 ✅ |
+| `lab/test-content-ops.js` | 扩展执行器全协议（真实 `content-main.js` 进 Node vm 沙箱 + 真 headless scratch-vm）+ v0.7.0 瘦身体积断言 | 163/163 ✅ |
+| `lab/real-machine-check.mjs` | **真 Chrome/Edge + 真 turbowarp.org 全链路**（装扩展 → token 握手 → 28 工具 + 存/读 sb3 + 45s 保活） | **115/115** ✅（Chrome、Edge 各一遍；不传 `SB3_FIXTURE`，传了真实 sb3 会更多） |
+| `lab/desktop-cdp-check.mjs` | **TurboWarp Desktop + CDP 直连**端到端（独立 CDP 连接读真 VM + 存盘往返 + 接管用户实例 + 关掉后会话自动掉线 + v0.7.0 运行控制） | 83/83 ✅ |
 | `lab/sync-executor.mjs` | 把扩展 `content-main.js` 同步成插件包的 `vm-executor.js`（`--check` 只检查） | 工具 ✅ |
 | `lab/test-vm-pipeline.js` | scratch-vm 管线冒烟（无断言，打印型） | 跑通 ✅ |
 | `lab/inspect-sb3.mjs` | 离线读 sb3/project.json：同时报**真块数**和**含影子块数**（引用块数必须写清数法） | 工具 ✅ |
 | `packages/dsh-plugin-scratch/test-skills.mjs` | skill 区 | 23/23 ✅ |
-| `packages/dsh-plugin-scratch/test-tools.mjs` | 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 / CDP 启动参数与诚实报错 / `tagForPage` / 执行器副本一致性 / 打包契约） | 73/73 ✅ |
+| `packages/dsh-plugin-scratch/test-tools.mjs` | 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 / CDP 启动参数与诚实报错 / `tagForPage` / 执行器副本一致性 / 打包契约 / v0.7.0 新工具契约） | 92/92 ✅ |
 | `packages/dsh-plugin-scratch/test-bridge-auth.mjs` | 握手认证 + 跨会话伪造防护 + ping/pong 保活 | 21/21 ✅ |
 
 ```sh
@@ -230,6 +230,46 @@ CDP 那条路也有它自己的盲区：`desktop-cdp-check.mjs` 只在装了 Tur
   这条由 `lab` 里的往返测试守住（存进去的东西不能用 = 背包没用）。
 - 和 skill 区的关系：skill 讲"怎么做"，背包给"现成的东西"。两者共用同一套开关/索引习惯。
 
+## v0.7.0：把「问题记录」清账（2026-10-18）
+
+那份 699 行的问题记录（四轮实测、26 条）逐条下场见 **`问题记录-处理台账.md`**。
+这一轮的核心判断是：**插件的定位错了**。它原来把自己做成「读写项目数据的 RPC」，
+而 AI 要干完一件真活需要的是闭环 ——
+`启动 → 点绿旗 → 交互 → 读运行时 → 量性能 → 定位/高亮 → 改 → 截图给用户看 → 再量`。
+入口（运行/交互）、出口（视觉验证）、度量（性能/结构）、批次化（少往返）全缺，
+所以 AI 只能在外面自己补（实测补了 36 个文件 / 2334 行，比插件本体还大）。
+
+### 这一轮做掉的（工具 19 → 28）
+
+| 类别 | 新工具 | 关键点 |
+|---|---|---|
+| 运行控制 | `scratch_run` / `scratch_click` / `scratch_press_key` | 绿旗/停止/点击/按键都是**运行期动作**，不碰项目数据，所以不产生快照、不受 preview 管 |
+| 可观测 | `scratch_state` / `scratch_profile` / `scratch_screenshot` | 状态读 `runtime.threads`/`clones`/`currentStepTime`；截图走 CDP `Page.captureScreenshot`（页面里做不到） |
+| 结构视图 | `scratch_list_scripts` | 用 `runtime._hats` 判定真脚本 vs 游离块（不靠 opcode 前缀猜） |
+| 省往返 | `scratch_batch` / `scratch_selftest` | 批处理**白名单只放只读/运行期 op**：写操作走批处理 = 绕过 preview 确认 |
+| 瘦身 | `read_script` / `watch` 加参数 | 见下 |
+
+### 三条「以前没人守得住」的契约，现在有断言
+
+1. **回传体积**：`read_script` 默认不回变量（真机踩过：Stage 只有 26 个块却回 7.5MB，全是长列表），
+   `watch` 默认不跟列表（一次 poll 14.8MB）。替身层用**体积断言**守着（< 64KB / < 8KB），
+   不是"看它好像小了点"。
+2. **跨角色定位**：`locate` 以前只搜当前编辑目标，多角色项目里必然失败，还把原因归到
+   "ID 可能被换新"（误导）。现在全角色搜索 + 自动切 `editingTarget` + 错误里列出找过谁。
+3. **绿旗到底跑没跑**：真机断言不看工具自报的 `running`，而是**独立 CDP 通道**去读角色坐标
+   —— 点完绿旗 x 从 0 变 50 才算过。
+
+### 顺手修的真 bug
+
+`registerCdpSession` 只 ping 一次：冷启动时那个窗口刚创建、页面还没加载完，push 被丢掉 →
+`pageResponded` 假阴性（其余全绿、只有这一条红）。改成每 500ms 重发直到 pong 或超时。
+
+### 明确不做（连理由一起存档）
+
+`read_script` 的 `format:"raw"`（反向序列化风险 > 收益）、`sessionId` 稳定别名（端口重启也变）、
+逐调用 `confirmPolicy`（与会话级 `safety` 两套语义，AI 必用错）、批处理放开写操作、
+扫任意调试端口（会打到用户其它 Electron 应用）。详见台账第 5 节。
+
 ## 插件页化 + 真实工作反馈（2026-10-17 晚）
 
 ### 这一轮做掉的
@@ -242,33 +282,24 @@ CDP 那条路也有它自己的盲区：`desktop-cdp-check.mjs` 只在装了 Tur
 | **P0** 桌面版窗口以隐藏态被拉起（用户全程看不到） | 根因是 `spawn(..., windowsHide: true)`；GUI 启动不再带。新增 `win32-window.ps1`（EnumWindows + IsWindowVisible + ShowWindow），`open_editor` / `list_sessions` 回报 `window`，隐藏态自动救 |
 | **P1-2** 无会话/会话失效的错误只推扩展那条路 | 错误提示与 `setup` 都改成「① 桌面版零安装（通常最快）② 网页版扩展」，并说明会话可能是被关掉了 |
 
-### 真实工作反馈里排队的（按代价/价值）
+### 真实工作反馈里排队的（v0.7.0 已全部处置）
 
 | 编号 | 问题 | 状态 |
 |---|---|---|
-| P1-1 | `scratch_locate` 不接受 `session`/`target`，只在当前编辑目标里搜 → 多角色项目基本不可用 | **待做**（加 target + 跨角色搜索 + 命中后自动切编辑目标） |
-| P1-3 | session 缺窗口可观测性 | ✅ 已做（`window` 字段 + `windowRepair`/`windowHidden`） |
-| P2-1 | 手动带 `--remote-debugging-port` 的实例不会被发现 | 部分：固定端口 `desktopDebugPort`（31821）会被探测并接管；任意端口仍不行（可加 `port` 参数） |
-| P2-2 | `scratch_read_script` 输出爆炸（475KB～7.5MB，连带 variables/lists） | **待做**：`includeVariables:false` / `opcodes` 过滤 / `summary:true` / `limit` |
-| P2-3 | 每个写操作都要 preview→apply 两次往返 | **待做**：`confirmPolicy:"auto"`（会话级或 open_editor 参数） |
-| P2-4 | `open_editor` 没有窗口选项 | 部分：默认自动显示 + 回报可见性；仍缺显式 `showWindow:false` / 摆位 |
-| P3-1 | `sessionId`（`cd-1`）重启即变 | 低优先（可加 `pid:port` 别名） |
-| P3-2 | 写操作返回字段不统一（`added`/`updated`/`deleted`/`applied`） | 低优先（统一成 `{before, after, changed}`） |
+| P1-1 | `scratch_locate` 不接受 `session`/`target`，只在当前编辑目标里搜 → 多角色项目基本不可用 | ✅ v0.7.0（`target` 参数 + 跨角色搜索 + 命中自动切编辑目标） |
+| P1-3 | session 缺窗口可观测性 | ✅ 已做（`window` 字段 + `windowRepair`/`windowHidden`；v0.7.0 又加了 `active`/`screen`） |
+| P2-1 | 手动带 `--remote-debugging-port` 的实例不会被发现 | ✅ v0.7.0（`scratch_open_editor({ port })` 显式接管任意端口） |
+| P2-2 | `scratch_read_script` 输出爆炸（475KB～7.5MB，连带 variables/lists） | ✅ v0.7.0（默认不回变量 + `summary`/`scriptId`/`opcodes`/`limit`/`offset`） |
+| P2-3 | 每个写操作都要 preview→apply 两次往返 | ✅ 插件设置页的 `safety=auto` 就是那个开关（配置页 v0.6.0 才通，之前等于没有） |
+| P2-4 | `open_editor` 没有窗口选项 | ✅ v0.7.0（`show:false` 只接管不弹窗 + `port`） |
+| P3-1 | `sessionId`（`cd-1`）重启即变 | 🟡 缓解：`meta` 里带 `pid`/`debugPort`，`selftest` 打 pid+hwnd 便于对号；不做稳定别名 |
+| P3-2 | 写操作返回字段不统一 | ✅ v0.7.0（老字段保留 + 统一 `changed:{added,updated,deleted}`） |
 
-### 能力缺口（真实工作暴露的最大一条）
+### 能力缺口（v0.7.0 已封口）
 
 19 个工具全是**静态读写**，而完成一件真活需要闭环：**启动 → 点绿旗 → 交互 → 读运行时 → 量性能 →
 定位/高亮 → 改 → 截图给用户看 → 再量**。缺的入口/出口/度量/批处理，AI 只能自己在外面写脚本补
-（实测补了 36 个文件 / 2334 行，比插件本体还大）。排期：
-
-1. **运行控制**：`scratch_run({greenflag|stop})`、`scratch_click`、`scratch_press_key`、`scratch_state`、
-   `scratch_screenshot`、`scratch_reveal_block`（这批在真机上都被验证过可行：`runtime.greenFlag()`、
-   `ioDevices.mouse.postData`、`Blockly.getMainWorkspace().centerOnBlock`、`Page.captureScreenshot` 180ms）
-2. **批处理**：`scratch_batch({calls:[...]})` —— 一次往返做多件事（实测 7 条命令合并后从
-   「N×20s + N×推理」降到 314ms）
-3. **脚本结构视图**：`scratch_list_scripts`（顶层脚本清单，区分**真脚本**与**游离积木**）、
-   `read_script` 瘦身
-4. **性能**：`scratch_profile({seconds})`（包装 `runtime._step` 量每步耗时，比项目自己的 fps 变量可靠）
+（实测补了 36 个文件 / 2334 行，比插件本体还大）。**v0.7.0 把这一层收进插件了**，见上面那节。
 
 ## 以后可以做的（评估过，暂时不做）
 
@@ -318,11 +349,17 @@ CDP 那条路也有它自己的盲区：`desktop-cdp-check.mjs` 只在装了 Tur
 
 ## 给接手 AI 的提示
 
-- 你的 19 个工具：`scratch_open_editor`（主动开编辑器，浏览器/桌面版两条路）/ `list_sessions` /
-  `snapshot` / `read_script` / `add_blocks` / `apply` / `locate` / `add_costume` / `rollback` /
+- 你的 28 个工具：`scratch_open_editor`（主动开编辑器，浏览器/桌面版两条路；`port` 接管任意调试端口，
+  `show:false` 只接管不弹窗）/ `list_sessions` / `selftest`（排障第一步）/
+  `snapshot` / `read_script`（`summary` 先看结构，`scriptId`/`opcodes` 再读块体） / `list_scripts` /
+  `add_blocks` / `apply` / `locate` / `add_costume` / `rollback` /
   `update_block` / `delete_blocks` / `tidy_blocks` / `get_opcodes` / `watch` /
   `user_context` / `load_project`（打开本机 .sb3） / `save_project`（存回磁盘） /
+  `run` / `state` / `click` / `press_key` / `profile` / `screenshot` / `batch` /
   `skills` / `skill_edit`
+- **改完要自己验证，别让用户去点**：`scratch_run({action:"greenflag"})` → `scratch_state` 看坐标/变量
+  有没有真的变 → `scratch_screenshot` 把画面给用户。`running:true` **不算证据**（项目里常有不会自动跑的脚本）
+- **一次要问好几件事就 `scratch_batch`**（只读/运行期，≤12 条）：一轮往返做完，省的是用户的等待时间
 - **用户说「打开 TurboWarp」时别让他自己去点**：调 `scratch_open_editor`。它有两条路：
   `app:'browser'`（默认，要装扩展 + token）和 `app:'desktop'`（TurboWarp Desktop + **CDP 直连，零安装零 token**）。
   用户说「打开我的作品 xxx.sb3」就传 `path` —— 已经有会话时它**不会再开窗口**，直接把文件装进现有会话
@@ -333,7 +370,7 @@ CDP 那条路也有它自己的盲区：`desktop-cdp-check.mjs` 只在装了 Tur
   `force` 会**关掉现有窗口、未保存的改动会丢**——先说清楚再动
 - **发现没有会话**：调 `scratch_list_sessions`，它会把 token 和三步配置指引一起返回，念给用户
   （或者干脆改用 `app:'desktop'`，不需要 token）
-- **第一次在这个项目上干活：先 `scratch_skills read INDEX.md`**（8 篇经验按需选读，不强制）
+- **第一次在这个项目上干活：先 `scratch_skills read INDEX.md`**（9 篇经验按需选读，不强制）
 - 生成积木前先 `scratch_get_opcodes` 查白名单，别编造 opcode
 - 用户的块 ID 在 `scratch_snapshot` / `scratch_read_script` 的输出里；你自己注入的块用
   `add_blocks` 返回的**新 ID**

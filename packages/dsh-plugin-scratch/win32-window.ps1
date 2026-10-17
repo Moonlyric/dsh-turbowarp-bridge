@@ -35,6 +35,9 @@ public class DshWin32 {
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+  [DllImport("user32.dll")] public static extern bool SystemParametersInfo(uint action, uint param, out RECT rect, uint winIni);
   public struct RECT { public int L, T, R, B; }
   public static List<IntPtr> Handles = new List<IntPtr>();
   public static bool Collect(IntPtr h, IntPtr l) { Handles.Add(h); return true; }
@@ -48,6 +51,13 @@ if ($TargetPid -gt 0) {
   foreach ($proc in @(Get-Process -Name $ImageName -ErrorAction SilentlyContinue)) { $targets.Add([int]$proc.Id) }
 }
 if ($targets.Count -eq 0) { Write-Output '[]'; exit 0 }
+
+# 屏幕/工作区几何：判断"窗口跑到屏幕外"要靠它（GetSystemMetrics + SPI_GETWORKAREA 都是纯 P/Invoke，比加载 WinForms 便宜）
+$screenW = [DshWin32]::GetSystemMetrics(0)
+$screenH = [DshWin32]::GetSystemMetrics(1)
+$work = New-Object DshWin32+RECT
+[void][DshWin32]::SystemParametersInfo(0x0030, 0, [ref]$work, 0)
+$fgHandle = [DshWin32]::GetForegroundWindow()
 
 [void][DshWin32]::Handles.Clear()
 [void][DshWin32]::EnumWindows([DshWin32+EnumWindowsProc] { param($wnd, $lp) return [DshWin32]::Collect($wnd, $lp) }, [IntPtr]::Zero)
@@ -84,7 +94,9 @@ foreach ($wnd in [DshWin32]::Handles) {
     cls       = $sbClass.ToString()
     visible   = [bool]$isVisible
     minimized = [bool][DshWin32]::IsIconic($wnd)
+    active    = [bool]($fgHandle -eq $wnd)
     rect      = @([int]$rect.L, [int]$rect.T, [int]($rect.R - $rect.L), [int]($rect.B - $rect.T))
+    screen    = @([int]$screenW, [int]$screenH, [int]$work.L, [int]$work.T, [int]($work.R - $work.L), [int]($work.B - $work.T))
     title     = $titleText
   }
   $found.Add($item)
@@ -109,7 +121,10 @@ foreach ($w in $found) {
   [void]$json.Append('"cls":"').Append((Esc $w.cls)).Append('",')
   [void]$json.Append('"visible":').Append($(if ($w.visible) { 'true' } else { 'false' })).Append(',')
   [void]$json.Append('"minimized":').Append($(if ($w.minimized) { 'true' } else { 'false' })).Append(',')
+  [void]$json.Append('"active":').Append($(if ($w.active) { 'true' } else { 'false' })).Append(',')
   [void]$json.Append('"rect":[').Append($r[0]).Append(',').Append($r[1]).Append(',').Append($r[2]).Append(',').Append($r[3]).Append('],')
+  $sc = $w.screen
+  [void]$json.Append('"screen":[').Append($sc[0]).Append(',').Append($sc[1]).Append(',').Append($sc[2]).Append(',').Append($sc[3]).Append(',').Append($sc[4]).Append(',').Append($sc[5]).Append('],')
   [void]$json.Append('"title":"').Append((Esc $w.title)).Append('"')
   [void]$json.Append('}')
 }

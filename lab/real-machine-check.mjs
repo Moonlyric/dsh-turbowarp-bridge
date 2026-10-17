@@ -333,7 +333,7 @@ async function main() {
       ? readFileSync(STUB_LOG, 'utf8').split(/\r?\n/).filter(Boolean)
       : []
     const TOKEN = readFileSync(join(HOME, 'scratch-bridge-token.txt'), 'utf8').trim()
-    t('插件 apply 未抛错，注册了 19 个工具', registered.size === 19, '实际 ' + registered.size)
+    t('插件 apply 未抛错，注册了 28 个工具', registered.size === 28, '实际 ' + registered.size)
     t('桥 token 已生成（32 位 hex）', /^[0-9a-f]{32}$/.test(TOKEN), TOKEN)
     const call = async (name, args) => {
       const tool = registered.get(name)

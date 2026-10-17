@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-scratch",
-  "version": "0.6.0",
-  "description": "TurboWarp bridge for DeepSeek Harness: AI reads and edits sb3 blocks live in the editor, with community-derived skill library",
+  "version": "0.7.0",
+  "description": "TurboWarp bridge for DeepSeek Harness: AI reads/edits sb3 blocks live, drives the project (green flag, click, keys), reads runtime state, takes screenshots, and keeps a community-derived skill library",
   "type": "module",
   "main": "index.js",
   "exports": {

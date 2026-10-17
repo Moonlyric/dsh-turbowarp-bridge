@@ -28,6 +28,8 @@ const t = (name, cond, detail) => {
   else { fail++; console.log('  FAIL ' + name + (detail ? ' | ' + detail : '')) }
 }
 const sleep = (ms) => new Promise(r => setTimeout(r, ms))
+// v0.7.0 加了 9 个运行控制/可观测工具（19 → 28），数量集中在这里维护
+const TOOL_COUNT = 28
 
 // ---- 桩：把收到的参数追加到一个文件里，冒充「被打开的程序」 ----
 const browserStub = join(STUB_DIR, 'stub-browser.cmd')
@@ -53,7 +55,7 @@ mod.apply(fakeCtx, {
   browserPath: browserStub, desktopPath: desktopStub
 })
 t('插件 apply 未抛错', true)
-t('注册了 19 个工具', registered.size === 19, '实际 ' + registered.size)
+t('注册了 ' + TOOL_COUNT + ' 个工具', registered.size === TOOL_COUNT, '实际 ' + registered.size)
 
 const call = async (name, args) => {
   const tool = registered.get(name)
@@ -224,7 +226,7 @@ mod3.apply({
 }, { safety: 'auto', bridgePort: BUSY_PORT, maxSnapshots: 1, desktopPath: process.execPath })
 await sleep(400)
 t('端口被占时如实记一条 warn，而且不抛（插件照常可用）',
-  logs3.some(l => /已被占用/.test(l)) && reg3b.size === 19,
+  logs3.some(l => /已被占用/.test(l)) && reg3b.size === TOOL_COUNT,
   JSON.stringify(logs3.slice(-3)) + ' tools=' + reg3b.size)
 const { default: WsClient } = await import('ws')
 const tryConnect = () => new Promise((resolve) => {
@@ -412,6 +414,69 @@ t('隐藏态会自动 ShowWindow 救回来（windowRepair / windowHidden）',
   indexSrc.includes('out.windowRepair') && indexSrc.includes('out.windowHidden'))
 t('会话失效的错误提示同时给两条路（桌面版 / 网页版）',
   /scratch_open_editor\(\{ app: "desktop" \}\)/.test(indexSrc) && indexSrc.includes('tw-bridge-extension'))
+
+// ==================== 11. v0.7.0：运行控制 / 可观测 / 批处理 ====================
+// 这一节守的是「问题记录里那四个 P0/P1/P2 没有被悄悄退回去」：
+//   窗口可见性(P0-1) / 跨角色定位(P1-1) / 回传爆炸(P2-2、P1-5) / 运行控制缺失(P0-2)
+// 断言尽量落在「行为契约」上（工具参数真的往下传了、回传结构里真有那个字段），
+// 而不是只数一数工具有没有注册。
+console.log('\n[11] 运行控制 / 可观测 / 批处理（问题记录 P0-2、P1-1、P1-5、P1-6、P2-2）')
+const NEW_TOOLS = ['scratch_run', 'scratch_state', 'scratch_click', 'scratch_press_key',
+  'scratch_screenshot', 'scratch_profile', 'scratch_list_scripts', 'scratch_batch', 'scratch_selftest']
+const missingTools = NEW_TOOLS.filter(n => !registered.has(n))
+t('9 个新工具都在（运行控制/状态/点击/按键/截图/性能/脚本清单/批处理/自检）',
+  missingTools.length === 0, '缺: ' + missingTools.join(','))
+
+const paramNames = (name) => Object.keys(((registered.get(name) || {}).parameters || {}).properties || {})
+t('scratch_locate 带 target 参数（跨角色定位的入口）',
+  paramNames('scratch_locate').includes('target'), paramNames('scratch_locate').join(','))
+t('scratch_read_script 带 summary/scriptId/opcodes/offset（瘦身与分页的入口）',
+  ['summary', 'scriptId', 'opcodes', 'offset'].every(k => paramNames('scratch_read_script').includes(k)),
+  paramNames('scratch_read_script').join(','))
+t('scratch_watch 带 includeLists（长列表默认不跟）',
+  paramNames('scratch_watch').includes('includeLists'), paramNames('scratch_watch').join(','))
+t('scratch_open_editor 带 port（接管手动开的实例）与 show（窗口选项）',
+  paramNames('scratch_open_editor').includes('port') && paramNames('scratch_open_editor').includes('show'),
+  paramNames('scratch_open_editor').join(','))
+t('scratch_run 的 action 说明里列出了 greenflag/stopall',
+  /greenflag/.test(registered.get('scratch_run').description) && /stopall/.test(registered.get('scratch_run').description))
+
+// 批处理白名单：写操作绝对不能进去（那会绕过 preview/apply 的确认）
+const batchDesc = registered.get('scratch_batch').description
+t('scratch_batch 的白名单里没有写操作（add_blocks/update/delete/restore 都不许）',
+  !/add_blocks/.test(indexSrc.match(/BATCH_OPS = new Set\(\[[\s\S]*?\]\)/)[0]),
+  indexSrc.match(/BATCH_OPS = new Set\(\[[\s\S]*?\]\)/)[0].replace(/\s+/g, ' '))
+t('scratch_batch 描述里把白名单原文告诉 AI（省得它瞎试）',
+  /read_script/.test(batchDesc) && /state/.test(batchDesc))
+t('批处理有单次条数上限（不让人一条消息塞爆）', indexSrc.includes('一次最多 12 条'))
+
+// 截图只能走 CDP：扩展那条路页面里没有浏览器层权限
+t('截图走 Page.captureScreenshot，且对扩展会话明确拒绝',
+  indexSrc.includes('Page.captureScreenshot') && indexSrc.includes('截图只能走桌面版 CDP 会话'))
+t('selftest 真的检查桥在不在监听（不是只看有没有会话）',
+  indexSrc.includes("add('bridge 监听'") && indexSrc.includes('bridgeListening'))
+t('写操作的「哪变了」统一成 changed（P3-2），且老字段保留',
+  (indexSrc.match(/return withChanged\(await guardedWrite\(/g) || []).length === 5 && indexSrc.includes('changed.added'),
+  String((indexSrc.match(/return withChanged\(await guardedWrite\(/g) || []).length))
+
+// 执行器侧：新 op 都在，而且都在**同步后的** vm-executor.js 里（CDP 那条路读的是它）
+const executorSrc = readFileSync(join(PKG_DIR, 'vm-executor.js'), 'utf8')
+const missingOps = ['run', 'state', 'click', 'press_key', 'profile', 'list_scripts']
+  .filter(op => !new RegExp(`case '${op}'`).test(executorSrc))
+t('执行器里 6 个新 op 都在（run/state/click/press_key/profile/list_scripts）',
+  missingOps.length === 0, '缺: ' + missingOps.join(','))
+t('read_script 默认不回变量（7.5MB 那个坑的根因就是它连带回列表）',
+  executorSrc.includes('variablesOmitted') && executorSrc.includes('includeVariables === true'))
+t('watch 默认不跟列表，且回传前先裁长度（14.8MB 那个坑）',
+  executorSrc.includes('includeLists: false') && executorSrc.includes('maxQueue'))
+t('state/profile 用 runtime.currentStepTime 反推 fps（比项目里的 fps 变量可信）',
+  executorSrc.includes('currentStepTime'))
+t('click 用的是 mouse.postData 的像素坐标换算（x = scratchX+240，y = 180-scratchY）',
+  executorSrc.includes('canvasWidth: 480') && executorSrc.includes('scratchX'))
+t('locate 会跨角色搜索并在错误里列出找过谁',
+  executorSrc.includes('个角色/舞台里都没有'))
+t('窗口探针额外报 active + screen 工作区（判断"被别的窗口盖住/跑到屏幕外"）',
+  psProbe.includes('"active"') && psProbe.includes('"screen"') && psProbe.includes('GetForegroundWindow'))
 
 console.log(`\n===== 插件工具单测: ${pass} pass / ${fail} fail =====`)
 try { rmSync(STUB_DIR, { recursive: true, force: true }); rmSync(HOME, { recursive: true, force: true }) } catch {}

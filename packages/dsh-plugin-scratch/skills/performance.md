@@ -41,6 +41,10 @@
 
 ## dsh 场景特化（AI 用桥改项目时）
 
-- 你改完块后项目在编辑器里**不自动重跑**——告诉用户「点绿旗看看效果」或建议 `scratch_locate` 定位你改的块人工检查
-- 大项目（>2000 块）用 `scratch_read_script` 按精灵读，别 `scratch_snapshot` 全量拉（token 会爆）
+- 你改完块后项目在编辑器里**不自动重跑**——`scratch_run({action:"greenflag"})` 自己点，别让用户代劳；
+  要确认真的跑起来了看 `scratch_state` 里那个角色的坐标/变量有没有变（`running:true` 不算证据）
+- 大项目（>2000 块）先 `scratch_read_script({summary:true})` 拿结构，再按 `scriptId` 读单段；
+  `scratch_snapshot` 是整项目 project.json，大项目别整份拉（token 会爆）
+- 性能问题用 `scratch_profile({seconds:3})` 量（读 VM 自己的步进耗时），别信项目里那个 `fps` 变量；
+  量法写进 runtime-control.md
 - 改动前快照是自动的（scratch_add_blocks 内置），但**连续多次改**建议口头告知用户每步要改什么——preview 档的存在意义就是这个

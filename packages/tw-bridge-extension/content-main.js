@@ -58,7 +58,9 @@
   })
 
   // ---------------- M2 状态：观察者 + 用户事件缓存 ----------------
-  const watchState = { timer: null, targetName: null, values: {}, queue: [] }
+  // includeLists 默认 false：真机踩过 —— 一个 160000 项的列表让单次 poll 回了 14.8MB
+  // （问题记录 P1-5）。要看列表就显式 includeLists: true，且只回长度/首个变化位/样本。
+  const watchState = { timer: null, targetName: null, values: {}, queue: [], includeLists: false, maxQueue: 400 }
   const userEvents = [] // {type, blockId, opcode, at} 最近 20 条
 
   function watchTick() {
@@ -67,17 +69,37 @@
       const vm = window.vm
       if (!vm || !watchState.targetName) return
       const stage = vm.runtime.getTargetForStage()
-      const t = vm.runtime.targets.find(t => t.getName() === watchState.targetName)
+      const t = vm.runtime.targets.find(t2 => t2.getName() === watchState.targetName)
       if (!t) return
       const changes = []
       const check = (target, scope) => {
         if (!target) return
         for (const [id, v] of Object.entries(target.variables)) {
           const key = scope + ':' + v.name
-          if (!Object.prototype.hasOwnProperty.call(watchState.values, key) || watchState.values[key] !== v.value) {
-            changes.push({ name: v.name, scope, from: watchState.values[key], to: v.value })
-            watchState.values[key] = v.value
+          const isList = v.type === 'list' || Array.isArray(v.value)
+          if (isList) {
+            if (!watchState.includeLists) continue
+            const arr = Array.isArray(v.value) ? v.value : []
+            const prev = watchState.values[key] || { length: arr.length, sample: arr.slice(0, 20).map(x => JSON.stringify(x)) }
+            const sample = arr.slice(0, 20).map(x => JSON.stringify(x))
+            let firstDiff = -1
+            const n = Math.min(sample.length, prev.sample.length)
+            for (let i = 0; i < n; i++) { if (sample[i] !== prev.sample[i]) { firstDiff = i; break } }
+            if (firstDiff < 0 && arr.length !== prev.length) firstDiff = n
+            if (firstDiff < 0) continue
+            watchState.values[key] = { length: arr.length, sample }
+            changes.push({
+              name: v.name, scope, type: 'list', length: arr.length, prevLength: prev.length,
+              firstChangedIndex: firstDiff,
+              sample: arr.slice(firstDiff, firstDiff + 3).map(clipScalar)
+            })
+            continue
           }
+          const cur = clipScalar(v.value)
+          const known = Object.prototype.hasOwnProperty.call(watchState.values, key)
+          if (known && watchState.values[key] === cur) continue
+          changes.push({ name: v.name, scope, from: known ? watchState.values[key] : undefined, to: cur })
+          watchState.values[key] = cur
         }
       }
       check(stage, 'global')
@@ -87,6 +109,9 @@
         // 断线时也照样采（重连后用户还能看到断线期间的变化）。
         // ⚠️ 之前把整段记在 `if (linkOk)` 里 → 一旦没连上，轨迹就永远是空的（真机抓到过）。
         watchState.queue.push(...changes.map(c => Object.assign({ at: Date.now() }, c)))
+        if (watchState.queue.length > watchState.maxQueue) {
+          watchState.queue.splice(0, watchState.queue.length - watchState.maxQueue)
+        }
         if (linkOk) relaySend('watch', { target: watchState.targetName, changes, at: Date.now() })
       }
     } catch { /* 页面切换等瞬态，忽略 */ }
@@ -239,6 +264,184 @@
     const t = targets.find(t => t.getName() === name)
     if (!t) throw new Error(`找不到角色 "${name}"，现有: ${targets.map(t => t.getName()).join(', ')}`)
     return t
+  }
+
+  // ==================== 运行时 / 静态分析的小工具（v0.7.0） ====================
+  // 这一组是从「问题记录」里的 P1-1 / P1-5 / P2-2 / P0-2 / P1-6 提炼出来的：
+  // 之前 AI 每次都要自己连裸 CDP 写一套（36 个脚本 / 2300 行），现在收进执行器。
+
+  const sleepMs = (ms) => new Promise(r => setTimeout(r, ms))
+
+  /** 同名 target 的全部实例：原身 + 克隆体。按造型找「可见的那个克隆体」必须用它 */
+  function findTargets(vm, name) {
+    const all = vm.runtime.targets || []
+    if (!name) return vm.editingTarget ? [vm.editingTarget] : []
+    return all.filter(t => t.getName() === name)
+  }
+
+  function clipScalar(v) {
+    // 数字/布尔原样给（AI 要判断真假和大小，别全变字符串）；字符串超长才截断
+    if (typeof v === 'number' || typeof v === 'boolean') return v
+    const s = v === null || v === undefined ? '' : String(v)
+    return s.length > 120 ? s.slice(0, 117) + '…' : s
+  }
+
+  /**
+   * 变量摘要。**默认不回列表内容** —— 真机踩过：一个 160000 项的列表
+   * （`地图.细胞类别`）让 scratch_watch 单次 poll 回了 14.8MB、read_script 回 7.5MB。
+   * 标量直出（截断到 120 字），列表只报长度 + 前几项样本。
+   */
+  function varSummary(target, opts) {
+    const o = opts || {}
+    const maxVars = Number(o.maxVars) || 40
+    const scalars = {}
+    const listLengths = {}
+    let dropped = 0
+    let n = 0
+    if (!target || !target.variables) return { scalars, listLengths }
+    for (const v of Object.values(target.variables)) {
+      const isList = v.type === 'list' || Array.isArray(v.value)
+      if (isList) {
+        const arr = Array.isArray(v.value) ? v.value : []
+        listLengths[v.name] = arr.length
+        if (o.includeLists === true) {
+          scalars[v.name] = arr.slice(0, Number(o.listLimit) || 50).map(clipScalar)
+        }
+        continue
+      }
+      if (n >= maxVars) { dropped++; continue }
+      scalars[v.name] = clipScalar(v.value)
+      n++
+    }
+    const out = { scalars, listLengths }
+    if (dropped) out.droppedVars = dropped
+    if (!Object.keys(listLengths).length) delete out.listLengths
+    return out
+  }
+
+  /** 顶层块 id（parent 为空）。活块形态里 parent 比 topLevel 标记更可靠 */
+  function topLevelIds(blocks) {
+    const out = []
+    for (const [id, b] of Object.entries(blocks)) {
+      if (b && !b.parent) out.push(id)
+    }
+    return out
+  }
+
+  /** 从一个块出发收全「它这一坨」的 id：next 链 + 所有输入（含 SUBSTACK）+ 影子块 */
+  function collectIds(blocks, rootId) {
+    const out = []
+    const seen = new Set()
+    const stack = [rootId]
+    while (stack.length) {
+      const id = stack.pop()
+      if (!id || seen.has(id)) continue
+      const b = blocks[id]
+      if (!b) continue
+      seen.add(id)
+      out.push(id)
+      if (b.next) stack.push(b.next)
+      for (const inp of Object.values(b.inputs || {})) {
+        if (!inp) continue
+        if (inp.block) stack.push(inp.block)
+        if (inp.shadow) stack.push(inp.shadow)
+      }
+    }
+    return out
+  }
+
+  function opcodeHistogram(blocks, ids) {
+    const h = {}
+    for (const id of ids) {
+      const b = blocks[id]
+      if (b) h[b.opcode] = (h[b.opcode] || 0) + 1
+    }
+    return h
+  }
+
+  /**
+   * 脚本索引：顶层块清单。
+   * ⚠️ 关键区分：真脚本（帽子块打头）vs **游离块**（作者调试拖出来的孤立块）。
+   * 真机实测某角色 185 个顶层块里约 150 个是游离块 —— 不区分的话"按块数排名"全是噪音。
+   * 判定用 runtime._hats（VM 自己注册的帽子表），不靠 opcode 前缀猜。
+   */
+  function scriptIndex(vm, t) {
+    const blocks = t.blocks._blocks
+    const hats = (vm.runtime && vm.runtime._hats) || {}
+    const out = []
+    for (const id of topLevelIds(blocks)) {
+      const b = blocks[id]
+      const ids = collectIds(blocks, id)
+      const calls = []
+      for (const bid of ids) {
+        const bb = blocks[bid]
+        if (bb && bb.opcode === 'procedures_call' && bb.mutation && bb.mutation.proccode) {
+          if (!calls.includes(bb.mutation.proccode)) calls.push(bb.mutation.proccode)
+        }
+      }
+      out.push({
+        blockId: id,
+        opcode: b.opcode,
+        kind: hats[b.opcode] ? 'script' : 'loose',
+        blockCount: ids.length,
+        x: b.x, y: b.y,
+        calls: calls.length ? calls : undefined
+      })
+    }
+    // 真脚本在前（块数降序），游离块垫底（块数降序）
+    out.sort((a, b2) => {
+      if (a.kind !== b2.kind) return a.kind === 'script' ? -1 : 1
+      return b2.blockCount - a.blockCount
+    })
+    return out
+  }
+
+  /** 一段脚本的"人话"名字：帽子块 + 自定义积木名，方便 AI 在清单里认人 */
+  function scriptLabel(blocks, s) {
+    if (s.opcode === 'procedures_definition') {
+      const protoId = blocks[s.blockId] && blocks[s.blockId].inputs && blocks[s.blockId].inputs.custom_block
+      const proto = protoId && protoId.block && blocks[protoId.block]
+      if (proto && proto.mutation && proto.mutation.proccode) return proto.mutation.proccode
+    }
+    return undefined
+  }
+
+  /** 运行时快照（只读，全用 try 兜：不同 VM 版本字段有差异，别让工具整个炸掉） */
+  function runtimeState(vm, opts) {
+    const o = opts || {}
+    const rt = vm.runtime
+    const threads = rt.threads || []
+    const active = threads.filter(th => th.status !== 4 /* STATUS_DONE */)
+    const clones = {}
+    let targets = 0
+    for (const t of rt.targets || []) {
+      targets++
+      if (!t.sprite || t.isOriginal) continue
+      clones[t.sprite.name] = (clones[t.sprite.name] || 0) + 1
+    }
+    const stage = rt.getTargetForStage()
+    const vars = varSummary(stage, { includeLists: o.includeLists === true, listLimit: o.listLimit })
+    const stepTime = typeof rt.currentStepTime === 'number' ? rt.currentStepTime : null
+    const out = {
+      running: active.length > 0,
+      threads: active.length,
+      threadsTotal: threads.length,
+      targets,
+      clones: Object.keys(clones).length ? clones : undefined,
+      stepMs: stepTime,
+      fps: stepTime ? Math.round(1000 / stepTime) : null,
+      pageVars: vars.scalars
+    }
+    if (vars.listLengths) out.pageLists = vars.listLengths
+    if (!o.targetName) return out
+    const t = (rt.targets || []).find(x => x.getName() === o.targetName)
+    if (t) {
+      const tv = varSummary(t)
+      out.target = { name: t.getName(), isClone: !t.isOriginal, x: t.x, y: t.y, size: t.size, visible: t.visible, localVars: tv.scalars }
+      out.x = t.x
+      out.y = t.y
+    }
+    return out
   }
 
   /** 文档标题去掉站名后缀（TurboWarp / TurboWarp Desktop 两种都兜） */
@@ -438,8 +641,83 @@
         return pj
       }
       case 'read_script': {
+        // 瘦身版（问题记录 P2-2 / §15.4）：以前无论要什么，都回「全部块 + 全部变量」，
+        // 真机踩过 Stage 26 个块却回 7.5MB（全是 variables 里的长列表）、按钮 475KB。
+        // 现在默认：只回块、不回变量、块数超上限要分页，并且**总是带脚本索引**（很小、最有用）。
         const t = findTarget(vm, args && args.target)
-        return { target: t.getName(), blocks: t.blocks._blocks, variables: t.variables }
+        const a = args || {}
+        const blocks = t.blocks._blocks
+        const allIds = Object.keys(blocks)
+        const scripts = scriptIndex(vm, t).map(s => Object.assign(s, { label: scriptLabel(blocks, s) }))
+        const meta = {
+          target: t.getName(),
+          isClone: !t.isOriginal,
+          blockCount: allIds.length,
+          scriptCount: scripts.filter(s => s.kind === 'script').length,
+          looseCount: scripts.filter(s => s.kind === 'loose').length
+        }
+
+        // summary=true：只给"结构"，不给块体（找块 / 判断某 opcode 存不存在时用这个）
+        if (a.summary === true) {
+          const limit = Math.min(Math.max(Number(a.limit) || 200, 1), 2000)
+          const vs = varSummary(t)
+          return Object.assign(meta, {
+            summary: true,
+            opcodes: opcodeHistogram(blocks, allIds),
+            scripts: scripts.slice(0, limit),
+            scriptsTruncated: scripts.length > limit || undefined,
+            // 变量名给（便宜、有用），值不给 —— 与默认路径一致，别让 summary 变成"变量消失"的错觉
+            variablesOmitted: true,
+            variableNames: Object.keys(vs.scalars),
+            listNames: vs.listLengths,
+            hint: '要看某段脚本的块体：scratch_read_script({ scriptId: <scripts[].blockId> })，或 opcodes: [...] 过滤'
+          })
+        }
+
+        // 选块集合：单个脚本 > opcode 过滤 > 全部
+        let ids
+        const root = a.scriptId || a.topLevelBlockId
+        if (root) {
+          if (!blocks[root]) {
+            throw new Error(`找不到脚本 ${root}（角色 "${t.getName()}" 里没有这个块 id；先用 summary:true 拿清单）`)
+          }
+          ids = collectIds(blocks, root)
+        } else {
+          ids = allIds
+        }
+        const opFilters = Array.isArray(a.opcodes) ? a.opcodes.filter(Boolean) : (a.opcodes ? [a.opcodes] : null)
+        if (opFilters && opFilters.length) {
+          const set = new Set(opFilters)
+          ids = ids.filter(id => blocks[id] && set.has(blocks[id].opcode))
+        }
+        const offset = Math.min(Math.max(Number(a.offset) || 0, 0), ids.length)
+        // 缺省上限 1500 块：够读绝大多数角色，又不至于把上下文打爆
+        const limit = Math.min(Math.max(Number(a.limit) || 1500, 1), 20000)
+        const page = ids.slice(offset, offset + limit)
+        const out = Object.assign(meta, {
+          returned: page.length,
+          filteredCount: ids.length,
+          offset: offset || undefined,
+          hasMore: offset + page.length < ids.length || undefined,
+          blocks: {}
+        })
+        for (const id of page) out.blocks[id] = blocks[id]
+        // 变量默认不回（这是 7.5MB 的元凶）；要就显式 includeVariables: true
+        if (a.includeVariables === true) {
+          const vs = varSummary(t, { includeLists: a.includeLists === true, listLimit: a.listLimit })
+          out.variables = t.variables
+          out.variablesSummary = vs
+        } else {
+          const vs = varSummary(t)
+          out.variableNames = Object.keys(vs.scalars)
+          if (vs.listLengths) out.listNames = vs.listLengths
+          out.variablesOmitted = true
+        }
+        if (!root && !opFilters) out.scripts = scripts.slice(0, Number(a.scriptLimit) || 60)
+        if (out.hasMore) {
+          out.hint = `只回了 ${page.length}/${ids.length} 块（offset=${offset}）。用 offset 翻页、或 scriptId/opcodes 收窄。`
+        }
+        return out
       }
       case 'add_blocks': {
         // 宿主 API 事实（npm scratch-vm 5.0.300 / TurboWarp spork 5.0.301 实测一致）：
@@ -495,19 +773,41 @@
         // 坑一：workspace 只在**当前编辑角色**的积木区里，别的角色的块根本不在里面
         //       → 先把目标角色切成 editingTarget 并刷新，再找。
         // 坑二：emitWorkspaceUpdate 之后 GUI 是异步重建的，块不会立刻出现 → 重试。
-        const t = findTarget(vm, args && args.target)
+        const blockId = args && args.blockId
+        if (!blockId) throw new Error('blockId 必填')
         const ws = getBlocklyWorkspace()
         if (!ws) {
           throw new Error('拿不到 Blockly workspace（积木区还没挂载 / 这是播放器页；scratch.mit.edu 新版编辑器不暴露 window.Blockly）')
         }
-        // 先在 VM 里确认这个块真的存在：不存在就没必要等着 GUI 慢慢渲染（否则要空转 1 秒多）
-        if (!t.blocks.getBlock(args.blockId)) {
-          throw new Error(`找不到块 ${args.blockId}（角色 "${t.getName()}" 里没有这个 ID；它可能已被 add_blocks 换新，用 scratch_read_script 重读一次）`)
+        // 跨角色搜索（P1-1）：以前只在「当前编辑目标」里找，多角色项目里必然失败，
+        // 而且错误信息把原因归到「ID 可能被 add_blocks 换新」—— 完全误导（实测就是这么被绕的）。
+        // 现在：给了 target 就只搜它；没给就按「当前编辑角色 → 其它角色 → 舞台」全搜，命中后自动切过去。
+        const allTargets = (vm.runtime.targets || []).filter(x => x.isOriginal)
+        const scope = args && args.target
+          ? allTargets.filter(x => x.getName() === args.target)
+          : allTargets.slice()
+        if (args && args.target && !scope.length) {
+          throw new Error(`找不到角色 "${args.target}"，现有: ${allTargets.map(x => x.getName()).join(', ')}`)
         }
+        const rank = (x) => (vm.editingTarget && x.id === vm.editingTarget.id ? 0 : (x.isStage ? 2 : 1))
+        scope.sort((a, b) => rank(a) - rank(b))
+        // 先在 VM 里确认这个块真的存在：不存在就没必要等着 GUI 慢慢渲染（否则要空转 1 秒多）
+        const t = scope.find(x => x.blocks._blocks[blockId])
+        if (!t) {
+          throw new Error(
+            `找不到块 ${blockId}：${scope.length} 个角色/舞台里都没有（找过 ${scope.map(x => x.getName()).join('、')}）。`
+            + '两种可能：① 它已经被 add_blocks 换过新 ID —— 用 scratch_read_script({ summary: true }) 重读，清单里都是真实 ID；'
+            + '② 这个块只活在某个克隆体里（运行期克隆的积木不在工作区上，定位不了）。'
+          )
+        }
+        const fromTarget = vm.editingTarget && vm.editingTarget.getName()
+        if (!args || !args.target) args.target = t.getName() // 命中后统一按"这个角色"处理
         // 存在但可能还没渲染：先切角色刷新，再重试等 GUI 重建完
+        let switched = false
         if (vm.editingTarget && vm.editingTarget.id !== t.id) {
           vm.setEditingTarget(t.id)
           safeEmitWorkspaceUpdate(vm)
+          switched = true
           await new Promise(r => setTimeout(r, 150))
         }
         let block = ws.getBlockById(args.blockId)
@@ -553,6 +853,9 @@
           opcode: block.type,
           position: { x: xy.x, y: xy.y },
           scrolledBy,
+          // 跨角色定位命中时把"从哪个角色切过来"也报出来，用户才知道工作区为什么整体换了
+          switchedFrom: switched ? fromTarget : undefined,
+          searchedTargets: scope.length,
           warnings: scrolledBy && !scrolledBy.startsWith('error')
             ? undefined
             : [`工作区没有可用的滚动 API（centerOnBlock / scrollBounds / scroll 都没有），只做了高亮、没有滚动${scrolledBy ? '：' + scrolledBy : ''}`]
@@ -859,22 +1162,37 @@
         // start 后扩展侧每 500ms 轮询（全局 Stage + 目标角色局部 两层），变化时推帧
         const action = (args && args.action) || 'poll'
         const collectVars = () => {
-          // 返回 {全局+局部变量名: 值} 扁平视图
+          // 返回 {全局+局部变量名: 值} 扁平视图。
+          // ⚠️ 只取标量：以前连列表整段回传，一次 poll 14.8MB（问题记录 P1-5）。
           const stage = vm.runtime.getTargetForStage()
-          const t = vm.runtime.targets.find(t => t.getName() === watchState.targetName)
+          const t = vm.runtime.targets.find(t2 => t2.getName() === watchState.targetName)
           const out = {}
-          if (stage) for (const v of Object.values(stage.variables)) out[v.name] = v.value
-          if (t) for (const v of Object.values(t.variables)) out[v.name] = v.value
-          return out
+          const lists = {}
+          for (const src of [stage, t]) {
+            if (!src) continue
+            const vs = varSummary(src, { includeLists: watchState.includeLists })
+            Object.assign(out, vs.scalars)
+            if (vs.listLengths) Object.assign(lists, vs.listLengths)
+          }
+          return { values: out, lists }
         }
         if (action === 'start') {
           const t = findTarget(vm, args && args.target)
           watchState.targetName = t.getName()
           watchState.values = {}
+          watchState.includeLists = !!(args && args.includeLists === true)
+          watchState.queue.length = 0
           if (watchState.timer) clearInterval(watchState.timer)
           watchState.timer = setInterval(watchTick, 500)
           watchTick() // 立即首采
-          return { watching: watchState.targetName, variables: Object.keys(collectVars()) }
+          const snap = collectVars()
+          return {
+            watching: watchState.targetName,
+            includeLists: watchState.includeLists,
+            variables: Object.keys(snap.values),
+            listLengths: Object.keys(snap.lists).length ? snap.lists : undefined,
+            hint: '列表默认不跟踪（includeLists:false）。要看列表变化就重新 start 并传 includeLists: true'
+          }
         }
         if (action === 'stop') {
           if (watchState.timer) clearInterval(watchState.timer)
@@ -883,7 +1201,215 @@
         }
         // poll：返回当前值 + 清空变化队列
         const changes = watchState.queue.splice(0)
-        return { current: collectVars(), changes, watching: watchState.targetName }
+        const snap = collectVars()
+        return {
+          current: snap.values,
+          listLengths: Object.keys(snap.lists).length ? snap.lists : undefined,
+          changes,
+          changeCount: changes.length,
+          watching: watchState.targetName,
+          includeLists: watchState.includeLists
+        }
+      }
+
+      // ==================== 运行控制 / 可观测（P0-2，v0.7.0） ====================
+      // 这些在问题记录里是「AI 每次都要自己写驱动脚本」的那一层。全部是只读或运行期动作，
+      // 不碰项目数据，所以不受 preview/apply 那套写保护约束（也不产生快照）。
+
+      case 'run': {
+        const action = (args && args.action) || 'greenflag'
+        const rt = vm.runtime
+        const before = runtimeState(vm)
+        if (action === 'greenflag') {
+          vm.greenFlag()
+          if (typeof vm.start === 'function') vm.start() // GUI 里通常在跑；headless/暂停时可自愈
+        } else if (action === 'stopall') {
+          vm.stopAll()
+        } else if (action === 'start') {
+          if (typeof vm.start === 'function') vm.start()
+        } else if (action === 'stoploop') {
+          if (typeof vm.stop === 'function') vm.stop()
+        } else {
+          throw new Error(`未知 action ${action}（greenflag | stopall | start | stoploop）`)
+        }
+        // 让绿旗线程真的跑起来几帧，用户才看得到变化（也给调用方一个稳定的读数）
+        const wait = Math.min(Math.max(Number(args && args.waitMs) || 300, 0), 5000)
+        if (wait) await sleepMs(wait)
+        const after = runtimeState(vm)
+        return {
+          action,
+          before: { running: before.running, threads: before.threads },
+          after,
+          hint: action === 'greenflag' && !after.running
+            ? '绿旗点了，但没有任何线程在跑 —— 项目可能没有接绿旗的脚本，或者脚本第一帧就结束了（这种是正常现象）'
+            : undefined
+        }
+      }
+
+      case 'state': {
+        const st = runtimeState(vm, {
+          targetName: args && args.target,
+          includeLists: !!(args && args.includeLists === true)
+        })
+        // 顺手把"点绿旗之后到底有没有在动"这件事说清楚：线程清单比单个布尔值有用
+        const rt = vm.runtime
+        const threads = (rt.threads || [])
+          .filter(th => th.status !== 4)
+          .slice(0, 20)
+          .map(th => ({
+            target: th.target && th.target.getName(),
+            topBlock: th.topBlock,
+            status: th.status,
+            stackDepth: th.stack && th.stack.length
+          }))
+        if (threads.length) st.activeThreads = threads
+        return st
+      }
+
+      case 'list_scripts': {
+        const t = findTarget(vm, args && args.target)
+        const blocks = t.blocks._blocks
+        const all = scriptIndex(vm, t).map(s => Object.assign(s, { label: scriptLabel(blocks, s) }))
+        const minBlocks = Number(args && args.minBlocks) || 0
+        const kind = (args && args.kind) || 'all' // all | script | loose
+        const list = all.filter(s => s.blockCount >= minBlocks && (kind === 'all' || s.kind === kind))
+        const limit = Math.min(Math.max(Number(args && args.limit) || 100, 1), 500)
+        return {
+          target: t.getName(),
+          isClone: !t.isOriginal,
+          blockCount: Object.keys(blocks).length,
+          scriptCount: all.filter(s => s.kind === 'script').length,
+          looseCount: all.filter(s => s.kind === 'loose').length,
+          returned: Math.min(list.length, limit),
+          scripts: list.slice(0, limit),
+          note: 'kind=script 是帽子块打头的真脚本；kind=loose 是作者拖出来的游离块（没有帽子、不会自己运行）。'
+            + '看某段脚本的块体：scratch_read_script({ scriptId: blockId })'
+        }
+      }
+
+      case 'click': {
+        // 点舞台上的东西。两条路：先按真实鼠标事件走（renderer.pick 命中就是真点击），
+        // 没命中再退化到「显式启动这个角色的点击帽子」——克隆体/无渲染环境下 pick 不可靠。
+        const rt = vm.runtime
+        const a = args || {}
+        let target = null
+        if (a.target) {
+          const cands = findTargets(vm, a.target)
+          if (!cands.length) {
+            throw new Error(`找不到角色 "${a.target}"，现有: ${(rt.targets || []).map(x => x.getName()).join(', ')}`)
+          }
+          // 有克隆体时优先"可见且非隐藏"的那个（用户看的也是它）
+          const visible = cands.filter(c => c.visible !== false)
+          let pool = visible.length ? visible : cands
+          if (a.costume) {
+            const byCostume = pool.filter(c => {
+              try { return c.getCostumes().some(cs => cs.name === a.costume) } catch { return false }
+            })
+            if (byCostume.length) pool = byCostume
+          }
+          target = pool[0]
+        }
+        let sx
+        let sy
+        if (typeof a.x === 'number' || typeof a.y === 'number') {
+          sx = Number(a.x) || 0
+          sy = Number(a.y) || 0
+        } else if (target) {
+          let bounds = null
+          try { bounds = target.getBounds() } catch { bounds = null }
+          if (bounds && typeof bounds.left === 'number') {
+            sx = (bounds.left + bounds.right) / 2
+            sy = (bounds.top + bounds.bottom) / 2
+          } else {
+            // 没有 renderer（headless / 播放器）就拿不出包围盒，退到角色坐标
+            sx = target.x || 0
+            sy = target.y || 0
+          }
+        } else {
+          throw new Error('要嘛给 target（点这个角色的造型中心）要嘛给 x/y（舞台坐标，范围 -240..240 / -180..180）')
+        }
+        // mouse.postData 吃的是「画布像素」：scratchX = 480*(x/canvasWidth - 0.5)
+        // 所以 canvasWidth=480、canvasHeight=360 时 x = scratchX+240、y = 180-scratchY
+        const px = Math.round(sx + 240)
+        const py = Math.round(180 - sy)
+        const mouse = rt.ioDevices && rt.ioDevices.mouse
+        if (!mouse) throw new Error('拿不到 runtime.ioDevices.mouse')
+        const threadsBefore = (rt.threads || []).length
+        const payload = { x: px, y: py, canvasWidth: 480, canvasHeight: 360, isDown: true }
+        // ⚠️ postData 在「没有 renderer.pick」的宿主里会抛（headless / 播放器页）。
+        //    这种情况不该整个 op 失败 —— 记下原因，走下面的 hat 退化路。
+        let pickError = null
+        try {
+          mouse.postData(payload)
+          await sleepMs(60)
+          mouse.postData(Object.assign({}, payload, { isDown: false }))
+          await sleepMs(120)
+        } catch (e) {
+          pickError = e && e.message ? e.message : String(e)
+        }
+        let via = pickError ? 'pick-error' : 'pick'
+        let hats = (rt.threads || []).length - threadsBefore
+        if (hats <= 0 && target && a.forceHat !== false) {
+          // 退化路：直接按角色启动点击帽子（克隆体的点击也是这样触发的）
+          try {
+            const th = rt.startHats('event_whenthisspriteclicked', null, target)
+            hats = Array.isArray(th) ? th.length : (th ? 1 : 0)
+            via = 'hat-fallback'
+          } catch (e) { via = 'hat-error: ' + e.message }
+        }
+        return {
+          clicked: target ? target.getName() : null,
+          isClone: target ? !target.isOriginal : undefined,
+          costume: target ? (() => { try { return target.getCostumes()[target.currentCostume].name } catch { return null } })() : undefined,
+          stageXY: { x: Math.round(sx), y: Math.round(sy) },
+          canvasXY: { x: px, y: py },
+          via,
+          hatsStarted: Math.max(hats, 0),
+          running: (rt.threads || []).some(th => th.status !== 4),
+          hint: via === 'hat-fallback'
+            ? '没走 renderer.pick（无渲染/没点中），改成直接启动该角色的「当角色被点击」帽子。'
+              + (pickError ? ` pick 失败原因：${pickError}` : '')
+            : undefined
+        }
+      }
+
+      case 'press_key': {
+        const kb = vm.runtime.ioDevices && vm.runtime.ioDevices.keyboard
+        if (!kb) throw new Error('拿不到 runtime.ioDevices.keyboard')
+        const key = (args && args.key) || ' '
+        const holdMs = Math.min(Math.max(Number(args && args.holdMs) || 80, 0), 5000)
+        kb.postData({ key, isDown: true })
+        if (holdMs) await sleepMs(holdMs)
+        kb.postData({ key, isDown: false })
+        return { key, holdMs, note: 'key 用 DOM 键名：空格是 " "、"ArrowUp"/"Up"、"Enter"，字母直接给 "a"' }
+      }
+
+      case 'profile': {
+        // 采样 VM 自己报的步进耗时（runtime.currentStepTime），比项目里那个 fps 变量可信
+        const secs = Math.min(Math.max(Number(args && args.seconds) || 3, 0.5), 10)
+        const samples = []
+        const threadPeak = { n: 0 }
+        const t0 = Date.now()
+        while (Date.now() - t0 < secs * 1000) {
+          const v = vm.runtime.currentStepTime
+          if (typeof v === 'number' && v > 0) samples.push(v)
+          const active = (vm.runtime.threads || []).filter(th => th.status !== 4).length
+          if (active > threadPeak.n) threadPeak.n = active
+          await sleepMs(100)
+        }
+        const pct = (p) => (samples.length ? samples.slice().sort((x, y) => x - y)[Math.min(samples.length - 1, Math.floor((samples.length - 1) * p))] : null)
+        const avg = samples.length ? samples.reduce((x, y) => x + y, 0) / samples.length : null
+        return {
+          seconds: secs,
+          samples: samples.length,
+          stepMs: {
+            avg: avg && Number(avg.toFixed(2)),
+            p50: pct(0.5), p95: pct(0.95), max: samples.length ? Math.max(...samples) : null
+          },
+          fps: avg ? Number((1000 / avg).toFixed(1)) : null,
+          threadsPeak: threadPeak.n,
+          note: 'stepMs = VM 每帧步进耗时（含所有脚本）。fps 由它反推；项目自己的 fps 变量常常是存档残留值，别信。'
+        }
       }
 
       case 'user_context': {
