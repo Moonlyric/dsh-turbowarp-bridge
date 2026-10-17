@@ -41,13 +41,23 @@ AI 通过 `scratch_*` 工具读取/修改 Scratch 项目，用户在 TurboWarp �
 3. 装完插件页里会出现 `dsh-plugin-scratch` 卡片：里面对应一个 `scratch` 行，
    可以**分别开关**（组合包开关 = 停用/启用整个包；行开关 = 只停插件）。
 
-不想用本地路径也可以直接装 GitHub 上的那份（dsh 自带的 pnpm 支持 `#path:` 子目录）：
+不想用本地路径也可以从 GitHub 装（dsh 自带的 pnpm 支持 `#path:` 子目录）：
 
 ```
 github:Moonlyric/dsh-turbowarp-bridge#path:packages/dsh-plugin-scratch
 ```
 
-装的时候需要能访问 github.com；装完是本机缓存副本，仓库更新后要再装一次。
+⚠️ 但在本机大概率会「连接 GitHub 超时」，开 VPN 也没用：
+- 安装源里的「中国大陆镜像源」只代理 **npm registry**，本包没发布到 npm，git 安装走 github.com；
+- dsh 的安装子进程不继承本地 HTTP 代理，`git ls-remote`（5s 预算）直接超时 —— 实测不带
+  `HTTPS_PROXY` 时 21 秒失败。要用它必须给 dsh 进程配代理。
+
+本机推荐直接用上面的**本地目录**（零网络）。两种写法：
+
+| 粘贴 | 记录成 | 特点 |
+|---|---|---|
+| `G:\...\packages\dsh-plugin-scratch` | `link:` | 改代码立即生效；依赖仓库里的 node_modules |
+| `file:G:\...\packages\dsh-plugin-scratch` | `file:` | 自包含；改代码要重装 |
 
 装好之后**不要**再去 `cordis.patch.yml` 里手写 `insert:`。手写 insert 能跑，但插件页里看不到它
 ——没有启用/禁用开关、没有配置页（这是真机上踩过的坑）。profile patch 只用来**覆盖配置**：

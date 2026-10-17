@@ -87,15 +87,30 @@ G:\09 Eutopia\demo\DSH Turbowarp插件\packages\dsh-plugin-scratch
 （这就是「从本地目录安装一个组合包」：dsh 会 `pnpm add file:<那个路径>`，把包装进
 `profiles\<profile>\node_modules`，并加进 `dsh.profile.bundles`。）
 
-**也可以直接从 GitHub 装**（换机器、或者不想 clone 仓库时用这个）——同一个对话框里粘：
+**也可以从 GitHub 装**（换机器、或者不想 clone 仓库时用这个）——同一个对话框里粘：
 
 ```
 github:Moonlyric/dsh-turbowarp-bridge#path:packages/dsh-plugin-scratch
 ```
 
-这是 pnpm 的 git 子目录 spec（dsh 自带的 pnpm 11.28 支持 `#path:`）。实测：装完「已安装插件」里照样
-出现卡片、`scratch` 行「运行中」，**来源信息**显示的就是这一串，配置页也正常。代价是：装的时候
-要能访问 github.com；装完是本机缓存副本，仓库更新后要再装一次。
+这是 pnpm 的 git 子目录 spec（dsh 自带的 pnpm 11.28 支持 `#path:`），我用官方 CLI 验过：
+装完卡片出现、`scratch` 行「运行中」、来源信息显示这一串、配置页正常。
+
+⚠️ **但它在本机大概率会“连接 GitHub 超时”，而且开 VPN 也救不了**：
+- 「安装源 = 中国大陆镜像源」只代理 **npm registry**；这个包**没发布到 npm**，git 安装走的是
+  `github.com` / `codeload.github.com`，镜像完全不参与（UI 上这点很容易误会）；
+- 安装流程会先跑一次 `git ls-remote`（默认 5s 预算），然后 pnpm 再去下载 —— 这两个**子进程不继承
+  你的代理环境**。本地 HTTP 代理（127.0.0.1:7890）必须通过 `HTTPS_PROXY` 传进去才生效；
+  实测：不带该环境变量时 `git ls-remote https://github.com/...` 21 秒超时失败。
+- 想让它真的能装，得给 **DSH 进程**配代理（用户级 `HTTPS_PROXY` + 重启 dsh，或在 git 全局配置里写
+  `http.proxy`）。没这个必要的话，直接用上面的本地目录安装。
+
+**本地目录安装的两种写法**（都零网络）：
+
+| 粘贴 | pnpm 记录 | 特点 |
+|---|---|---|
+| `G:\...\packages\dsh-plugin-scratch` | `link:` 符号链接 | **改仓库代码立即生效**，不用重装；但依赖仓库目录里的 `node_modules` |
+| `file:G:\...\packages\dsh-plugin-scratch` | `file:` 复制 | 自包含、用宿主版本依赖；改代码后要重装 |
 
 装完插件页里会出现一张 `dsh-plugin-scratch` 卡片，点进去是：
 
