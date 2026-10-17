@@ -7,7 +7,7 @@ v0.7.0 起它还能**替你点绿旗、点角色、按键、读运行期状态�
 所以"改完到底行不行"不用你自己去点。
 
 ```
-dsh 插件（Node，28 个 scratch_* 工具 + WebSocket 桥 :31820）
+dsh 插件（Node，30 个 scratch_* 工具 + WebSocket 桥 :31820）
 
   路径一 · 扩展桥（你自己浏览器里的编辑器）
       ↕ JSON-RPC over ws（握手 token）
@@ -46,6 +46,7 @@ dsh 插件（Node，28 个 scratch_* 工具 + WebSocket 桥 :31820）
 | 观察 | `scratch_watch`（变量轨迹，列表默认只报长度）、`scratch_user_context`（你选中了哪块、有没有按绿旗） |
 | 唤起 | `scratch_open_editor`（AI 自己把编辑器打开，不用你点；浏览器 / 桌面版两条路，`port` 可接管你手动开的实例，`show:false` 只接管不弹窗） |
 | 经验库 | `scratch_skills` / `scratch_skill_edit`（可读可写的 Scratch 实践经验，AI 自己积累） |
+| 背包 | `scratch_backpack`（把做好的积木存进背包：存/列/读/删，删进 `_trash` 不真删）、`scratch_backpack_load`（取出来注入，变量/列表按名字接上或补建） |
 
 **三档安全**（默认 `preview`）：写操作先返回一个 `planId` + 预览，你说"行"才落盘；
 每次写操作前自动快照（内存 + 磁盘），随时 `scratch_rollback`。
@@ -249,7 +250,7 @@ TurboWarp 时会 SKIP，不打扰你。
 ## 目录
 
 ```
-packages/dsh-plugin-scratch/   dsh 插件：桥服务端 + 28 个工具 + 经验库 + CDP 直连 + 单测
+packages/dsh-plugin-scratch/   dsh 插件：桥服务端 + 30 个工具 + 经验库 + 背包 + CDP 直连 + 单测
                                lib/client.js = 浏览器半侧（插件页里的配置表单，手写不用打包）
                                win32-window.ps1 = 窗口可见性探针（EnumWindows，Windows only）
 packages/tw-bridge-extension/  MV3 扩展：SW 持 socket，内容脚本操作 window.vm

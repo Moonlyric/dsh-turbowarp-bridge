@@ -920,6 +920,153 @@ async function main() {
   t('找不到时列出找过谁（而不是甩锅给 add_blocks 换 ID）',
     r.ok === false && /个角色\/舞台里都没有/.test(r.error) && /找过/.test(r.error), r.error)
 
+  // ==================== v0.8.0：背包（子树导出 + 变量引用落地） ====================
+  // 背包能不能用，全看两件事：
+  //   ① 存下来的片段是**自包含**的（引用的变量/列表连同值一起走）
+  //   ② 注进别的角色/别的项目时，变量引用会被接上或补建（而不是留下「变量未找到」）
+  // 这两条以前没有任何测试能发现：功能"看起来都对"，坏在跨角色那一步。
+  console.log('\n[test v0.8.0] 背包：子树导出与变量落地')
+  const varByName = (target, name) => Object.values(target.variables).find(v => v && v.name === name)
+  const blocksById = (target, ids) => ids.map(id => target.blocks._blocks[id]).filter(Boolean)
+  /** 在 sb3 dict 里按 id 找块（导出结果是 sb3 形态，只有压缩后的 next/inputs） */
+  const sb3Block = (dict, id) => dict[id]
+  /** 从帽子块顺着 next 链找第一个指定 opcode 的块（sb3 形态） */
+  const sb3Find = (dict, rootId, opcode) => {
+    let cur = dict[rootId]
+    for (let i = 0; cur && i < 50; i++) {
+      if (cur.opcode === opcode) return cur
+      cur = cur.next ? dict[cur.next] : null
+    }
+    return null
+  }
+  const savedSb3Blocks = (dict, rootId) => sb3Find(dict, rootId, 'data_setvariableto') || {}
+
+  // 手写一段：引用「舞台上的 分数（id 有效）」+「还不存在的 字模（id 是空的）」
+  const bpTpl = {
+    bp_h1: { opcode: 'event_whenflagclicked', next: 'bp_s1', parent: null, inputs: {}, fields: {}, shadow: false, topLevel: true, x: 100, y: 100 },
+    bp_s1: { opcode: 'data_setvariableto', next: null, parent: 'bp_h1', inputs: { VALUE: [1, [10, '1']] }, fields: { VARIABLE: ['分数', 'score_id'] }, shadow: false, topLevel: false },
+    bp_h2: { opcode: 'data_deletealloflist', next: null, parent: null, inputs: {}, fields: { LIST: ['字模', ''] }, shadow: false, topLevel: true, x: 100, y: 300 }
+  }
+  r = await rpc('add_blocks', { target: 'Sprite1', blocks: bpTpl })
+  t('AI 手写的空变量 id 会被就地补建（旧行为是留一块「变量未找到」）',
+    r.ok === true && r.result.refs && (r.result.refs.created || []).some(c => c.name === '字模'),
+    JSON.stringify(r.result.refs))
+  const ziMo = varByName(spriteT, '字模')
+  t('补建的列表挂在当前角色上、值是空列表（不是挂在舞台或没建）',
+    !!ziMo && ziMo.type === 'list' && Array.isArray(ziMo.value) && ziMo.value.length === 0,
+    ziMo ? ziMo.type + '/' + JSON.stringify(ziMo.value) : 'null')
+  t('refsHint 用人话说明补建了什么（AI 不用去翻 refs 结构）',
+    /补建了 1 个变量\/列表/.test(String(r.result.refsHint)), String(r.result.refsHint))
+  const bpRoot1 = r.result.idMap.bp_h1
+  const bpRoot2 = r.result.idMap.bp_h2
+
+  // ---- export_blocks ----
+  r = await rpc('export_blocks', { target: 'Sprite1', scriptIds: [bpRoot1, bpRoot2] })
+  t('export_blocks ok', r.ok === true, r.error)
+  t('导出的是 sb3 形态（输入压缩成数组，不是活块对象）',
+    Array.isArray(savedSb3Blocks(r.result.blocks, bpRoot1).inputs.VALUE),
+    JSON.stringify(savedSb3Blocks(r.result.blocks, bpRoot1)))
+  t('块数只算子树的 3 块（内联字面量不算独立块）', r.result.blockCount === 3, String(r.result.blockCount))
+  t('报出有几条脚本、各自什么帽子',
+    r.result.scripts === 2 && r.result.topLevelOpcodes.join(',') === 'event_whenflagclicked,data_deletealloflist',
+    JSON.stringify(r.result.topLevelOpcodes))
+  const reqVars = (r.result.requires.variables || []).find(v => v.name === '分数')
+  t('requires 带上引用的标量变量和它的当前值（跨项目搬的时候要用）',
+    !!reqVars && reqVars.value === 25, JSON.stringify(r.result.requires.variables))
+  const reqLists = (r.result.requires.lists || []).find(v => v.name === '字模')
+  t('requires 带上引用的列表（字模这类列表就是片段的命）', !!reqLists && Array.isArray(reqLists.value), JSON.stringify(r.result.requires.lists))
+  const savedBlocks = r.result.blocks
+  const savedRequires = [].concat(r.result.requires.variables || [], r.result.requires.lists || [], r.result.requires.broadcasts || [])
+
+  // ---- 往返：把导出的片段注进舞台 ----
+  r = await rpc('add_blocks', { target: 'Stage', blocks: savedBlocks, variables: savedRequires })
+  t('导出→注入往返成功（stage 也能吃下同一份 sb3 dict）', r.ok === true, r.error)
+  const stageZiMo = varByName(stageT, '字模')
+  t('目标上原来没有的列表被补建在 Stage 上', !!stageZiMo, String(!!stageZiMo))
+  const injectedDel = blocksById(stageT, [r.result.idMap[bpRoot2]])[0]
+  t('注入后 LIST 字段指向的是**目标里真实存在的**变量 id（不是原来那个悬空 id）',
+    !!injectedDel && injectedDel.fields.LIST.id === (stageZiMo && stageZiMo.id),
+    JSON.stringify(injectedDel && injectedDel.fields.LIST) + ' vs ' + (stageZiMo && stageZiMo.id))
+  const setBlk = Object.values(stageT.blocks._blocks).find(b => b.opcode === 'data_setvariableto' && b.fields.VARIABLE.id === 'score_id')
+  t('目标里已存在的全局变量保持原指向（没有被误改成新建的同名变量）', !!setBlk, 'score_id 指向丢失')
+  t('refs.kept 报了"有几个引用原样有效"', r.result.refs && r.result.refs.kept >= 1, JSON.stringify(r.result.refs))
+
+  // ---- 按名字改指向（id 失效但同名存在）----
+  // 用「本角色计数」：它只在 Sprite1 上有一份，名字无歧义
+  // （舞台上的「分数」在测试夹具里有两份同名变量，不适合做这条断言的靶子）
+  const remapTpl = {
+    bp_r1: { opcode: 'data_showvariable', next: null, parent: null, inputs: {}, fields: { VARIABLE: ['本角色计数', 'ghost-id-999'] }, shadow: false, topLevel: true, x: 500, y: 500 }
+  }
+  r = await rpc('add_blocks', { target: 'Sprite1', blocks: remapTpl })
+  t('id 失效但同名变量存在 → 自动改指向（不新建重复变量）',
+    r.ok === true && r.result.refs && (r.result.refs.remapped || []).some(x => x.name === '本角色计数' && x.to === 'local_id'),
+    JSON.stringify(r.result.refs))
+  const remappedBlk = blocksById(spriteT, [r.result.idMap.bp_r1])[0]
+  t('改指向落到块上（字段里就是 local_id）', !!remappedBlk && remappedBlk.fields.VARIABLE.id === 'local_id',
+    JSON.stringify(remappedBlk && remappedBlk.fields.VARIABLE))
+  t('改指向不会顺手新建变量（refs.created 为空）', !r.result.refs || !r.result.refs.created, JSON.stringify(r.result.refs))
+
+  // ---- 声明值：新建时用 variables 里的 value ----
+  const newListTpl = {
+    bp_n1: { opcode: 'data_deletealloflist', next: null, parent: null, inputs: {}, fields: { LIST: ['背包列表', ''] }, shadow: false, topLevel: true, x: 700, y: 100 }
+  }
+  r = await rpc('add_blocks', { target: 'Stage', blocks: newListTpl, variables: [{ name: '背包列表', type: 'list', value: ['甲', '乙'] }] })
+  const bpList = varByName(stageT, '背包列表')
+  t('新建列表时用上声明的值（背包带的字模内容真的进来了）',
+    r.ok === true && !!bpList && JSON.stringify(bpList.value) === JSON.stringify(['甲', '乙']),
+    bpList ? JSON.stringify(bpList.value) : 'null')
+
+  // ---- 列表封顶：巨型列表别把背包撑爆 ----
+  const bigListTpl = {
+    bp_b1: { opcode: 'data_showlist', next: null, parent: null, inputs: {}, fields: { LIST: ['地图.细胞类别', 'big_list_id'] }, shadow: false, topLevel: true, x: 900, y: 100 }
+  }
+  r = await rpc('add_blocks', { target: 'Sprite1', blocks: bigListTpl })
+  t('引用巨型列表的脚本注入成功', r.ok === true, r.error)
+  r = await rpc('export_blocks', { target: 'Sprite1', scriptIds: [r.result.idMap.bp_b1] })
+  const capped = (r.result.requires.lists || []).find(v => v.name === '地图.细胞类别')
+  t('导出时列表按 listLimit 截断，并如实标出原始长度（否则 5000 项又搬一遍）',
+    r.ok === true && !!capped && capped.truncated === true && capped.length === 5000 && capped.value.length === 1000,
+    JSON.stringify(capped && { len: capped.length, kept: capped.value.length, truncated: capped.truncated }))
+  r = await rpc('export_blocks', { target: 'Sprite1', all: true })
+  t('all:true 导出这个角色的全部脚本', r.ok === true && r.result.scripts >= 3, r.error + ' / scripts=' + (r.result && r.result.scripts))
+
+  // ---- 对拍：自己写的 live→sb3 转换器 vs 官方序列化器 ----
+  // 为什么不直接用官方序列化器：TurboWarp 桌面版的 vm.toJSON() 会把 block id 压缩成 a/b/c
+  // （真机踩到：手里的真 id 在输出里不存在）。所以转换器得自己写 —— 那就必须有个对拍，
+  // 否则"看着像 sb3、注回去错"这类问题只能靠真机撞。
+  // npm 版 scratch-vm 不压缩 id，于是这里可以**逐块深比**。
+  const official = (JSON.parse(vm.toJSON()).targets.find(x => x.name === 'Sprite1') || {}).blocks || {}
+  const mine = r.result.blocks
+  const diffs = []
+  const missingInMine = Object.keys(official).filter(id => !mine[id])
+  const extraInMine = Object.keys(mine).filter(id => !official[id])
+  if (missingInMine.length) diffs.push(`少了 ${missingInMine.length} 块: ${missingInMine.slice(0, 5)}`)
+  if (extraInMine.length) diffs.push(`多了 ${extraInMine.length} 块: ${extraInMine.slice(0, 5)}`)
+  const norm = (v) => JSON.stringify(v, (_k, val) => (val === undefined ? null : val))
+  const blockDiff = (a, b) => {
+    const ka = Object.keys(a).sort(), kb = Object.keys(b).sort()
+    if (ka.join(',') !== kb.join(',')) return `键不同 ${ka} vs ${kb}`
+    for (const k of ['opcode', 'next', 'parent', 'shadow', 'topLevel', 'x', 'y']) {
+      if (norm(a[k]) !== norm(b[k])) return `${k}: ${norm(a[k])} vs ${norm(b[k])}`
+    }
+    for (const k of ['fields', 'inputs', 'mutation']) {
+      if (norm(a[k]) !== norm(b[k])) return `${k}: ${norm(a[k])} vs ${norm(b[k])}`
+    }
+    return null
+  }
+  for (const id of Object.keys(official)) {
+    if (!mine[id]) continue
+    const d = blockDiff(official[id], mine[id])
+    if (d) diffs.push(`${id}(${official[id].opcode}): ${d}`)
+    if (diffs.length > 6) break
+  }
+  t('导出结果与官方序列化器逐块一致（输入压缩/内联字面量/字段 id/坐标都对得上）',
+    diffs.length === 0, diffs.slice(0, 4).join(' ｜ '))
+  r = await rpc('export_blocks', { target: 'Sprite1' })
+  t('既没 scriptIds 也没 all 时明确报错', r.ok === false && /scriptIds/.test(r.error), r.error)
+  r = await rpc('export_blocks', { target: 'Sprite1', scriptIds: ['nope'] })
+  t('id 全不存在时明确报错（不返回空片段）', r.ok === false && /都不在角色/.test(r.error), r.error)
+
   console.log(`\n===== ops 层单测: ${pass} pass / ${fail} fail =====`)
   process.exit(fail ? 1 : 0)
 }

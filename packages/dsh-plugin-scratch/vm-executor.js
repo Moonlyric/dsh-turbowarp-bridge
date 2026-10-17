@@ -614,6 +614,277 @@
     return { blocks: out, index, warnings }
   }
 
+  // ---------------- 背包用：子树导出 / 变量引用落地 ----------------
+  // 导出**不经过 vm.toJSON()**：TurboWarp 桌面版的 toJSON 会把 block id 压缩成 a/b/c
+  // （真机实测：我手里的真 id 在输出里根本不存在，报"一个都没找到"）。
+  // 所以自己把 live 块转成 sb3 dict —— 只用 sb3 的两条编码：
+  //   ① 内联字面量：[4,"10"] 这种（10 个 math/text/colour 类型）+ 变量/列表/广播带 id
+  //   ② 输入压缩：[1, 值] / [2, 块] / [3, 块, 默认值]
+  // 正确性由 lab/test-content-ops.js 的 v0.8.0 节对拍守着（跟**官方序列化器的输出**逐块比）。
+
+  const CODE_BY_PRIMITIVE_OPCODE = Object.fromEntries(
+    Object.entries(PRIMITIVE_BY_CODE).map(([code, [opcode]]) => [opcode, Number(code)])
+  )
+
+  /** live 影子块 → 内联字面量描述；不是那 10 种就返回 null（菜单影子要当普通块引用） */
+  function primitiveDesc(id, all) {
+    const s = all[id]
+    if (!s || !s.shadow) return null
+    const code = CODE_BY_PRIMITIVE_OPCODE[s.opcode]
+    if (code === undefined) return null
+    const fname = PRIMITIVE_BY_CODE[code][1]
+    const f = s.fields && s.fields[fname]
+    if (!f) return null
+    // 广播/变量/列表字面量必须带 id（[code, name, id]），否则注回去就丢了指向
+    return code >= 11 ? [code, f.value, f.id] : [code, f.value]
+  }
+
+  /** live input（{name, block, shadow}）→ sb3 输入描述数组 */
+  function inputToSb3(inp, all) {
+    if (!inp || typeof inp !== 'object') return null
+    const block = inp.block || null
+    const shadow = inp.shadow || null
+    if (block && shadow && block === shadow) {
+      const p = primitiveDesc(block, all)
+      return [1, p || block] // p 命中 = 字面量；否则是菜单影子块（looks_costume 这类），当块引用
+    }
+    if (block && shadow) {
+      const p = primitiveDesc(shadow, all)
+      return [3, block, p || shadow]
+    }
+    if (block) return [2, block]
+    if (shadow) {
+      const p = primitiveDesc(shadow, all)
+      return [1, p || shadow]
+    }
+    return null
+  }
+
+  function liveBlockToSb3(b, all) {
+    const o = {
+      opcode: b.opcode,
+      next: b.next || null,
+      parent: b.parent || null,
+      inputs: {},
+      fields: {},
+      shadow: !!b.shadow,
+      topLevel: !!b.topLevel
+    }
+    if (b.topLevel) {
+      o.x = Number.isFinite(b.x) ? b.x : 0
+      o.y = Number.isFinite(b.y) ? b.y : 0
+    }
+    if (b.mutation) o.mutation = JSON.parse(JSON.stringify(b.mutation))
+    for (const [name, f] of Object.entries(b.fields || {})) {
+      if (!f) continue
+      // 变量/列表/广播的 field 带 id（[值, id]），其余只有一个值
+      o.fields[name] = f.id ? [f.value, f.id] : [f.value]
+    }
+    for (const [name, inp] of Object.entries(b.inputs || {})) {
+      const d = inputToSb3(inp, all)
+      if (d) o.inputs[name] = d
+    }
+    return o
+  }
+
+  /**
+   * 把这个角色的若干脚本子树导成 sb3 dict（含 next 链、嵌套块、影子块、mutation）。
+   * @returns {{blocks: Object, warnings: string[]}}
+   */
+  function exportSubtreeLive(t, rootIds) {
+    const all = t.blocks._blocks
+    const out = {}
+    const warnings = []
+    const seen = new Set()
+    // 队列而不是栈：导出顺序跟着 roots 给（脚本清单第一条就是第一个根），人读着顺
+    const queue = []
+    for (const id of rootIds) {
+      if (!all[id]) { warnings.push(`块 ${id} 不在这角色里（已被删？或是克隆体里的块）`); continue }
+      queue.push(id)
+    }
+    let head = 0
+    while (head < queue.length) {
+      const id = queue[head++]
+      if (!id || seen.has(id)) continue
+      const b = all[id]
+      if (!b) continue
+      seen.add(id)
+      out[id] = liveBlockToSb3(b, all)
+      if (b.next) queue.push(b.next)
+      for (const inp of Object.values(b.inputs || {})) {
+        // 内联字面量（[4,"10"] 这种）会被压进父块的 input 里，**不能**再单独占一个 dict 位置
+        // —— 官方序列化器也是这么做的（compressInputTree 会把它们删掉）。
+        // 菜单影子（looks_costume / sound_sounds_menu 这类）不是 primitive，必须留着当块引用。
+        for (const id of [inp && inp.block, inp && inp.shadow]) {
+          if (id && !primitiveDesc(id, all)) queue.push(id)
+        }
+      }
+    }
+    return { blocks: out, warnings }
+  }
+
+  const REF_KIND_BY_CODE = { 11: 'broadcast', 12: 'variable', 13: 'list' }
+  const VAR_TYPE_BY_KIND = { variable: '', list: 'list', broadcast: 'broadcast_msg' }
+  const KIND_BY_VAR_TYPE = { '': 'variable', list: 'list', broadcast_msg: 'broadcast' }
+  const REFS_KEY = { variable: 'variables', list: 'lists', broadcast: 'broadcasts' }
+
+  /** 遍历块（含影子、含内联字面量），把每个变量/列表/广播引用交给 fn */
+  function eachRef(blocks, fn) {
+    const fieldKind = (fname) => fname === 'VARIABLE' ? 'variable' : fname === 'LIST' ? 'list' : fname === 'BROADCAST_OPTION' ? 'broadcast' : null
+    for (const b of Object.values(blocks || {})) {
+      if (Array.isArray(b)) {
+        const kind = REF_KIND_BY_CODE[b[0]]
+        if (kind) fn(kind, b, 1, 2) // [code, name, id]
+        continue
+      }
+      if (!b || typeof b !== 'object') continue
+      for (const [fname, v] of Object.entries(b.fields || {})) {
+        const kind = fieldKind(fname)
+        if (kind && Array.isArray(v)) fn(kind, v, 0, 1) // [name, id]
+      }
+      for (const desc of Object.values(b.inputs || {})) {
+        if (!Array.isArray(desc)) continue
+        for (let i = 1; i < desc.length; i++) {
+          const v = desc[i]
+          if (Array.isArray(v) && REF_KIND_BY_CODE[v[0]]) fn(REF_KIND_BY_CODE[v[0]], v, 1, 2)
+        }
+      }
+    }
+  }
+
+  /** 子树引用了哪些变量/列表/广播，各自的值是多少（背包要带着值走，字模列表就是命） */
+  function collectRefs(blocks, t, stage, opts) {
+    const out = { variables: [], lists: [], broadcasts: [] }
+    const listCap = Math.max(0, Number(opts && opts.listLimit) || 1000)
+    const seen = new Set()
+    // 在**活变量**里查（不再读 sb3）：id 命中就用它，否则按名字 + 类型找
+    const lookup = (kind, name, id) => {
+      for (const owner of [t, stage]) {
+        if (!owner) continue
+        const vars = owner.variables || {}
+        if (id && vars[id] && (KIND_BY_VAR_TYPE[vars[id].type] || 'variable') === kind) return vars[id]
+        for (const v of Object.values(vars)) {
+          if (!v || v.name !== name) continue
+          if ((KIND_BY_VAR_TYPE[v.type] || 'variable') === kind) return v
+        }
+      }
+      return null
+    }
+    eachRef(blocks, (kind, arr, nameIdx, idIdx) => {
+      const name = arr[nameIdx]
+      if (!name) return
+      const key = kind + '|' + name
+      if (seen.has(key)) return
+      seen.add(key)
+      const found = lookup(kind, name, arr[idIdx])
+      const item = { name }
+      if (kind === 'broadcast') {
+        // 广播只有名字，没有值
+      } else if (kind === 'list') {
+        const full = Array.isArray(found && found.value) ? found.value : []
+        // 列表封顶：字模这类列表只有几十项，但脚本也可能引用 5000 项的巨型列表 ——
+        // 整份搬进背包就是把 7MB 又搬一次。超了截断 + 明确标出来。
+        if (full.length > listCap) {
+          item.value = full.slice(0, listCap)
+          item.truncated = true
+          item.length = full.length
+        } else {
+          item.value = full
+        }
+      } else {
+        item.value = found && found.value !== undefined ? found.value : ''
+      }
+      out[REFS_KEY[kind]].push(item)
+    })
+    return out
+  }
+
+  /**
+   * 把块里的变量引用「落地」到目标角色：
+   *   ① id 在目标/舞台里有效 → 不动
+   *   ② id 无效但同名的存在 → 改指向那个 id（跨角色/跨项目搬脚本时最常见）
+   *   ③ 都没有 → 就地新建（标量 ''、列表 []；带 value 的用 value）
+   * 为什么必须做：官方 GUI 对不存在的变量 id 显示「变量未找到」，积木跑起来是空值 ——
+   * 这是 AI 手写 blocks、或把背包里的片段注进别的角色时**必然**踩的坑。
+   * @returns {{created: Array, remapped: Array, kept: number}}
+   */
+  function resolveRefs(vm, t, blocks, declared) {
+    const stage = vm.runtime.getTargetForStage()
+    const created = []
+    const remapped = []
+    let kept = 0
+    const cache = new Map() // kind|name -> id（同一次注入里别重复建）
+
+    const owners = () => [t, stage].filter(Boolean)
+    const byId = (kind, id) => {
+      if (!id) return null
+      for (const owner of owners()) {
+        const v = owner.variables && owner.variables[id]
+        if (v && (KIND_BY_VAR_TYPE[v.type] || 'variable') === kind) return { owner, id, v }
+      }
+      return null
+    }
+    const byName = (kind, name) => {
+      for (const owner of owners()) {
+        for (const [id, v] of Object.entries(owner.variables || {})) {
+          if (v && v.name === name && (KIND_BY_VAR_TYPE[v.type] || 'variable') === kind) return { owner, id, v }
+        }
+      }
+      return null
+    }
+    const declaredValue = (kind, name) => {
+      if (!Array.isArray(declared)) return undefined
+      for (const d of declared) {
+        if (!d || typeof d !== 'object') continue
+        if (d.name !== name) continue
+        const dk = d.type === 'list' ? 'list' : d.type === 'broadcast' ? 'broadcast' : 'variable'
+        if (dk === kind) return d.value
+      }
+      return undefined
+    }
+    const create = (kind, name) => {
+      // 广播挂在舞台上（收报积木按 id 查舞台），标量/列表挂在当前目标上（跟原角色一致）
+      const owner = kind === 'broadcast' ? stage : t
+      if (!owner) return null
+      const id = `dshv-${Math.random().toString(36).slice(2, 10)}`
+      try {
+        owner.createVariable(id, name, VAR_TYPE_BY_KIND[kind])
+      } catch (e) {
+        return null
+      }
+      const v = owner.variables && owner.variables[id]
+      if (!v) return null
+      const val = declaredValue(kind, name)
+      if (kind === 'variable') v.value = val === undefined ? '' : val
+      else if (kind === 'list') v.value = Array.isArray(val) ? val.slice() : []
+      created.push({ kind, name, id, on: kind === 'broadcast' ? 'stage' : (owner.isStage ? 'stage' : 'target'), valueProvided: val !== undefined })
+      return { owner, id, v }
+    }
+    const resolveOne = (kind, name, id) => {
+      if (!name) return null
+      const hit = byId(kind, id)
+      if (hit) { kept++; return null } // ① 不动
+      const key = kind + '|' + name
+      if (cache.has(key)) return cache.get(key)
+      const same = byName(kind, name)
+      if (same) {
+        remapped.push({ kind, name, from: id || '(空)', to: same.id })
+        cache.set(key, same.id)
+        return same.id
+      }
+      const made = create(kind, name)
+      if (!made) return null
+      cache.set(key, made.id)
+      return made.id
+    }
+
+    eachRef(blocks, (kind, arr, nameIdx, idIdx) => {
+      const nid = resolveOne(kind, arr[nameIdx], arr[idIdx])
+      if (nid && nid !== arr[idIdx]) arr[idIdx] = nid
+    })
+    return { created, remapped, kept }
+  }
+
   async function ops(op, args) {
     const vm = getVM()
     switch (op) {
@@ -729,6 +1000,8 @@
         const input = args.blocks
         if (!input || typeof input !== 'object') throw new Error('blocks 必填（sb3 blocks dict）')
         if (Array.isArray(input)) throw new Error('blocks 要传 sb3 dict（{id: 块对象}），不是数组')
+        // 变量引用先落地（AI 手写的空 id、背包跨角色搬来的旧 id，都在这儿被接上或补建）
+        const refs = resolveRefs(vm, t, input, args.variables)
         const { blocks: liveBlocks, index, warnings } = toLiveBlocks(input)
         if (!liveBlocks.length) throw new Error('blocks 里没有可注入的块')
 
@@ -762,10 +1035,59 @@
           expandedBlocks: liveBlocks.length,
           idMap,
           idMapReliable,
+          // 变量引用发生了什么（只在真动过时才出现，免得把小输出撑大）
+          refs: (refs.created.length || refs.remapped.length)
+            ? { created: refs.created.length ? refs.created : undefined, remapped: refs.remapped.length ? refs.remapped : undefined, kept: refs.kept }
+            : undefined,
+          refsHint: refs.created.length
+            ? `补建了 ${refs.created.length} 个变量/列表（内容已在 requires 里带上）：${refs.created.map(c => c.name).join('、')}`
+            : (refs.remapped.length ? `有 ${refs.remapped.length} 个变量引用按名字改指向了目标角色里已有的同名变量` : undefined),
           warnings: warnings.length ? warnings : undefined,
           hint: idMapReliable
             ? '后续引用新块请用 idMap 里的新 ID（shareBlocksToTarget 会全部换新 ID）'
             : 'idMap 不可靠（opcode 校验没过），请用 scratch_read_script 重新读一次拿真实 ID'
+        }
+      }
+      case 'export_blocks': {
+        // 背包的「存」这一半：把指定脚本（子树）导出成 sb3 dict，连同它引用的变量/列表的值。
+        // 这样存下来的片段是**自包含**的：搬家/换项目也能注回去（变量引用由 resolveRefs 接上或补建）。
+        const t = findTarget(vm, args && args.target)
+        const roots = []
+        if (Array.isArray(args.scriptIds)) roots.push(...args.scriptIds)
+        if (Array.isArray(args.blockIds)) roots.push(...args.blockIds)
+        const given = roots.filter(x => typeof x === 'string' && x)
+        const rootIds = given.length ? given : (args.all === true ? topLevelIds(t.blocks._blocks) : [])
+        if (!rootIds.length) throw new Error('要给 scriptIds（顶层块 id）/ blockIds；整份导出传 all: true')
+        if (!t.isOriginal) throw new Error('这是克隆体，导不了（克隆体没有自己的积木定义）；请对原始角色操作')
+        const { blocks, warnings } = exportSubtreeLive(t, rootIds)
+        if (!Object.keys(blocks).length) {
+          throw new Error(`这些 id 都不在角色「${t.getName()}」里（先 scratch_list_scripts 拿真实脚本 id）。`
+            + `要的 id=${JSON.stringify(rootIds.slice(0, 5))}；这个角色一共 ${Object.keys(t.blocks._blocks).length} 块`)
+        }
+        const requires = collectRefs(blocks, t, vm.runtime.getTargetForStage(), { listLimit: args.listLimit })
+        // 自定义积木：调了 proccode 但片段里没有它的 definition —— 注进去就是空转（GUI 也不报错），
+        // 必须在存的时候就说清楚"得把定义那条一起存"
+        const defined = new Set()
+        const called = new Set()
+        for (const b of Object.values(blocks)) {
+          if (Array.isArray(b) || !b.mutation || !b.mutation.proccode) continue
+          if (b.opcode === 'procedures_definition') defined.add(b.mutation.proccode)
+          else if (b.opcode === 'procedures_call') called.add(b.mutation.proccode)
+        }
+        for (const pc of called) {
+          if (!defined.has(pc)) warnings.push(`调用了自定义积木「${pc}」但片段里没有它的定义（procedures_definition）—— 注进去会是空转，把定义那条脚本一起存`)
+        }
+        const hats = Object.values(blocks).filter(b => !Array.isArray(b) && b.topLevel).map(b => b.opcode)
+        return {
+          target: t.getName(),
+          project: docTitle(),
+          roots: rootIds,
+          blocks,
+          blockCount: Object.keys(blocks).length,
+          scripts: hats.length,
+          topLevelOpcodes: hats,
+          requires,
+          warnings: warnings.length ? warnings : undefined
         }
       }
       case 'locate': {

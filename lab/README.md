@@ -17,7 +17,7 @@ npm install          # scratch-vm + scratch-storage，约 140MB
 
 ```sh
 # 替身 VM 层（秒级）
-node test-content-ops.js     # 主套件：97 条断言（读/写/改/删/整理/定位/白名单/观察者/用户事件/降级分支）
+node test-content-ops.js     # 主套件：187 条断言（读/写/改/删/整理/定位/白名单/观察者/运行控制/回传瘦身/背包导出与对拍）
 node test-vm-pipeline.js     # scratch-vm 管线冒烟：只打日志，没有断言（退出码恒为 0）
 
 # 真机层（分钟级，需要浏览器 + 网络）
@@ -29,8 +29,9 @@ node real-machine-check.mjs
 ```sh
 cd ../packages/dsh-plugin-scratch
 npm install
-node test-skills.mjs         # 23 条断言
-node test-tools.mjs          # 23 条断言（唤起编辑器 / token 配置包 / 地址白名单）
+node test-skills.mjs         # 23 条断言（skill 区）
+node test-tools.mjs          # 103 条断言（唤起编辑器 / 打包契约 / 运行控制 / 背包契约）
+node test-backpack.mjs       # 36 条断言（背包：假页面连真桥，存→读→注入→删）
 node test-bridge-auth.mjs    # 21 条断言（握手认证 + 跨会话伪造防护）
 ```
 

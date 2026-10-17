@@ -170,7 +170,7 @@ try {
   // ⚠️ Windows 上 import() 绝对路径必须转成 file:// URL，否则 "G:\..." 会被当成 g: 协议
   const mod = await import(pathToFileURL(join(ROOT, 'packages', 'dsh-plugin-scratch', 'index.js')).href)
   mod.apply(fakeCtx, { safety: 'preview', bridgePort: 31841, maxSnapshots: 3, skillsEnabled: false })
-  t('插件 apply 未抛错，注册了 28 个工具', registered.size === 28, '实际 ' + registered.size)
+  t('插件 apply 未抛错，注册了 30 个工具', registered.size === 30, '实际 ' + registered.size)
   const call = async (name, args) => {
     const tool = registered.get(name)
     if (!tool) throw new Error('没有工具 ' + name)
@@ -349,6 +349,69 @@ try {
   t('scratch_selftest 全绿（桥/会话/注入/项目/Blockly/窗口都在位）', self.ok === true, J(self.checks, 400))
   const winCheck = (self.checks || []).find(c => c.check === '窗口可见')
   t('selftest 的窗口项独立确认可见（真机上用户看得到）', !!(winCheck && winCheck.ok === true), J(winCheck, 200))
+
+  step('6.6 v0.8.0：背包（存 → 换角色取出来 → 独立通道核对）')
+  // 背包的价值只有"取出来还能用"这一条。所以这里不读工具的返回值当证据：
+  //   ① 存：写进 $DSH_HOME/scratch-backpack（那份文件是真的 JSON，能独立解析）
+  //   ② 取：注进**另一个角色**（Stage），然后用独立 CDP 通道读 Stage 的块
+  const hatId = applied.idMap && applied.idMap.hat
+  const bpSaved = await call('scratch_backpack', {
+    action: 'save', name: 'desk-check', target: workTarget, scriptIds: [hatId],
+    title: '桌面版验收片段', description: '验收用，跑完就删', tags: ['check'],
+    notes: '这段是 desktop-cdp-check 存的'
+  })
+  const bpFile = join(HOME, 'scratch-backpack', 'desk-check.json')
+  t('save 落盘到 $DSH_HOME/scratch-backpack（路径就在返回值里）',
+    bpSaved.saved === 'desk-check' && existsSync(bpFile), J(bpSaved, 240))
+  const bpJson = JSON.parse(readFileSync(bpFile, 'utf8'))
+  const bpRealBlocks = Object.values(bpJson.blocks || {}).length
+  t('存下来的 blocks 是真积木（3 块：旗帽 + 移动 + 说）', bpRealBlocks === 3, String(bpRealBlocks))
+  t('元数据跟着存（title/notes/source.target）',
+    bpJson.title === '桌面版验收片段' && /desktop-cdp-check/.test(bpJson.notes) && bpJson.source.target === workTarget,
+    J(bpJson.source, 160))
+  const bpList = await call('scratch_backpack', { action: 'list' })
+  t('list 扫得到它，并给出块数/标签', (bpList.items || []).some(x => x.name === 'desk-check' && x.blocks === 3 && x.tags.includes('check')),
+    J(bpList.items, 260))
+  t('INDEX.md 也生成了（AI 能廉价扫目录）', existsSync(join(HOME, 'scratch-backpack', 'INDEX.md')))
+
+  const beforeStage = await raw.evalJson(`(() => {
+    const s = window.vm.runtime.targets.find(x => x.isStage)
+    return Object.keys(s.blocks._blocks).length
+  })()`)
+  const bpLoadPreview = await call('scratch_backpack_load', { name: 'desk-check', target: 'Stage', x: 40, y: 40 })
+  t('preview 档下 load 只给计划（项目还没动）',
+    bpLoadPreview.mode === 'preview' && !!bpLoadPreview.planId, J(bpLoadPreview, 240))
+  t('计划里说清"注的是哪条、会补什么变量"',
+    bpLoadPreview.preview && bpLoadPreview.preview.snippet === 'desk-check' &&
+    Array.isArray(bpLoadPreview.preview.creates), J(bpLoadPreview.preview, 200))
+  const bpApplied = await call('scratch_apply', { planId: bpLoadPreview.planId })
+  // added 数的是**新建块的总数**（含内联字面量展开出来的影子块），所以 3 个非影子块 = 5 个块
+  t('apply 之后真的注进去了（3 块脚本 + 2 个字面量影子）',
+    bpApplied.changed && bpApplied.changed.added === 5, J(bpApplied, 240))
+  const stageBlocks = await raw.evalJson(`(() => {
+    const s = window.vm.runtime.targets.find(x => x.isStage)
+    const all = s.blocks._blocks
+    const say = Object.values(all).find(b => b.opcode === 'looks_say' && !b.shadow)
+    const move = Object.values(all).find(b => b.opcode === 'motion_movesteps' && !b.shadow)
+    const sayShadow = say && all[say.inputs.MESSAGE.block]
+    const hats = Object.values(all).filter(b => b.topLevel && !b.shadow)
+    return {
+      total: Object.keys(all).length,
+      msg: sayShadow && sayShadow.fields.TEXT.value,
+      steps: move && all[move.inputs.STEPS.block] && all[move.inputs.STEPS.block].fields.NUM.value,
+      hats: hats.map(b => ({ op: b.opcode, x: b.x, y: b.y }))
+    }
+  })()`)
+  t('独立通道读到的块数增量 == 工具自报的 added（两边对得上）',
+    stageBlocks.total === beforeStage + bpApplied.changed.added, `${beforeStage} → ${stageBlocks.total}（自报 +${bpApplied.changed.added}）`)
+  t('取出来的片段值没丢（消息文本 + 移动步数原样）',
+    stageBlocks.msg === '桌面版CDP验收' && String(stageBlocks.steps) === '50', J(stageBlocks, 200))
+  t('落点是给的那个坐标（不是沿用存的时候的）',
+    stageBlocks.hats.length === 1 && stageBlocks.hats[0].x === 40 && stageBlocks.hats[0].y === 40,
+    J(stageBlocks.hats, 160))
+  const bpDel = await call('scratch_backpack', { action: 'delete', name: 'desk-check' })
+  t('delete 把它挪进 _trash（没真删）', !existsSync(bpFile) && /_trash/.test(bpDel.movedTo || ''), J(bpDel, 200))
+  t('删完 list 里没了', (await call('scratch_backpack', { action: 'list' })).count === 0)
 
   step('7. 存档 → 从磁盘装回来（真走一遍文件往返）')
   const outSb3 = join(OUT, 'desktop-roundtrip.sb3')

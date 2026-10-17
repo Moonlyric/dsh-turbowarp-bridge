@@ -46,15 +46,15 @@ AI 侧的入口是 `scratch_open_editor`：用户说「打开 TurboWarp」时，
 | **M0** | 核心管线：读（snapshot/read_script）+ 写（add_blocks）+ 回滚 + SVG 造型 + 定位 | ✅ |
 | **M1** | 全编辑能力：update_block + delete_blocks（级联）+ tidy_blocks + opcode 白名单 + 快照持久化 | ✅ |
 | **M2** | 观察者 + 双向联动：watch（变量订阅/轮询）+ user_context（选块/绿旗感知） | ✅ |
-| **Skill 区** | Scratch 实践经验库（9 篇）+ scratch_skills / scratch_skill_edit + 三层开关 | ✅ 23/23 |
+| **Skill 区** | Scratch 实践经验库（10 篇）+ scratch_skills / scratch_skill_edit + 三层开关 | ✅ 23/23 |
 | **审计 + 修** | 全项目审查：修掉「核心注入在真机上根本不工作」等 7 个真 bug，补断言防回归 | ✅ 2026-10-16 |
 | **LNA 改造** | socket 从页面搬进扩展 service worker + 心跳保活 + `lab` 加 LNA/保活断言 | ✅ 2026-10-17（这次绿才算数） |
-| **M0.5 真机** | 真 Chrome/Edge + 真 turbowarp.org 全链路自动验收（28 工具 + 存/读 sb3） | ✅ **115/115**（2026-10-17 关 VPN 实测，Chrome 与 Edge 各一遍；旧的 98/98 是假绿） |
-| **CDP 直连** | TurboWarp Desktop 零安装路径：带调试端口启动 + 注默认上下文 + 接管用户自己开的窗口 | ✅ 2026-10-17（v0.7.0 后 83/83，见下） |
+| **M0.5 真机** | 真 Chrome/Edge + 真 turbowarp.org 全链路自动验收（30 工具 + 存/读 sb3） | ✅ **115/115**（2026-10-17 关 VPN 实测，Chrome 与 Edge 各一遍；旧的 98/98 是假绿） |
+| **CDP 直连** | TurboWarp Desktop 零安装路径：带调试端口启动 + 注默认上下文 + 接管用户自己开的窗口 | ✅ 2026-10-17（v0.8.0 后 96/96，见下） |
 | **主动唤起** | `scratch_open_editor`：AI 自己开浏览器/桌面版并等会话连上；新增 `path` 装作品 | ✅ 2026-10-16 / 扩展于 2026-10-17 |
 | **文件往返** | `scratch_load_project` / `scratch_save_project`（打开本机 .sb3、存回磁盘、默认不覆盖） | ✅ |
 | **M3** | 断链/接链（moveBlock 的 parent 系）、变量/列表增删、造型删除改名、Firefox 支持（userscript 方向） | 未开始 |
-| **背包** | **AI 自维护的代码块背包**：把做好的可复用积木（pen 文字引擎、弹幕骨架、ECS 骨架…）预存下来，下次直接取用 | 未开始（见下） |
+| **背包** | **AI 自维护的代码块背包**：把做好的可复用积木（pen 文字引擎、弹幕骨架、ECS 骨架…）预存下来，下次直接取用 | ✅ v0.8.0（36+14 条断言，见下） |
 | **M4** | 多标签页路由（SW 已按 tab 记账，还差 UI）、快照 diff 预览 UI、性能（大项目分页读） | 部分（路由已做） |
 | **M5** | 发布：npm 组合包 + `dsh plugin add`（版本锁定） | 未开始 |
 
@@ -183,25 +183,26 @@ hint 里说明"没动他的窗口"。
 8. **`vm.workspace` 从来不存在**（GUI 把 workspace 存在 React 实例上），
    取用路径统一走 `window.ScratchBlocks` / `window.Blockly`。
 
-## 测试资产（2026-10-17 本轮复跑，可回归）
+## 测试资产（2026-10-18 本轮复跑，可回归）
 
 | 套件 | 覆盖 | 结果 |
 |---|---|---|
-| `lab/test-content-ops.js` | 扩展执行器全协议（真实 `content-main.js` 进 Node vm 沙箱 + 真 headless scratch-vm）+ v0.7.0 瘦身体积断言 | 163/163 ✅ |
-| `lab/real-machine-check.mjs` | **真 Chrome/Edge + 真 turbowarp.org 全链路**（装扩展 → token 握手 → 28 工具 + 存/读 sb3 + 45s 保活） | **115/115** ✅（Chrome、Edge 各一遍；不传 `SB3_FIXTURE`，传了真实 sb3 会更多） |
-| `lab/desktop-cdp-check.mjs` | **TurboWarp Desktop + CDP 直连**端到端（独立 CDP 连接读真 VM + 存盘往返 + 接管用户实例 + 关掉后会话自动掉线 + v0.7.0 运行控制） | 83/83 ✅ |
+| `lab/test-content-ops.js` | 扩展执行器全协议（真实 `content-main.js` 进 Node vm 沙箱 + 真 headless scratch-vm）+ v0.7.0 瘦身体积断言 + v0.8.0 背包（导出/注入/变量落地/**与官方序列化器逐块对拍**） | 187/187 ✅ |
+| `lab/real-machine-check.mjs` | **真 Chrome/Edge + 真 turbowarp.org 全链路**（装扩展 → token 握手 → 30 工具 + 存/读 sb3 + 45s 保活） | **115/115** ✅（Chrome、Edge 各一遍；不传 `SB3_FIXTURE`，传了真实 sb3 会更多） |
+| `lab/desktop-cdp-check.mjs` | **TurboWarp Desktop + CDP 直连**端到端（独立 CDP 连接读真 VM + 存盘往返 + 接管用户实例 + 关掉后会话自动掉线 + v0.7.0 运行控制 + v0.8.0 背包往返） | 96/96 ✅ |
 | `lab/sync-executor.mjs` | 把扩展 `content-main.js` 同步成插件包的 `vm-executor.js`（`--check` 只检查） | 工具 ✅ |
 | `lab/test-vm-pipeline.js` | scratch-vm 管线冒烟（无断言，打印型） | 跑通 ✅ |
 | `lab/inspect-sb3.mjs` | 离线读 sb3/project.json：同时报**真块数**和**含影子块数**（引用块数必须写清数法） | 工具 ✅ |
 | `packages/dsh-plugin-scratch/test-skills.mjs` | skill 区 | 23/23 ✅ |
-| `packages/dsh-plugin-scratch/test-tools.mjs` | 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 / CDP 启动参数与诚实报错 / `tagForPage` / 执行器副本一致性 / 打包契约 / v0.7.0 新工具契约） | 92/92 ✅ |
+| `packages/dsh-plugin-scratch/test-tools.mjs` | 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 / CDP 启动参数与诚实报错 / `tagForPage` / 执行器副本一致性 / 打包契约 / v0.7.0 新工具契约 / v0.8.0 背包契约） | 103/103 ✅ |
+| `packages/dsh-plugin-scratch/test-backpack.mjs` | **背包集成**（假页面连真桥：存 → 落盘 → list/read → 注入（x/y 平移、变量声明、variableValues）→ preview 不落盘 → 删除进 `_trash` → 名字穿越防护） | 36/36 ✅ |
 | `packages/dsh-plugin-scratch/test-bridge-auth.mjs` | 握手认证 + 跨会话伪造防护 + ping/pong 保活 | 21/21 ✅ |
 
 ```sh
 cd lab && npm install && node test-content-ops.js && node real-machine-check.mjs
 node desktop-cdp-check.mjs          # 桌面版那条：会真开一个窗口，跑完自动关
 cd ../packages/dsh-plugin-scratch && npm install
-node test-skills.mjs && node test-tools.mjs && node test-bridge-auth.mjs
+node test-skills.mjs && node test-tools.mjs && node test-backpack.mjs && node test-bridge-auth.mjs
 cd ..\.. && node lab/sync-executor.mjs   # 改过扩展执行器就要跑，否则 test-tools 会红
 ```
 
@@ -212,23 +213,31 @@ cd ..\.. && node lab/sync-executor.mjs   # 改过扩展执行器就要跑，否�
 CDP 那条路也有它自己的盲区：`desktop-cdp-check.mjs` 只在装了 TurboWarp Desktop 的 Windows 上能跑，
 而且检测到用户已经开着 TurboWarp 时会 SKIP（宁可没结论，也不打扰用户）。
 
-## 背包（用户提的，排队中）
+## 背包：AI 自己维护的可复用积木库（v0.8.0 已做）
 
 > 用户原话：「文字引擎这种完全可以直接预存到 ai 代码块背包里，后面可以加个类似这种背包的东西让 ai 自己维护」
 
 一句话：**skill 存经验，背包存做好的积木**。
 
-- **放什么**：可复用的整块积木（pen 文字引擎 `画字`/`找字`/`画文本` + 字模列表、弹幕骨架、
-  ECS 骨架、存档读写、UI 按钮骨架…），带参数说明和"怎么用"。
-- **放哪**：`$DSH_HOME/scratch-backpack/`，一条一个 JSON + 一份 `INDEX.md`（照抄 skill 区的做法，
-  让 AI 能廉价扫目录、按需取用，而不是一次性全灌进上下文）。
-- **谁来维护**：AI 自己。做完一件有难度的事 → 问用户"要不要存进背包" → 存；下次直接取。
-  **不做自动收集**（自动存会攒一堆垃圾，用户就再也不看了）。
-- **怎么用**：取出来就是 `scratch_add_blocks` 的入参形态（活块/sb3 形态二选一，工具自己转），
-  AI 只需替换参数（坐标、字模列表、颜色）。
-- **验收标准**：每个存进去的片段必须能"取出来 → 注入 → 通过积木结构体检 + 真机 GUI 显示正常"，
-  这条由 `lab` 里的往返测试守住（存进去的东西不能用 = 背包没用）。
-- 和 skill 区的关系：skill 讲"怎么做"，背包给"现成的东西"。两者共用同一套开关/索引习惯。
+| 面 | 做成了什么 |
+|---|---|
+| 存什么 | 整块积木（pen 文字引擎、弹幕骨架、ECS 骨架、存档读写、UI 按钮骨架…），**连同它引用的变量/列表的值**（字模表跟着走） |
+| 存哪 | `$DSH_HOME/scratch-backpack/<名字>.json`，一条一个；`INDEX.md` 照抄 skill 区，让 AI 廉价扫目录 |
+| 谁维护 | AI 自己。做完一件有难度的事 → **问用户**「要不要存进背包」→ 存；**不做自动收集**（自动攒会变垃圾堆） |
+| 怎么用 | `scratch_backpack_load({ name })` 就是 `add_blocks` 的入参形态；坐标整体平移、变量按名字接上或补建 |
+| 两个工具 | `scratch_backpack`（list/read/save/delete）+ `scratch_backpack_load`（注入，受 `safety` 档位管） |
+| 删除 | 不真删，挪进 `_trash/`（存进去的东西可能是几小时的活） |
+| 验收 | 替身层 187/187（含**与官方序列化器逐块对拍**）、桌面真机 96/96（存→换角色取→独立 CDP 读块） |
+
+### 这一轮踩到的两个真坑（都写进断言了）
+
+1. **`vm.toJSON()` 在 TurboWarp 桌面版会把 block id 压缩成 `a`/`b`/`c`**。
+   第一版导出走的是官方序列化器，真机上直接报"这些 id 一个都没找到"（诊断信息把两边 id 都打出来了才对上）。
+   现在导出是**自己写的 live→sb3 转换**（不再整份序列化，大项目也快），
+   正确性由「与官方序列化器逐块深比」守着 —— npm 版的 vm 不压缩 id，所以能真比。
+2. **AI 手写的 blocks 里变量 id 是空的**（`["分数", ""]`），旧行为是留一块「变量未找到」。
+   现在 `add_blocks` 会**落地变量引用**：有效 id 不动 / 同名换指向 / 都没有就补建（值可声明）。
+   这条不只服务背包 —— 手写积木、跨角色搬脚本都吃这个修复。
 
 ## v0.7.0：把「问题记录」清账（2026-10-18）
 
@@ -349,7 +358,7 @@ CDP 那条路也有它自己的盲区：`desktop-cdp-check.mjs` 只在装了 Tur
 
 ## 给接手 AI 的提示
 
-- 你的 28 个工具：`scratch_open_editor`（主动开编辑器，浏览器/桌面版两条路；`port` 接管任意调试端口，
+- 你的 30 个工具：`scratch_open_editor`（主动开编辑器，浏览器/桌面版两条路；`port` 接管任意调试端口，
   `show:false` 只接管不弹窗）/ `list_sessions` / `selftest`（排障第一步）/
   `snapshot` / `read_script`（`summary` 先看结构，`scriptId`/`opcodes` 再读块体） / `list_scripts` /
   `add_blocks` / `apply` / `locate` / `add_costume` / `rollback` /
@@ -370,7 +379,7 @@ CDP 那条路也有它自己的盲区：`desktop-cdp-check.mjs` 只在装了 Tur
   `force` 会**关掉现有窗口、未保存的改动会丢**——先说清楚再动
 - **发现没有会话**：调 `scratch_list_sessions`，它会把 token 和三步配置指引一起返回，念给用户
   （或者干脆改用 `app:'desktop'`，不需要 token）
-- **第一次在这个项目上干活：先 `scratch_skills read INDEX.md`**（9 篇经验按需选读，不强制）
+- **第一次在这个项目上干活：先 `scratch_skills read INDEX.md`**（10 篇经验按需选读，不强制）
 - 生成积木前先 `scratch_get_opcodes` 查白名单，别编造 opcode
 - 用户的块 ID 在 `scratch_snapshot` / `scratch_read_script` 的输出里；你自己注入的块用
   `add_blocks` 返回的**新 ID**

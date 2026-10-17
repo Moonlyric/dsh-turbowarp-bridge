@@ -28,8 +28,8 @@ const t = (name, cond, detail) => {
   else { fail++; console.log('  FAIL ' + name + (detail ? ' | ' + detail : '')) }
 }
 const sleep = (ms) => new Promise(r => setTimeout(r, ms))
-// v0.7.0 加了 9 个运行控制/可观测工具（19 → 28），数量集中在这里维护
-const TOOL_COUNT = 28
+// v0.7.0 加了 9 个运行控制/可观测工具（19 → 28），v0.8.0 加了 2 个背包工具（→ 30）
+const TOOL_COUNT = 30
 
 // ---- 桩：把收到的参数追加到一个文件里，冒充「被打开的程序」 ----
 const browserStub = join(STUB_DIR, 'stub-browser.cmd')
@@ -477,6 +477,39 @@ t('locate 会跨角色搜索并在错误里列出找过谁',
   executorSrc.includes('个角色/舞台里都没有'))
 t('窗口探针额外报 active + screen 工作区（判断"被别的窗口盖住/跑到屏幕外"）',
   psProbe.includes('"active"') && psProbe.includes('"screen"') && psProbe.includes('GetForegroundWindow'))
+
+// ==================== 12. v0.8.0：背包 ====================
+// 背包的存在意义是「AI 自己攒可复用的整块积木」（用户提的需求）。这里守的是**契约**：
+//   · 存 = 从项目导出（走执行器 export_blocks，不是让 AI 手动抄 JSON）
+//   · 取 = 注入 + 变量/列表按名字接上或补建（否则搬过去全是「变量未找到」）
+//   · 存/删不动项目 → 不该被 preview 拦；注入动项目 → 必须受 safety 管
+console.log('\n[12] 背包（存/取可复用积木）')
+t('两个背包工具都注册了（scratch_backpack / scratch_backpack_load）',
+  registered.has('scratch_backpack') && registered.has('scratch_backpack_load'), [...registered.keys()].join(','))
+t('scratch_backpack 的 action 说明列出 list/read/save/delete（AI 一眼能用）',
+  ['list', 'read', 'save', 'delete'].every(a => registered.get('scratch_backpack').description.includes(a)))
+t('save 的入参带 scriptIds/blockIds/all（三种存法）',
+  ['scriptIds', 'blockIds', 'all'].every(k => paramNames('scratch_backpack').includes(k)),
+  paramNames('scratch_backpack').join(','))
+t('load 的入参带 x/y 与 variableValues（换位置、换字模表）',
+  ['x', 'y', 'variableValues'].every(k => paramNames('scratch_backpack_load').includes(k)),
+  paramNames('scratch_backpack_load').join(','))
+t('load 明确受 safety 档位管（preview 档返回 planId，不是绕过确认直写项目）',
+  /guardedWrite\(sid, 'add_blocks'/.test(indexSrc) && /preview 档会返回 planId/.test(registered.get('scratch_backpack_load').description))
+t('存之前问用户（不做自动收集 —— 自动攒会变垃圾堆）',
+  /问用户/.test(registered.get('scratch_backpack').description), registered.get('scratch_backpack').description.slice(0, 120))
+t('删除只是挪进 _trash（几小时的活不该被手滑删掉）',
+  indexSrc.includes('backpackTrashDir') && indexSrc.includes('renameSync(f, dst)'))
+t('背包目录在 $DSH_HOME 下（照 skill 区的做法，不散落在项目里）',
+  indexSrc.includes("'scratch-backpack'") && indexSrc.includes('BACKPACK_INDEX'))
+t('执行器里有 export_blocks（子树导出走官方序列化器，不自己转 sb3）',
+  executorSrc.includes("case 'export_blocks'") && executorSrc.includes('vm.toJSON()'))
+t('注入时会落地变量引用（resolveRefs：有效不动 / 同名改指向 / 缺的补建）',
+  executorSrc.includes('function resolveRefs') &&
+  executorSrc.includes('byName(kind, name)') && executorSrc.includes('create(kind, name)'),
+  String(['resolveRefs', 'byName', 'create'].filter(k => !executorSrc.includes(k)).join(',')))
+t('背包片段导出时列表封顶（不然 5000 项的巨型列表又被搬一遍）',
+  executorSrc.includes('listCap') && executorSrc.includes('truncated'))
 
 console.log(`\n===== 插件工具单测: ${pass} pass / ${fail} fail =====`)
 try { rmSync(STUB_DIR, { recursive: true, force: true }); rmSync(HOME, { recursive: true, force: true }) } catch {}

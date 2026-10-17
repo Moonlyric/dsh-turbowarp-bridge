@@ -1,4 +1,4 @@
-# dsh-plugin-scratch — TurboWarp 桥插件（v0.7.0 · 组合包安装 + 插件页配置 + CDP 直连 + 运行控制闭环）
+# dsh-plugin-scratch — TurboWarp 桥插件（v0.8.0 · 组合包安装 + 插件页配置 + CDP 直连 + 运行控制闭环 + 积木背包）
 
 DSH（DeepSeek Harness）插件：把 TurboWarp 编辑器接入 agent。
 AI 通过 `scratch_*` 工具读取/修改 Scratch 项目，用户在 TurboWarp 界面里**实时**看到变化。
@@ -6,7 +6,7 @@ AI 通过 `scratch_*` 工具读取/修改 Scratch 项目，用户在 TurboWarp �
 架构（两条传输路径，读写的是**同一份**页面执行器）：
 
 ```
-本插件（Node）= WebSocket 服务端（桥 :31820） + CDP 直连客户端 + 28 个 scratch_* 工具 + Skill 经验库
+本插件（Node）= WebSocket 服务端（桥 :31820） + CDP 直连客户端 + 30 个 scratch_* 工具 + Skill 经验库 + 积木背包
 
   路一 · 扩展桥
         ↕ JSON-RPC over ws（握手 token）
@@ -117,7 +117,7 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 > **只有浏览器（扩展桥）那条路要 token。** 桌面版走 CDP 直连：不用扩展、不用 token，
 > 因为它连的是"我们自己拉起来、自己注执行器"的进程，没有"本机任意页面都能连进来"这个问题。
 
-## 工具清单（28 个）
+## 工具清单（30 个）
 
 | 工具 | 方向 | 说明 |
 |---|---|---|
@@ -149,6 +149,8 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 | `scratch_list_scripts` | 读 | 顶层脚本清单（opcode/块数/调用的自定义积木/名字），**区分真脚本与游离块**（判定用 `runtime._hats`） |
 | `scratch_batch` | 读/运行 | 一次往返做多件事（≤12 条，白名单只放只读/运行期 op；写操作不许进来） |
 | `scratch_selftest` | 读 | 全链路自检：桥监听 / 会话 / CDP 注入 / 项目就绪 / Blockly / 窗口可见 |
+| `scratch_backpack` | 读写 | **积木背包**：list/read/save/delete。把做好的脚本子树（连同它引用的变量/列表的值）存进 `$DSH_HOME/scratch-backpack/`，自动维护 `INDEX.md`；删除进 `_trash/` 不真删 |
+| `scratch_backpack_load` | 写 | 把背包里的一条注进项目（坐标整体平移、变量按名字接上或补建、`variableValues` 换内容）；受 `safety` 档位管 |
 
 ### scratch_open_editor：让 AI 自己去开编辑器
 
@@ -211,9 +213,10 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 
 ## Skill 区（Scratch 实践经验库）
 
-对社区高完成度作品**做法**的总结，9 篇经验文档：
+对社区高完成度作品**做法**的总结，10 篇经验文档：
 `getting-started` / `code-patterns` / `animation-visual` / `architecture` /
-`performance` / `sb3-json-reference` / `project-planning` / `recipes`。
+`performance` / `sb3-json-reference` / `project-planning` / `recipes` /
+`runtime-control`（跑起来再改）/ `backpack`（攒积木）。
 
 > 这里**刻意不记**「哪个作品有多少积木」——数字对"怎么写"没有帮助。要量规模自己调
 > `scratch_snapshot` 或 `lab/inspect-sb3.mjs`；文档只留能照着做的经验。
@@ -224,29 +227,53 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 - 首启复制到 `$DSH_HOME/scratch-skills/`，**升级默认不覆盖**用户改过的版本；
   想强制回到内置版：在 skill 目录里放一个 `.reset` 空文件，下次加载整份覆盖
 
+## 背包（AI 自己维护的可复用积木库）
+
+**skill 区存「怎么做」，背包存「做好的东西」。**
+
+| 面 | 说明 |
+|---|---|
+| 存哪 | `$DSH_HOME/scratch-backpack/<名字>.json`（一条一个）+ 自动生成的 `INDEX.md` |
+| 存什么 | 脚本子树（sb3 dict）+ 它引用的变量/列表**的值**（字模表跟着走；巨型列表按 `listLimit` 截断并标 `truncated`） |
+| 怎么存 | `scratch_backpack({ action: "save", name, target, scriptIds, title, notes, tags })`（`all:true` 存整个角色）—— 走执行器 `export_blocks` |
+| 怎么取 | `scratch_backpack_load({ name, target, x, y, variableValues })` —— 坐标整体平移（缺省 48,48），变量按名字**接上或补建** |
+| 删除 | 挪进 `_trash/`（带时间戳），不真删 |
+| 纪律 | **存之前问用户**（不做自动收集）；调了自定义积木却没存定义时导出会 `warnings` 提醒 |
+
+实现上的两个坑（改之前先看这里）：
+
+1. **导出不能用 `vm.toJSON()`**：TurboWarp 桌面版会把 block id 压缩成 `a`/`b`/`c`，
+   真机直接报"这些 id 一个都没找到"。所以导出是执行器里自己写的 live→sb3 转换
+   （`exportSubtreeLive`），正确性由 `lab/test-content-ops.js` 里**与官方序列化器逐块深比**守着。
+2. **注入时必须落地变量引用**（`resolveRefs`）：有效 id 不动 / 同名换指向 / 都没有就补建。
+   否则跨角色搬来的积木全是「变量未找到」，跑起来是空值。
+
 ## 文件
 
-- `index.js` — 入口：桥 + 握手 + 28 工具 + 快照持久化 + skill 区 + 桌面版启动
+- `index.js` — 入口：桥 + 握手 + 30 工具 + 快照持久化 + skill 区 + 背包 + 桌面版启动
 - `cdp.js` — **CDP 直连**：给桌面版带调试端口启动、注入执行器、`tagForPage()` 贴协议标签
 - `vm-executor.js` — 扩展 `content-main.js` 的**逐字节副本**（CDP 注的就是它；
   改完扩展执行器跑 `node ../lab/sync-executor.mjs` 同步，`test-tools.mjs` 有一致性断言守着）
 - `lib/client.js` — **浏览器半侧**（手写的 __ModuleLoader__ bundle：插件页里的配置表单）
 - `win32-window.ps1` — 窗口可见性探针（EnumWindows + ShowWindow，Windows only）
-- `skills/` — 内置 9 篇经验 + `INDEX.md`
+- `skills/` — 内置 10 篇经验 + `INDEX.md`
 - `cordis.patch.yml` — **组合包层**（`dsh.bundle.patch` 指向它，安装时自动插入 `scratch` 行）
 - `test-skills.mjs` — skill 区单测（23 断言）
+- `test-backpack.mjs` — **背包集成**（假页面连真桥：存→落盘→list/read→注入→preview→删除进 `_trash`，36 断言）
 - `test-bridge-auth.mjs` — 桥的握手认证与应答来源校验（21 断言，别删）
 - `test-tools.mjs` — 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 /
   CDP 桌面分支的启动参数与诚实报错 / `tagForPage` 四连 / 执行器副本一致性 / 桥端口被占自愈 /
-  返回值无损 JSON / 打包契约（组合包字段、volatile 配置、浏览器半侧格式、窗口探针），73 断言）
+  返回值无损 JSON / 打包契约（组合包字段、volatile 配置、浏览器半侧格式、窗口探针）+
+  v0.7.0 运行控制契约 + v0.8.0 背包契约，103 断言）
 
-## 测试状态（2026-10-17 本轮实测，VPN 全程关闭）
+## 测试状态（2026-10-18 本轮实测，VPN 全程关闭）
 
 | 套件 | 结果 |
 |---|---|
 | `test-skills.mjs` | 23/23 ✅ |
 | `test-bridge-auth.mjs` | 21/21 ✅ |
-| `test-tools.mjs` | 92/92 ✅（含打包契约：组合包 / volatile 配置 / 浏览器半侧 / 窗口探针 + v0.7.0 运行控制契约） |
+| `test-backpack.mjs` | 36/36 ✅ |
+| `test-tools.mjs` | 103/103 ✅（含打包契约：组合包 / volatile 配置 / 浏览器半侧 / 窗口探针 + v0.7.0 运行控制 + v0.8.0 背包契约） |
 | `../lab/test-content-ops.js` | 163/163 ✅（含瘦身体积断言：5000 项列表场景 < 64KB） |
 | `../lab/real-machine-check.mjs`（真 Chrome / Edge + 真 turbowarp.org；不传 `SB3_FIXTURE`） | 115/115 ✅（Chrome、Edge 各一遍） |
 | `../lab/desktop-cdp-check.mjs`（TurboWarp Desktop + CDP；真开一个窗口、跑完自动关） | 83/83 ✅（含窗口可见性交叉验证 + 绿旗后角色真位移） |

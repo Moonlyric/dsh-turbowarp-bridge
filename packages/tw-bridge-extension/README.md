@@ -26,7 +26,7 @@
 | 文件 | 作用 |
 |---|---|
 | `manifest.json` | MV3；`permissions: storage, scripting, alarms`；host 只匹配 turbowarp.org / scratch.mit.edu |
-| `content-main.js` | 核心执行器（MAIN world，`document_idle`）：15 个 op + 宿主兼容层 + 观察者 + 用户事件。**不碰网络**。这是执行器的**唯一源文件**，插件的 `vm-executor.js` 是它的逐字节副本（`lab/sync-executor.mjs` 同步，见下） |
+| `content-main.js` | 核心执行器（MAIN world，`document_idle`）：22 个 op + 宿主兼容层 + 观察者 + 用户事件 + 积木子树导出（`export_blocks`）。**不碰网络**。这是执行器的**唯一源文件**，插件的 `vm-executor.js` 是它的逐字节副本（`lab/sync-executor.mjs` 同步，见下） |
 | `relay-isolated.js` | ISOLATED world（`document_start`）：MAIN world ⇄ SW 的双向中继（`chrome.runtime.connect` 端口 + `window.postMessage`），断线自动重连 |
 | `background.js` | service worker：**持有 WebSocket**、握手、心跳保活、多标签页路由（指令只发给当前目标页）、图标徽标 |
 | `options.html` / `options.js` | 选项页：粘贴桥 token；高级项里可改桥地址（`bridgeUrl`，验收脚本用它避开你正在跑的 dsh） |

@@ -9,7 +9,7 @@ import { defineTool as rawDefineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
 import { homedir } from 'node:os'
 import { join, dirname, resolve, sep } from 'node:path'
-import { mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync, existsSync, copyFileSync, statSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync, existsSync, copyFileSync, statSync, renameSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { spawn, execFileSync } from 'node:child_process'
@@ -496,7 +496,7 @@ export function apply(ctx, config) {
   const builtinSkillDir = join(dirname(fileURLToPath(import.meta.url)), 'skills')
   const skillStateFile = join(skillDir, '.enabled.json')
   const builtinVersionFile = join(skillDir, '.builtin-version')
-  const SKILL_BUILTIN_VERSION = '2' // 升级内置 skill 时 bump（2 = 去掉块数普查、只留做法）
+  const SKILL_BUILTIN_VERSION = '3' // 升级内置 skill 时 bump（3 = 加背包那篇；2 = 去掉块数普查、只留做法）
 
   function skillEnabledMap() {
     try { return JSON.parse(readFileSync(skillStateFile, 'utf8')) } catch { return {} }
@@ -1228,10 +1228,12 @@ export function apply(ctx, config) {
         if (!plan) throw new Error(`planId ${args.planId} 不存在或已过期（重新调一次那个写工具生成新的）`)
         if (plan.sessionId !== sid) throw new Error(`planId ${args.planId} 属于另一个会话（${plan.sessionId}）`)
         pendingPlans.delete(args.planId)
-        return executePlan(plan)
+        // apply 也补统一的 changed（P3-2）：preview 档下真正的写操作发生在这里，
+        // 不补的话「preview → apply」这条路上唯一拿不到「哪变了」的恰好是落盘那一步。
+        return withChanged(await executePlan(plan))
       }
       if (!args?.blocks) throw new Error('scratch_apply 需要 planId（preview 档返回的）或 blocks+target')
-      return executePlan({ sessionId: sid, op: 'add_blocks', args: { target: args.target, blocks: args.blocks }, label: 'pre-apply' })
+      return withChanged(await executePlan({ sessionId: sid, op: 'add_blocks', args: { target: args.target, blocks: args.blocks }, label: 'pre-apply' }))
     }
   }))
 
@@ -1372,6 +1374,280 @@ export function apply(ctx, config) {
         return { deleted: args.name }
       }
       throw new Error(`未知 action ${action}`)
+    }
+  }))
+
+  // ==================== 背包：AI 自己维护的可复用积木库 ====================
+  // 用户原话：「文字引擎这种完全可以直接预存到 ai 代码块背包里，后面可以加个类似这种
+  // 背包的东西让 ai 自己维护」。
+  //   skill 区存「怎么做」（经验/做法），背包存「做好的东西」（整块积木 + 它要的变量值）。
+  // 存储：$DSH_HOME/scratch-backpack/<名字>.json 一条一个 + INDEX.md 一份目录
+  //   （照抄 skill 区的做法：AI 能廉价扫目录、按需取用，而不是一次性全灌进上下文）。
+  // 不做自动收集：自动攒会变垃圾堆，用户就再也不看了 —— 存之前问用户一句。
+  // 删除不真删：挪进 _trash/（存进去的东西可能是几小时的活，手滑一次不该没了）。
+  const backpackDir = join(process.env.DSH_HOME || (homedir() + '/.dsh'), 'scratch-backpack')
+  const backpackTrashDir = join(backpackDir, '_trash')
+  const BACKPACK_INDEX = 'INDEX.md'
+  const BP_NAME_MAX = 64
+
+  /** 名字 → 安全文件名（保留中文；Windows 非法字符换成 -） */
+  function bpSlug(raw) {
+    const s = String(raw || '').trim()
+      .replace(/[\\/:*?"<>|\s]+/g, '-')
+      .replace(/^[.-]+/, '')
+      .replace(/-+$/g, '')
+      .slice(0, BP_NAME_MAX)
+    return s
+  }
+  function bpPath(name) {
+    const slug = bpSlug(name)
+    if (!slug) throw new Error('name 必填（会作为文件名，用英文/数字/中文都行）')
+    const f = resolve(backpackDir, slug + '.json')
+    if (!f.startsWith(resolve(backpackDir) + sep)) throw new Error('路径越界')
+    return f
+  }
+  function bpRead(name) {
+    const f = bpPath(name)
+    if (!existsSync(f)) {
+      const have = listBackpack().items.map(x => x.name)
+      throw new Error(`背包里没有「${name}」（现有：${have.join('、') || '空'}）`)
+    }
+    return JSON.parse(readFileSync(f, 'utf8'))
+  }
+  function listBackpack() {
+    try { mkdirSync(backpackDir, { recursive: true }) } catch { /* 只读也能用 */ }
+    const items = []
+    let bytes = 0
+    try {
+      for (const f of readdirSync(backpackDir)) {
+        if (!f.endsWith('.json')) continue
+        const full = join(backpackDir, f)
+        try {
+          const s = readFileSync(full, 'utf8')
+          bytes += s.length
+          const o = JSON.parse(s)
+          items.push({
+            name: o.name || basename(f, '.json'),
+            title: o.title || '',
+            when: o.description || '',
+            tags: Array.isArray(o.tags) ? o.tags : [],
+            blocks: o.stats && o.stats.blocks || (o.blocks ? Object.keys(o.blocks).length : 0),
+            scripts: o.stats && o.stats.scripts || 0,
+            updated: o.updatedAt || '',
+            bytes: s.length
+          })
+        } catch { /* 坏文件跳过，不让一条烂数据废掉整个目录 */ }
+      }
+    } catch { /* 空目录 */ }
+    items.sort((a, b) => String(b.updated).localeCompare(String(a.updated)))
+    return { dir: backpackDir, count: items.length, items, indexBytes: bytes }
+  }
+  function rebuildBackpackIndex() {
+    const { items } = listBackpack()
+    const lines = [
+      '# Scratch 背包（AI 维护的可复用积木）',
+      '',
+      '> skill 区存「怎么做」，这里存「做好的东西」。取用：`scratch_backpack_load({ name })`。',
+      '> 存之前先问用户一句（不要自动攒 —— 攒成垃圾堆就没人看了）。',
+      '',
+      `共 ${items.length} 条。按更新时间倒序。`,
+      ''
+    ]
+    if (items.length) {
+      lines.push('| 名字 | 标题 | 块数 | 标签 | 更新 |', '|---|---|---|---|---|')
+      for (const it of items) {
+        lines.push(`| ${it.name} | ${it.title || it.when || ''} | ${it.blocks} | ${(it.tags || []).join(', ')} | ${String(it.updated).slice(0, 10)} |`)
+      }
+    } else {
+      lines.push('（空。做完一件有难度的事 → `scratch_backpack({ action: "save", ... })` 存进来。）')
+    }
+    try {
+      mkdirSync(backpackDir, { recursive: true })
+      writeFileSync(join(backpackDir, BACKPACK_INDEX), lines.join('\n') + '\n')
+      return join(backpackDir, BACKPACK_INDEX)
+    } catch (e) {
+      log.warn('背包目录索引写入失败: %s', e.message)
+      return null
+    }
+  }
+  /**
+   * 注入前把坐标搬到指定位置：保留片段内部的相对排布，只做整体平移。
+   * （直接沿用存的时候的坐标，多半会跟用户现有脚本叠在一起）
+   */
+  function shiftBackpackBlocks(blocks, x, y) {
+    const out = JSON.parse(JSON.stringify(blocks || {}))
+    const tops = Object.values(out).filter(b => b && !Array.isArray(b) && b.topLevel)
+    const pts = tops.filter(b => Number.isFinite(b.x) && Number.isFinite(b.y))
+    if (!tops.length) return out
+    // 没给位置就落到 48,48（别沿用存的时候的坐标 —— 那多半跟用户现有脚本叠在一起）
+    const tx = Number.isFinite(x) ? x : 48
+    const ty = Number.isFinite(y) ? y : 48
+    if (pts.length) {
+      const minX = Math.min(...pts.map(b => b.x))
+      const minY = Math.min(...pts.map(b => b.y))
+      for (const b of pts) { b.x += tx - minX; b.y += ty - minY }
+    } else {
+      tops.forEach((b, i) => { b.x = tx; b.y = ty + i * 200 })
+    }
+    return out
+  }
+
+  ctx.tools.register(defineTool({
+    name: 'scratch_backpack',
+    description: '积木背包（AI 自己维护的可复用积木库）：把做好的整块积木存下来，下次直接取用。'
+      + 'action=list 扫目录（很便宜，只回名字/标题/块数/标签）；action=read 读一条的完整 blocks；'
+      + 'action=save 把当前项目里的脚本存进来（用 scriptId/blockIds，或 all:true）；action=delete 删（进 _trash，不真删）。'
+      + '**存之前先问用户一句**（不要自动攒）。取用走 scratch_backpack_load。',
+    parameters: {
+      action: { type: 'string', description: 'list | read | save | delete（缺省 list）' },
+      name: { type: 'string', description: '条目名（文件名；中英文都行）。read/save/delete 必填（save 时可省略，从 title 生成）' },
+      session: { type: 'string', description: '会话 ID（save 时用），缺省用第一个' },
+      target: { type: 'string', description: 'save 时从哪个角色导出，缺省当前编辑中的角色' },
+      scriptIds: { type: 'array', description: 'save：要存的脚本根 id（顶层块 id，从 scratch_list_scripts 拿）' },
+      blockIds: { type: 'array', description: 'save：要存的块 id（会自动连带 next 链/嵌套块/影子块）' },
+      all: { type: 'boolean', description: 'save：把这个角色的全部脚本都存进来（想存整个角色时用）' },
+      title: { type: 'string', description: 'save：一句话标题（给人看）' },
+      description: { type: 'string', description: 'save：什么时候用它（相当于 skill 的「适用场景」）' },
+      notes: { type: 'string', description: 'save：怎么用/怎么改参数（会原样带给下次的自己）' },
+      tags: { type: 'array', description: 'save：标签，如 ["pen","text"]' },
+      overwrite: { type: 'boolean', description: 'save：同名已存在时是否覆盖（默认 false，会报错提醒）' }
+    },
+    output: jsonOut,
+    async execute(args) {
+      const action = args?.action || 'list'
+      if (action === 'list') {
+        const r = listBackpack()
+        return {
+          dir: r.dir,
+          count: r.count,
+          items: r.items,
+          indexFile: join(r.dir, BACKPACK_INDEX),
+          hint: r.count
+            ? '用 scratch_backpack({ action: "read", name }) 看某一条的 blocks，或 scratch_backpack_load 直接注进项目。'
+            : '背包是空的。做完一件有难度的事（比如 pen 文字引擎）可以问用户要不要存进来。'
+        }
+      }
+      if (action === 'read') {
+        const s = bpRead(args?.name)
+        return {
+          name: s.name,
+          title: s.title,
+          description: s.description,
+          notes: s.notes,
+          tags: s.tags,
+          stats: s.stats,
+          requires: s.requires,
+          source: s.source,
+          warnings: s.warnings,
+          blocks: s.blocks,
+          hint: 'blocks 是 sb3 dict，可直接喂 scratch_add_blocks；改参数用 add_blocks/update_block。若只想注入不改，用 scratch_backpack_load。'
+        }
+      }
+      if (action === 'save') {
+        const sid = needSession(args?.session)
+        const name = bpSlug(args?.name || args?.title)
+        if (!name) throw new Error('save 需要 name（或用 title 生成）')
+        const file = bpPath(name)
+        const prev = existsSync(file) ? (() => { try { return JSON.parse(readFileSync(file, 'utf8')) } catch { return null } })() : null
+        if (prev && args?.overwrite !== true) {
+          throw new Error(`背包里已经有「${name}」了。要覆盖传 overwrite: true；想另存就换个 name。`)
+        }
+        const exp = await call(sid, 'export_blocks', {
+          target: args?.target,
+          scriptIds: Array.isArray(args?.scriptIds) ? args.scriptIds : undefined,
+          blockIds: Array.isArray(args?.blockIds) ? args.blockIds : undefined,
+          all: args?.all === true ? true : undefined
+        }, 60000)
+        const now = new Date().toISOString()
+        const snippet = {
+          name,
+          // 覆盖时不传元数据 = 保留上次写的（改完积木再存一次，不该把「怎么用」的笔记弄丢）
+          title: args?.title || prev?.title || exp.topLevelOpcodes.join(' / ') || name,
+          description: args?.description || prev?.description || '',
+          notes: args?.notes || prev?.notes || '',
+          tags: Array.isArray(args?.tags) ? args.tags : (args?.tags ? [String(args.tags)] : (prev?.tags || [])),
+          createdAt: prev?.createdAt || now,
+          updatedAt: now,
+          source: {
+            session: sid,
+            project: exp.project || prev?.source?.project || '',
+            target: exp.target,
+            scripts: exp.scripts,
+            blockCount: exp.blockCount,
+            topLevelOpcodes: exp.topLevelOpcodes
+          },
+          stats: { blocks: exp.blockCount, scripts: exp.scripts },
+          requires: exp.requires,
+          warnings: exp.warnings,
+          blocks: exp.blocks
+        }
+        const text = JSON.stringify(snippet, null, 2)
+        mkdirSync(backpackDir, { recursive: true })
+        writeFileSync(file, text)
+        rebuildBackpackIndex()
+        return {
+          saved: name,
+          file,
+          bytes: text.length,
+          blocks: exp.blockCount,
+          scripts: exp.scripts,
+          requires: {
+            variables: (exp.requires.variables || []).map(v => v.name),
+            lists: (exp.requires.lists || []).map(v => `${v.name}(${(v.value || []).length}${v.truncated ? '/' + v.length : ''})`),
+            broadcasts: (exp.requires.broadcasts || []).map(v => v.name)
+          },
+          overwritten: !!prev,
+          warnings: exp.warnings,
+          hint: '存好了。下次用 scratch_backpack_load({ name }) 直接注进项目（变量/列表会按名字接上或补建）。'
+        }
+      }
+      if (action === 'delete') {
+        const s = bpRead(args?.name)
+        const f = bpPath(s.name)
+        mkdirSync(backpackTrashDir, { recursive: true })
+        const dst = join(backpackTrashDir, `${bpSlug(s.name)}-${new Date().toISOString().replace(/[:.]/g, '-')}.json`)
+        renameSync(f, dst)
+        rebuildBackpackIndex()
+        return { deleted: s.name, movedTo: dst, hint: '没真删，挪进 _trash/ 了（想恢复就把它移回背包目录）。' }
+      }
+      throw new Error(`未知 action ${action}（list | read | save | delete）`)
+    }
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'scratch_backpack_load',
+    description: '把背包里的一条注入到项目（带变量/列表补建：目标里没有的会被建出来，内容用背包存的那份）。'
+      + 'x/y 给新位置（缺省 48,48；片段内部的相对排布会保留）。variableValues 可覆盖列表/变量的内容（如换字模表）。'
+      + '写操作，受 safety 档位约束（preview 档会返回 planId，等 scratch_apply 落盘）。',
+    parameters: {
+      session: { type: 'string' },
+      name: { type: 'string', required: true, description: '背包条目名（scratch_backpack list 里有）' },
+      target: { type: 'string', description: '注到哪个角色，缺省当前编辑中的角色' },
+      x: { type: 'number', description: '第一个脚本的左上角 x（工作区坐标）' },
+      y: { type: 'number', description: '第一个脚本的左上角 y' },
+      variableValues: { type: 'object', additionalProperties: true, description: '按名字覆盖变量/列表内容，如 {"字模": ["甲","乙"]}' }
+    },
+    output: jsonOut,
+    async execute(args) {
+      const sid = needSession(args?.session)
+      const s = bpRead(args?.name)
+      const blocks = shiftBackpackBlocks(s.blocks, args?.x, args?.y)
+      // 变量/列表：用背包里存的声明（含值），再按 variableValues 覆盖
+      const overrides = (args?.variableValues && typeof args.variableValues === 'object') ? args.variableValues : {}
+      const declared = []
+      for (const v of (s.requires?.variables || [])) declared.push({ name: v.name, type: 'variable', value: overrides[v.name] !== undefined ? overrides[v.name] : v.value })
+      for (const v of (s.requires?.lists || [])) declared.push({ name: v.name, type: 'list', value: Array.isArray(overrides[v.name]) ? overrides[v.name] : v.value })
+      for (const v of (s.requires?.broadcasts || [])) declared.push({ name: v.name, type: 'broadcast' })
+      const preview = {
+        snippet: s.name,
+        title: s.title,
+        target: args?.target || '(当前编辑角色)',
+        blocks: Object.keys(blocks).length,
+        creates: declared.map(d => `${d.name}${d.type === 'list' ? '[]' : ''}`)
+      }
+      const r = withChanged(await guardedWrite(sid, 'add_blocks', { target: args?.target, blocks, variables: declared },
+        `pre-bp-${s.name}`, preview))
+      return Object.assign({ snippet: s.name, at: { x: args?.x, y: args?.y }, declared: declared.map(d => d.name) }, r)
     }
   }))
 
