@@ -41,6 +41,14 @@ AI 通过 `scratch_*` 工具读取/修改 Scratch 项目，用户在 TurboWarp �
 3. 装完插件页里会出现 `dsh-plugin-scratch` 卡片：里面对应一个 `scratch` 行，
    可以**分别开关**（组合包开关 = 停用/启用整个包；行开关 = 只停插件）。
 
+不想用本地路径也可以直接装 GitHub 上的那份（dsh 自带的 pnpm 支持 `#path:` 子目录）：
+
+```
+github:Moonlyric/dsh-turbowarp-bridge#path:packages/dsh-plugin-scratch
+```
+
+装的时候需要能访问 github.com；装完是本机缓存副本，仓库更新后要再装一次。
+
 装好之后**不要**再去 `cordis.patch.yml` 里手写 `insert:`。手写 insert 能跑，但插件页里看不到它
 ——没有启用/禁用开关、没有配置页（这是真机上踩过的坑）。profile patch 只用来**覆盖配置**：
 

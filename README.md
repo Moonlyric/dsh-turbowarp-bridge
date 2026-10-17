@@ -87,6 +87,16 @@ G:\09 Eutopia\demo\DSH Turbowarp插件\packages\dsh-plugin-scratch
 （这就是「从本地目录安装一个组合包」：dsh 会 `pnpm add file:<那个路径>`，把包装进
 `profiles\<profile>\node_modules`，并加进 `dsh.profile.bundles`。）
 
+**也可以直接从 GitHub 装**（换机器、或者不想 clone 仓库时用这个）——同一个对话框里粘：
+
+```
+github:Moonlyric/dsh-turbowarp-bridge#path:packages/dsh-plugin-scratch
+```
+
+这是 pnpm 的 git 子目录 spec（dsh 自带的 pnpm 11.28 支持 `#path:`）。实测：装完「已安装插件」里照样
+出现卡片、`scratch` 行「运行中」，**来源信息**显示的就是这一串，配置页也正常。代价是：装的时候
+要能访问 github.com；装完是本机缓存副本，仓库更新后要再装一次。
+
 装完插件页里会出现一张 `dsh-plugin-scratch` 卡片，点进去是：
 
 - **组合包开关** —— 关掉 = 从 `dsh.profile.bundles` 撤掉，插件停止运行；
