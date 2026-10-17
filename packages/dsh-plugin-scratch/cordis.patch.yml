@@ -1,31 +1,39 @@
-# 组合包层：把本插件插入 cordis 插件列表
+# 组合包（bundle）层：安装本包时，这一行会被 DSH 自动插入插件列表
 #
-# name 的取值（三种都行，dsh 0.1.2-rc.1 实测）：
-#   1) 包名             name: dsh-plugin-scratch      ← 从 profile 目录做 ESM 解析（需已 pnpm/npm 装进 profile）
-#   2) 相对路径         name: ../local-plugins/dsh-plugin-scratch/index.js
-#                                                     ← 相对本补丁文件所在目录；插件必须位于 harness\profiles\ 之下
-#                                                        （否则上溯不到 profiles\node_modules，@deepseek-ai/* 解析失败）
-#   3) file:// 绝对 URL name: file:///C:/path/to/index.js
-# ⚠️ 裸 Windows 路径（G:\...\index.js）不被支持，会被当成 g: 协议。
+# 为什么要有这个文件：DSH 的「插件」页面只列**组合包**（package.json 里声明了
+# `dsh.bundle.patch` 的包）。以前把插件行直接写进 profile 的 cordis.patch.yml 属于
+# "手工注入"：能跑，但插件页里永远看不到它，也就没有启用/禁用开关、没有配置页
+# （用户实测：插件页找不到 → 开关和设置参数全用不了）。
+#
+# 现在：这一行由组合包提供，profile 的 cordis.patch.yml 只负责**覆盖配置**
+# （patch 是按 id 定位的整段替换，所以覆盖时要重述要保留的字段）。
+#
+# `name` 用包名 `dsh-plugin-scratch`：由 profile 的 node_modules 解析（官方安装就是
+# pnpm 把包装进 profile）。不要再写相对路径/绝对路径 —— 插件页靠"包名 ↔ 行 id"
+# 去配对配置表单，写路径会让它认不出来。
 - insert:
     - id: scratch
       name: dsh-plugin-scratch
       config:
         # 安全档位：auto（直接落盘）| preview（默认，先 diff 后应用）| suggest（只给建议）
         safety: preview
-        # 桥监听端口（浏览器扩展连接用）
+        # 桥监听端口（浏览器扩展连接用）；桌面版 CDP 那条路不经过它
         bridgePort: 31820
         # 快照上限（防止巨型项目刷爆磁盘）
-        maxSnapshots: 50
+        maxSnapshots: 30
+        maxSnapshotMemMb: 64
+        maxSnapshotDiskMb: 256
         # Skill 经验库总开关（false 时 scratch_skills 返回 disabled，工具本体不受影响）
         skillsEnabled: true
         # 唤起编辑器（scratch_open_editor）用哪个浏览器；留空 = 系统默认浏览器
-        # browserPath: C:\Program Files\Google\Chrome\Application\chrome.exe
+        browserPath: ''
         # 本地 TurboWarp Desktop 的 exe；留空 = 自动找（常见目录 + 注册表卸载项）
         # 桌面版走 **CDP 直连**（启动时带 --remote-debugging-port，把页面执行器注进默认上下文）：
         # 它装不了 Chrome 扩展，但照样能被 AI 读写积木 —— 零安装、零 token。
-        # desktopPath: G:\09 Eutopia\scr\TurboWarp\TurboWarp.exe
+        desktopPath: ''
         # 「可接管」固定调试端口：app=desktop 会先探这个端口，有实例就直接接管（不新开窗口）。
         # 用仓库根目录的「启动TurboWarp(AI可接管).cmd」启动桌面版就是走这个端口。
         # 改这里的话记得同步改那个 .cmd。
-        # desktopDebugPort: 31821
+        desktopDebugPort: 31821
+        # 快照目录；留空 = 系统临时目录。大项目别堆在系统盘
+        snapshotsDir: ''

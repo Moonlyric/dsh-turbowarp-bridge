@@ -49,6 +49,23 @@ function twProcessCount() {
   } catch { return 0 }
 }
 
+/**
+ * 独立证据：自己用 Win32 探针枚举一次 TurboWarp 的窗口（不读插件返回值）。
+ * 为什么不用 `Get-Process ... MainWindowHandle`：隐藏窗口它恒返回 0，会得出
+ * 「没有窗口」的错误结论 —— 这正是上一轮排查被骗了一整轮的原因。
+ */
+function probeWindowWin32() {
+  const script = join(ROOT, 'packages', 'dsh-plugin-scratch', 'win32-window.ps1')
+  if (!existsSync(script)) return null
+  try {
+    const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', script, '-ImageName', 'TurboWarp'], { encoding: 'utf8', windowsHide: true, timeout: 10000 })
+    const list = JSON.parse(out.trim() || '[]')
+    const main = list.filter(w => w && w.cls === 'Chrome_WidgetWin_1' && w.title)
+    return main.find(w => /TurboWarp/i.test(w.title)) || main[0] || null
+  } catch { return null }
+}
+
 // ---------------- 独立 CDP 通道（验证用，不碰插件自己的那条连接） ----------------
 class RawCdp {
   constructor(ws) { this.ws = ws; this.seq = 0; this.waiters = new Map(); this.ctx = null; this.events = [] }
@@ -189,6 +206,19 @@ try {
   t('报出了当前编辑中的角色（AI 直接拿它当 target）',
     typeof r.editingTarget === 'string' && r.editingTarget.length > 0, String(r.editingTarget))
 
+  // ---- 窗口可见性：连上了 ≠ 用户看得见 ----
+  // 这是这个插件最阴的失败模式：进程在、CDP 通、积木也能改，但用户屏幕上什么都没有。
+  // 上一轮真实卡了一整轮，根因是 spawn 时带了 windowsHide（窗口以 SW_HIDE 状态创建）。
+  t('返回值里带了窗口状态（EnumWindows 拿的 hwnd/visible/rect）',
+    !!(r.window && typeof r.window.visible === 'boolean' && r.window.hwnd), J(r.window, 200))
+  t('窗口是可见的（用户真能看到编辑器，不是隐藏态）', !!(r.window && r.window.visible === true), J(r.window, 200))
+  t('启动时就没把窗口藏起来（不是"先隐藏、再 ShowWindow 补救"）',
+    r.windowRepair === undefined, String(r.windowRepair))
+  t('报的是编辑器主窗口（标题带 TurboWarp，不是 IME/辅助窗口）',
+    /TurboWarp/i.test(String(r.window && r.window.title)), String(r.window && r.window.title))
+  const winNow = probeWindowWin32()
+  t('独立 Win32 探针也看到它是可见的（插件没自说自话）', !!(winNow && winNow.visible === true), J(winNow, 160))
+
   step('3. 独立 CDP 通道核对（不读插件返回值）')
   raw = await RawCdp.connect(r.launched.debugPort)
   let page = await raw.evalJson(PAGE_PROBE)
@@ -212,6 +242,10 @@ try {
     J(Object.keys(opcodes), 120))
   const sessions = await call('scratch_list_sessions', {})
   t('list_sessions 认到 1 个会话', (sessions.sessions || []).length === 1, J(sessions, 200))
+  t('list_sessions 也报窗口状态（AI 随时能自检"用户看得见吗"）',
+    !!(sessions.sessions && sessions.sessions[0] && sessions.sessions[0].window), J(sessions.sessions && sessions.sessions[0], 240))
+  t('list_sessions 报的窗口同样可见', !!(sessions.sessions && sessions.sessions[0] && sessions.sessions[0].window && sessions.sessions[0].window.visible === true),
+    J(sessions.sessions && sessions.sessions[0] && sessions.sessions[0].window, 160))
   t('会话 meta 标了 transport=cdp（AI 能一眼看出走的是哪条路）',
     sessions.sessions[0].meta && sessions.sessions[0].meta.transport === 'cdp',
     J(sessions.sessions[0].meta || {}, 200))

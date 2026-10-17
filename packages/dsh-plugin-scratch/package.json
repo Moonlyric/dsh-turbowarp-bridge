@@ -1,24 +1,47 @@
 {
   "name": "dsh-plugin-scratch",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "description": "TurboWarp bridge for DeepSeek Harness: AI reads and edits sb3 blocks live in the editor, with community-derived skill library",
   "type": "module",
   "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
   "dsh": {
+    "manifestVersion": 1,
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   },
   "engines": {
-    "dsh": ">=0.1.2"
+    "dsh": ">=0.2.0-rc.2"
   },
   "scripts": {
     "test": "node test-tools.mjs && node test-skills.mjs && node test-bridge-auth.mjs",
     "sync-executor": "node ../../lab/sync-executor.mjs"
   },
   "dependencies": {
-    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
-    "ws": "^8.0.0"
+    "ws": "^8.21.3"
   },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.5"
+  },
+  "files": [
+    "index.js",
+    "cdp.js",
+    "vm-executor.js",
+    "cordis.patch.yml",
+    "win32-window.ps1",
+    "lib/client.js",
+    "skills/",
+    "README.md"
+  ],
   "license": "MIT"
 }

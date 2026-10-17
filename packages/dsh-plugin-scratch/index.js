@@ -6,6 +6,7 @@
 // 工具注册走 @deepseek-ai/dsh-tools 的 defineTool（0.2.0-rc.2 实测通过）。
 
 import { defineTool as rawDefineTool } from '@deepseek-ai/dsh-tools'
+import z from '@deepseek-ai/schemastery'
 import { homedir } from 'node:os'
 import { join, dirname, resolve, sep } from 'node:path'
 import { mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync, existsSync, copyFileSync, statSync } from 'node:fs'
@@ -18,6 +19,36 @@ import { attachCdp, findFreePort, tagForPage, probeCdp } from './cdp.js'
 
 export const name = 'dsh-plugin-scratch'
 export const inject = ['tools'] // dsh 规范：用到 ctx.tools 必须声明，框架保证注入后才加载
+
+// ---------------- 配置 schema ----------------
+// 为什么是 `.volatile()`：dsh 的「插件页 → 点进组合包 → 点某一行 → 配置」只渲染
+// **volatile 字段**（dsh-settings 的 volatileForm）。普通字段依旧只能改 YAML 文件，
+// 页面上根本不会出现配置控件 —— 这就是「设置参数用不了」的根因。
+// volatile 字段在运行时是 `{ get() }` 引用（cosmokit 的 createVolatile），不改 profile、
+// 不重挂插件就能读到新值；所以下面所有读取都走 cfg（每次读都 get() 一次），改完立即生效。
+// ⚠️ 字段名/类型必须与已写入 profile 的 YAML 值兼容（字符串存端口会报校验错）。
+export const Config = z.object({
+  safety: z.union(['auto', 'preview', 'suggest']).default('preview').volatile()
+    .description('写操作落地方式：preview 先给 diff 等确认，auto 直接落盘，suggest 只给建议'),
+  bridgePort: z.natural().min(1).max(65535).default(31820).volatile()
+    .description('桥监听端口（浏览器扩展连这个端口）。改完 ~2 秒内自动重绑，不用重启'),
+  snapshotsDir: z.string().default('').volatile()
+    .description('快照目录，留空 = 系统临时目录。大项目别堆在系统盘'),
+  maxSnapshots: z.natural().default(30).volatile().description('内存里最多留几份快照'),
+  maxSnapshotMemMb: z.natural().default(64).volatile().description('快照内存上限（MB）'),
+  maxSnapshotDiskMb: z.natural().default(256).volatile().description('快照落盘上限（MB）'),
+  skillsEnabled: z.boolean().default(true).volatile()
+    .description('Skill 经验库总开关（关掉后 scratch_skills 只回 disabled）'),
+  desktopPath: z.string().default('').volatile()
+    .description('TurboWarp Desktop 的 exe 路径，留空 = 自动找'),
+  desktopDebugPort: z.natural().min(1).max(65535).default(31821).volatile()
+    .description('「AI 可接管」的固定调试端口（与仓库里的 启动TurboWarp(AI可接管).cmd 保持一致）'),
+  browserPath: z.string().default('').volatile()
+    .description('网页版用哪个浏览器打开，留空 = 系统默认浏览器'),
+})
+
+/** 读 volatile 引用（`{ get() }`）或普通值；每次读都取最新，UI 保存后立即生效 */
+const readLive = (value) => (value !== null && typeof value === 'object' && typeof value.get === 'function' ? value.get() : value)
 
 // ---------------- 返回值清洗：必须是「无损 JSON」----------------
 // 真实的 harness 会校验工具返回值（`value is not lossless JSON`），而 `undefined`
@@ -66,7 +97,15 @@ const jsonOut = {
 /** @param {import('@deepseek-ai/cordis').Context} ctx */
 export function apply(ctx, config) {
   const log = ctx.logger('scratch')
-  log.info('TurboWarp bridge plugin loaded, safety=%s port=%s', config.safety, config.bridgePort)
+  // 配置的「活视图」：volatile 字段是 { get() } 引用，每次读都拿到最新值。
+  // 这样用户在插件页的配置表单里改完，下一次工具调用就按新值走，不用重启 dsh。
+  const cfg = new Proxy({}, {
+    get: (_t, key) => readLive(config[key]),
+    has: (_t, key) => key in config,
+    ownKeys: () => Reflect.ownKeys(config),
+    getOwnPropertyDescriptor: () => ({ enumerable: true, configurable: true }),
+  })
+  log.info('TurboWarp bridge plugin loaded, safety=%s port=%s', cfg.safety, cfg.bridgePort)
 
   // ---------------- 桥：管理已连接的 TW 编辑器会话 ----------------
   // 每个「会话」= 一个连上桥、且**通过 token 认证**的 turbowarp.org 编辑器标签页。
@@ -125,10 +164,13 @@ export function apply(ctx, config) {
     //    而且没有任何补救入口（插件的桥只在 apply 时起一次）。
     let retryTimer = null
     let attempts = 0
+    let lastWantedPort = cfg.bridgePort
     function listen() {
+      // 重绑时先把旧监听关掉（端口没变的重入也走这里，交给 error/EADDRINUSE 兜）
+      if (activeWss) { try { activeWss.close() } catch {} }
       let wss
       try {
-        wss = new WebSocketServer({ host: '127.0.0.1', port: config.bridgePort })
+        wss = new WebSocketServer({ host: '127.0.0.1', port: cfg.bridgePort })
       } catch (e) {
         log.error('桥服务创建失败: %s', e.message)
         schedule()
@@ -137,13 +179,13 @@ export function apply(ctx, config) {
       attach(wss)
       wss.on('listening', () => {
         attempts = 0
-        log.info('桥监听 %s:%d（等浏览器扩展连进来）', '127.0.0.1', config.bridgePort)
+        log.info('桥监听 %s:%d（等浏览器扩展连进来）', '127.0.0.1', cfg.bridgePort)
       })
       wss.on('error', (e) => {
         if (e && e.code === 'EADDRINUSE') {
           // 自己人重入（比如同一 profile 被加载两次）也会走到这儿
           log.warn('端口 %d 已被占用，%ds 后重试（另一个 dsh 实例/残留进程占着？）',
-            config.bridgePort, RETRY_BRIDGE_MS / 1000)
+            cfg.bridgePort, RETRY_BRIDGE_MS / 1000)
           try { wss.close() } catch {}
           schedule()
           return
@@ -156,13 +198,25 @@ export function apply(ctx, config) {
       attempts++
       retryTimer = setTimeout(() => { retryTimer = null; listen() }, RETRY_BRIDGE_MS)
       if (retryTimer.unref) retryTimer.unref() // 别因为这个定时器把进程钉住
-      if (attempts === 12) log.error('端口 %d 连续 %d 次被占用，桥仍未起来（用户会连不上）', config.bridgePort, attempts)
+      if (attempts === 12) log.error('端口 %d 连续 %d 次被占用，桥仍未起来（用户会连不上）', cfg.bridgePort, attempts)
     }
     // dsh 规范：手动资源用 ctx.effect 注册清理（卸载/热替换时自动调用）
     ctx.effect(() => () => {
       clearTimeout(retryTimer)
       try { activeWss && activeWss.close() } catch {}
     })
+    // 配置表单里改端口是「volatile 热改」：不重挂插件、不重启 dsh，
+    // 所以必须自己盯着端口变化重绑（2s 一次，成本可忽略）。
+    const watchPort = setInterval(() => {
+      const want = cfg.bridgePort
+      if (want === lastWantedPort) return
+      lastWantedPort = want
+      attempts = 0
+      log.info('配置里的桥端口改成 %d，正在重绑监听', want)
+      listen()
+    }, 2000)
+    if (watchPort.unref) watchPort.unref()
+    ctx.effect(() => () => clearInterval(watchPort))
     let activeWss = null
     function attach(wss) {
       activeWss = wss
@@ -284,7 +338,15 @@ export function apply(ctx, config) {
   function call(sessionId, op, args, timeoutMs = OP_TIMEOUTS[op] || 15000) {
     return new Promise((resolve, reject) => {
       const s = sessions.get(sessionId)
-      if (!s) return reject(new Error(`没有连接的编辑器会话 ${sessionId}（先让用户打开 turbowarp.org 并装 tw-bridge-extension）`))
+      if (!s) {
+        // 会话失效最常见的原因是「那个窗口/标签页已经关了」，不是「用户没装扩展」——
+        // 以前这条错误把桌面版用户直接引向装扩展，实测把人带偏了。两条路都写清楚。
+        return reject(new Error(
+          `会话 ${sessionId} 已不存在（那个编辑器窗口/标签页可能已经被关了，或 dsh 重启过）。`
+          + `重新连：① 桌面版 scratch_open_editor({ app: "desktop" })（零安装零 token，通常最快）；`
+          + `② 网页版：打开 turbowarp.org/editor 并确认 tw-bridge-extension 已装好、token 已填。`
+        ))
+      }
       const id = 'r' + (++reqSeq)
       const timer = setTimeout(() => {
         pending.delete(id)
@@ -312,12 +374,12 @@ export function apply(ctx, config) {
   const snapshots = [] // { at, sessionId, label, projectJson, bytes }（内存最近快照，盘上有全量）
   let snapBytes = 0
   // M1 持久化：快照写盘到 $DSH_HOME/scratch-snapshots/（dsh 重启后仍可救）
-  // config.snapshotsDir 可以把它挪到别的盘（大项目一份 project.json 就 7MB，别都堆系统盘上）
-  const snapDir = config.snapshotsDir
-    ? resolve(String(config.snapshotsDir))
+  // cfg.snapshotsDir 可以把它挪到别的盘（大项目一份 project.json 就 7MB，别都堆系统盘上）
+  const snapDir = cfg.snapshotsDir
+    ? resolve(String(cfg.snapshotsDir))
     : join(process.env.DSH_HOME || (homedir() + '/.dsh'), 'scratch-snapshots')
-  const MAX_SNAP_MEM_MB = Number(config.maxSnapshotMemMb) || 64 // 内存里最多留多少 MB 的快照
-  const MAX_SNAP_DISK_MB = Number(config.maxSnapshotDiskMb) || 256 // 盘上最多留多少 MB
+  const MAX_SNAP_MEM_MB = Number(cfg.maxSnapshotMemMb) || 64 // 内存里最多留多少 MB 的快照
+  const MAX_SNAP_DISK_MB = Number(cfg.maxSnapshotDiskMb) || 256 // 盘上最多留多少 MB
   const snapBytesOf = (pj) => { try { return JSON.stringify(pj).length } catch { return 0 } }
   async function takeSnapshot(sessionId, label) {
     const pj = await call(sessionId, 'snapshot')
@@ -326,7 +388,7 @@ export function apply(ctx, config) {
     snapshots.unshift(snap)
     snapBytes += bytes
     // 两个上限都管：条数（防止小项目刷屏）+ 总字节（防止大项目吃爆内存）
-    while (snapshots.length > config.maxSnapshots || (snapBytes > MAX_SNAP_MEM_MB * 1024 * 1024 && snapshots.length > 1)) {
+    while (snapshots.length > cfg.maxSnapshots || (snapBytes > MAX_SNAP_MEM_MB * 1024 * 1024 && snapshots.length > 1)) {
       snapBytes -= snapshots.pop().bytes
     }
     // 落盘（失败不阻塞操作，只打日志）
@@ -339,7 +401,7 @@ export function apply(ctx, config) {
       const files = readdirSync(snapDir).filter(f => f.startsWith(sessionId + '-')).sort()
       const sizeOf = (f) => { try { return statSync(join(snapDir, f)).size } catch { return 0 } }
       let total = files.reduce((n, f) => n + sizeOf(f), 0)
-      while (files.length > config.maxSnapshots * 2 || (total > MAX_SNAP_DISK_MB * 1024 * 1024 && files.length > 1)) {
+      while (files.length > cfg.maxSnapshots * 2 || (total > MAX_SNAP_DISK_MB * 1024 * 1024 && files.length > 1)) {
         const victim = files.shift()
         total -= sizeOf(victim)
         unlinkSync(join(snapDir, victim))
@@ -392,7 +454,7 @@ export function apply(ctx, config) {
   }
 
   async function guardedWrite(sessionId, op, args, label, preview) {
-    const safety = config.safety || 'preview'
+    const safety = cfg.safety || 'preview'
     if (safety === 'suggest') {
       return { mode: 'suggest', hint: '当前为 suggest 档：只把改动作为建议交给用户，不落项目。', plan: { op, args }, preview }
     }
@@ -403,7 +465,7 @@ export function apply(ctx, config) {
   // ---------------- Skill 区：Scratch 实践经验库 ----------------
   // 内置 skill（插件包 skills/ 目录）首启时复制到 $DSH_HOME/scratch-skills/，
   // 之后 agent/用户自由编辑，插件升级不覆盖（除非带 .reset 标记）。
-  // 开关三层：config.skillsEnabled（总闸）→ .enabled.json（单文件开关）→ agent 自主选读。
+  // 开关三层：cfg.skillsEnabled（总闸）→ .enabled.json（单文件开关）→ agent 自主选读。
   const skillDir = join(process.env.DSH_HOME || (homedir() + '/.dsh'), 'scratch-skills')
   const builtinSkillDir = join(dirname(fileURLToPath(import.meta.url)), 'skills')
   const skillStateFile = join(skillDir, '.enabled.json')
@@ -485,7 +547,7 @@ export function apply(ctx, config) {
     const tried = []
     const push = (p) => { if (p) tried.push(p); return p }
     const cands = [
-      push(config.desktopPath),
+      push(cfg.desktopPath),
       push(process.env.TURBOWARP_DESKTOP),
       push(join(process.env.LOCALAPPDATA || '', 'Programs', 'TurboWarp', 'TurboWarp.exe')),
       push(join(process.env['ProgramFiles'] || '', 'TurboWarp', 'TurboWarp.exe')),
@@ -524,39 +586,81 @@ export function apply(ctx, config) {
     } catch { return 0 }
   }
 
-  /** 起一个分离进程（不阻塞、不弹控制台）。Windows 下 .cmd/.bat 不能直接 spawn，得经 cmd.exe */
-  function spawnDetached(cmd, args) {
+  /**
+   * 起一个分离进程（不阻塞、不弹控制台）。
+   * ⚠️ `windowsHide` 只该用给 **控制台**（.cmd/.bat、cmd /c start）——
+   *    对 GUI 程序（TurboWarp.exe / chrome.exe）带上它，窗口会以 SW_HIDE 状态被创建：
+   *    进程在、CDP 连得上、积木也改得了，但用户屏幕上什么都看不到。
+   *    真机踩过（窗口 vis=False、rect 明明在屏幕内、任务栏没图标），A/B 验过：
+   *    同一条命令去掉这个字段就正常显示。
+   */
+  function spawnDetached(cmd, args, { hide = false } = {}) {
     const isBatch = process.platform === 'win32' && /\.(cmd|bat)$/i.test(cmd)
     const realCmd = isBatch ? 'cmd.exe' : cmd
     const realArgs = isBatch ? ['/c', cmd, ...args] : args
-    const child = spawn(realCmd, realArgs, { detached: true, stdio: 'ignore', windowsHide: true })
+    const child = spawn(realCmd, realArgs, { detached: true, stdio: 'ignore', windowsHide: hide })
     child.on('error', () => {}) // 失败靠调用方超时兜底，别让未处理的 error 崩掉插件
     child.unref()
     return child.pid
   }
 
-  /** 打开外部目标。config.browserPath 可指定浏览器（Windows 下也接受 .cmd/.bat 包装脚本） */
+  /** 打开外部目标。cfg.browserPath 可指定浏览器（Windows 下也接受 .cmd/.bat 包装脚本） */
   function openTarget(target, kind) {
     if (kind === 'desktop') return spawnDetached(target, [])
-    const exe = config.browserPath
+    const exe = cfg.browserPath
     if (exe) return spawnDetached(exe, [target])
-    if (process.platform === 'win32') return spawnDetached('cmd.exe', ['/c', 'start', '', target])
+    // `start` 只是个启动器：这里藏掉的是它自己的控制台，被启动的浏览器照常显示
+    if (process.platform === 'win32') return spawnDetached('cmd.exe', ['/c', 'start', '', target], { hide: true })
     if (process.platform === 'darwin') return spawnDetached('open', [target])
     return spawnDetached('xdg-open', [target])
+  }
+
+  // ---------------- 窗口可见性（Win32，Windows only，失败静默） ----------------
+  // 为什么插件自己要看窗口：桌面版可能被以隐藏状态拉起（见 spawnDetached 注释），而
+  // `MainWindowHandle`、`document.visibilityState` 都**查不出来**（前者隐藏态恒为 0，
+  // 后者在 Electron 里照样是 visible）。唯一可靠的是 EnumWindows + IsWindowVisible，
+  // 所以这里调 win32-window.ps1（附带 ShowWindow 修复）。
+  const WIN32_PROBE = join(dirname(fileURLToPath(import.meta.url)), 'win32-window.ps1')
+  let win32Unavailable = false
+  function desktopWindowInfo({ pid, show = false } = {}) {
+    if (process.platform !== 'win32' || win32Unavailable || !existsSync(WIN32_PROBE)) return null
+    const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', WIN32_PROBE]
+    if (pid) args.push('-TargetPid', String(pid))
+    else args.push('-ImageName', 'TurboWarp')
+    if (show) args.push('-Show')
+    try {
+      const out = execFileSync('powershell', args, { encoding: 'utf8', timeout: 8000, windowsHide: true })
+      const list = JSON.parse(out.trim() || '[]')
+      const main = list.filter((w) => w && w.cls === 'Chrome_WidgetWin_1' && w.title)
+      const winner = main.find((w) => /TurboWarp/i.test(w.title)) || main[0]
+      return winner || null
+    } catch (e) {
+      // 只报一次：沙箱里 powershell 可能起不来，不该每条日志都刷
+      if (!win32Unavailable) {
+        win32Unavailable = true
+        log.warn('查不了窗口可见性（powershell 调不起来：%s）；不影响读写积木，只是看不到「窗口是否显示」', e.message)
+      }
+      return null
+    }
   }
 
   /** 没会话时给 AI 的「怎么让用户接上」信息包（list_sessions 和 open_editor 共用） */
   function setupPayload() {
     return {
+      // 两条路一起给：桌面版通常最快（零安装零 token），网页版适合用户本来就在浏览器里改
+      firstChoice: '最快：scratch_open_editor({ app: "desktop", path: "作品.sb3" }) —— 零安装、零 token，'
+        + '我直接连本机 TurboWarp Desktop（CDP 直连），读写积木、存盘都能干。本机没装桌面版再看下面那条。',
+      webVersion: `网页版：Chrome/Edge 打开 chrome://extensions → 开发者模式 → 加载已解压的扩展程序 → 选 packages/tw-bridge-extension`
+        + `；然后点扩展「详情 → 扩展程序选项」把 token 粘进去（${bridgeToken}）；再打开 https://turbowarp.org/editor 。`,
       token: bridgeToken,
       tokenFile: bridgeTokenFile,
       tokenIsNew: bridgeTokenIsNew || undefined,
-      step1: '（只用 app=browser 这条路才需要）Chrome/Edge 打开 chrome://extensions → 开发者模式 → 加载已解压的扩展程序 → 选 packages/tw-bridge-extension',
+      step1: '（只有网页版这条路需要扩展）chrome://extensions → 开发者模式 → 加载已解压的扩展程序 → packages/tw-bridge-extension',
       step2: `点扩展的「详情 → 扩展程序选项」，把 token 粘进去保存：${bridgeToken}`,
       step3: '打开 https://turbowarp.org/editor ，F12 应看到 [dsh-bridge] connected & authenticated',
       // 零安装的那条路：本机有 TurboWarp Desktop 就用它，不需要扩展也不需要 token
-      easierAlternative: '不想装扩展就用 scratch_open_editor({ app: "desktop" })：启动本机 TurboWarp Desktop 并走 CDP 直连（零安装、零 token），AI 一样能读写积木；'
-        + '用户想自己开窗口也行 —— 用仓库里的「启动TurboWarp(AI可接管).cmd」启动，我照样能接管他开的那份',
+      easierAlternative: '用户想自己开窗口也行 —— 用仓库里的「启动TurboWarp(AI可接管).cmd」启动（带固定调试端口 31821），'
+        + '我照样能接管他开的那份（scratch_open_editor({ app: "desktop" }) 会先探这个端口）',
       recentRejected: rejectedConnections.length ? rejectedConnections : undefined
     }
   }
@@ -633,6 +737,11 @@ export function apply(ctx, config) {
         debugPort: port
       })
       const sess = sessions.get(sid)
+      // 记下进程/端口：后面查窗口可见性（list_sessions / 再次 open_editor）都要用
+      if (sess) {
+        if (launched.pid) sess.meta.pid = launched.pid
+        sess.meta.debugPort = port
+      }
       // ⚠️ 桌面版冷启动是"GUI 先出来、项目后加载"：刚接上时 vm 里可能**一个角色都没有**。
       //    这时候回报"就绪"会误导 AI 往不存在的角色里塞积木（真机踩过）。所以等 vm 里
       //    真有角色了再回报 ready（上限也用 waitMs 兜住）。
@@ -656,6 +765,26 @@ export function apply(ctx, config) {
         target: handle.target && handle.target.url,
         meta,
         path: wantPath || undefined
+      }
+      // 窗口可见性：连上了 ≠ 用户看得见。隐藏态会自动 ShowWindow 救回来，
+      // 并把「救之前/之后」都报出来（AI 一开始就能跟用户说清楚，而不是陪他猜）。
+      const before = desktopWindowInfo({ pid: launched.pid, show: false })
+      if (before) {
+        sess.window = before
+        out.window = before
+        if (!before.visible || before.minimized) {
+          const after = desktopWindowInfo({ pid: before.pid, show: true })
+          if (after) {
+            sess.window = after
+            out.window = after
+            out.windowRepair = !before.visible
+              ? (after.visible
+                  ? '窗口原本是**隐藏的**（EnumWindows: visible=false），已调 ShowWindow 显示出来'
+                  : '窗口原本是隐藏的，ShowWindow 没救回来 —— 让用户看任务栏/按 Alt+Tab 找「TurboWarp Desktop」')
+              : (after.minimized ? '窗口是最小化的，ShowWindow 还原也没成功' : '窗口原本是最小化的，已还原并置前')
+            if (!after.visible) out.windowHidden = true
+          }
+        }
       }
       if (wantPath) {
         try { out.loaded = await loadFileIntoSess(sid, wantPath) } catch (e) { out.loadError = e.message }
@@ -696,16 +825,32 @@ export function apply(ctx, config) {
           sessions: [],
           // 没有会话时把首次配置需要的东西一次性给全，AI 可以直接照着念给用户
           setup: setupPayload(),
-          hint: '先让用户装扩展并填 token；也可以直接调 scratch_open_editor 帮用户把编辑器打开'
+          hint: '两条路：① 最快 scratch_open_editor({ app: "desktop", path }) —— 零安装零 token，直接连本机 TurboWarp Desktop；'
+            + '② 网页版要先装 tw-bridge-extension 并填 token（见 setup.webVersion）。'
         }
       }
       const list = []
       for (const [id, s] of sessions) {
         const meta = await call(id, 'project_meta').catch(() => null)
-        list.push({ sessionId: id, meta: s.meta, detail: meta })
+        const entry = { sessionId: id, meta: s.meta, detail: meta }
+        // 连上了 ≠ 用户看得见：桌面版会话顺手查一次窗口可见性（约 0.3-0.6s，只在这条路上查）
+        if (s.cdp) {
+          const win = desktopWindowInfo({ pid: s.meta && s.meta.pid, show: false })
+          if (win) {
+            s.window = win
+            entry.window = win
+            if (!win.visible) {
+              entry.windowHint = '窗口在屏幕上**不可见**（EnumWindows: visible=false）—— 用户看不到编辑器不是错觉。'
+                + '再调一次 scratch_open_editor({ app: "desktop" }) 会顺手 ShowWindow 把它显示出来。'
+            } else if (win.minimized) {
+              entry.windowHint = '窗口是最小化的'
+            }
+          }
+        }
+        list.push(entry)
       }
       // 轻提示：skill 区存在（不注入内容，agent 自主决定是否读）
-      const skills = config.skillsEnabled === false ? null : listSkills()
+      const skills = cfg.skillsEnabled === false ? null : listSkills()
       return { sessions: list, skillHint: skills && skills.length ? `有 ${skills.length} 篇 Scratch 实践经验可用（scratch_skills list，不强制）` : null }
     }
   }))
@@ -765,6 +910,16 @@ export function apply(ctx, config) {
       if (sessions.size && !args?.force) {
         const sid = activeSession()
         const out = { alreadyConnected: true, sessionId: sid, sessions: [...sessions.keys()], path: wantPath || undefined }
+        // 顺带确认一下"用户到底看得到窗口吗"（桌面版会话才有；隐藏态直接救回来）
+        const sess = sessions.get(sid)
+        if (sess && sess.cdp) {
+          const win = desktopWindowInfo({ pid: sess.meta && sess.meta.pid, show: true })
+          if (win) {
+            sess.window = win
+            out.window = win
+            if (!win.visible) out.windowHint = '窗口在屏幕上不可见，ShowWindow 也没救回来 —— 让用户看任务栏 / Alt+Tab 找「TurboWarp Desktop」'
+          }
+        }
         if (wantPath) {
           try { out.loaded = await loadFileIntoSess(sid, wantPath) } catch (e) { out.loadError = e.message }
         }
@@ -781,7 +936,7 @@ export function apply(ctx, config) {
         // 先看"固定调试端口"上有没有一个现成的可接管实例 —— 用户可以用仓库里的
         // `启动TurboWarp(AI可接管).cmd` 自己开一份（那条启动命令带 --remote-debugging-port=31821），
         // 之后 AI 就能直接接管**用户自己开的那份**，而不是非要 AI 再开一个窗口。
-        const probePort = Number(config.desktopDebugPort) || DESKTOP_DEBUG_PORT
+        const probePort = Number(cfg.desktopDebugPort) || DESKTOP_DEBUG_PORT
         const existing = await probeCdp(probePort)
         if (existing.ok) {
           log.info('发现可接管的桌面版实例（调试端口 %d：%s）', probePort, existing.browser)
@@ -1069,8 +1224,8 @@ export function apply(ctx, config) {
     },
     output: jsonOut,
     async execute(args) {
-      if (config.skillsEnabled === false) {
-        return { skillsDisabled: true, hint: '用户关闭了 skill 功能（config.skillsEnabled=false）' }
+      if (cfg.skillsEnabled === false) {
+        return { skillsDisabled: true, hint: '用户关闭了 skill 功能（cfg.skillsEnabled=false）' }
       }
       const action = args?.action || 'list'
       if (action === 'list') {

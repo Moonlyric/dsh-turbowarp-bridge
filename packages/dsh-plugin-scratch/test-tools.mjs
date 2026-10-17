@@ -350,6 +350,69 @@ t('已经带标签的消息不会被贴第二层', JSON.parse(tagForPage(JSON.st
 t('{type:"pong"} 这类控制消息原样透传（页面本来就会忽略未知标签）',
   tagForPage('{"type":"pong"}') === '{"type":"pong"}')
 
+// ==================== 10. 「能被 DSH 插件页管起来」的打包契约 ====================
+// 这一节守的是**安装形态**，不是运行时行为：插件页只列组合包、只给有 volatile 字段的
+// 插件渲染配置表单、只给注册了 plugins.row.config 的行显示「配置」按钮。
+// 三条里任何一条退化，用户那边就是「插件页里没有它 / 开关用不了 / 设置参数用不了」，
+// 而运行时测试全绿也发现不了（上一版正是如此，真机才暴露）。
+console.log('\n[10] 打包契约：组合包 / 配置表单 / 浏览器半侧')
+const PKG_DIR = dirname(fileURLToPath(import.meta.url))
+const pkgJson = JSON.parse(readFileSync(join(PKG_DIR, 'package.json'), 'utf8'))
+t('声明了 dsh.bundle.patch（否则它不是组合包，插件页里根本不列）',
+  !!(pkgJson.dsh && pkgJson.dsh.bundle && pkgJson.dsh.bundle.patch), JSON.stringify(pkgJson.dsh))
+t('声明了 dsh.client.platform=web（否则插件页没有配置控件）',
+  !!(pkgJson.dsh && pkgJson.dsh.client && pkgJson.dsh.client.platform === 'web'), JSON.stringify(pkgJson.dsh))
+t('exports 里导出了 ./client（宿主按这个路径取浏览器半侧）',
+  !!(pkgJson.exports && pkgJson.exports['./client'] === './lib/client.js'), JSON.stringify(pkgJson.exports))
+t('依赖里不再出现 @deepseek-ai/*（宿主提供；写进 deps 会遮蔽运行时版本，把 tools 行搞挂）',
+  Object.keys(pkgJson.dependencies || {}).every(k => !k.startsWith('@deepseek-ai/')), JSON.stringify(pkgJson.dependencies))
+t('engines.dsh 声明了（版本不合时宿主会跳过组合包，提前写清楚省得猜）',
+  !!(pkgJson.engines && pkgJson.engines.dsh), JSON.stringify(pkgJson.engines))
+
+const Config = mod.Config
+t('导出了 Config（dsh 的 settings 服务靠它生成配置表单）', !!Config, typeof Config)
+const configDict = (Config && (Config.dict || (Config.meta && Config.meta.dict))) || {}
+const configKeys = Object.keys(configDict)
+t('Config 有 10 个字段（与配置页表单一一对应）', configKeys.length === 10, configKeys.join(','))
+const nonVolatile = configKeys.filter(k => !(configDict[k] && configDict[k].meta && configDict[k].meta.volatile))
+t('所有字段都是 volatile（否则 settings 报「没有 volatile 字段」，配置页直接不出现）',
+  nonVolatile.length === 0, 'not volatile: ' + nonVolatile.join(','))
+
+const clientSrc = readFileSync(join(PKG_DIR, 'lib', 'client.js'), 'utf8')
+t('浏览器半侧是 __ModuleLoader__ 的惰性 bundle（宿主只认这种格式）',
+  clientSrc.includes('window.__ModuleLoader__.load(') && clientSrc.includes('factory:'))
+t('浏览器半侧的模块 id 就是包名（写错 = 挂不上 Loader 行）',
+  clientSrc.includes(`id: '${pkgJson.name}'`), pkgJson.name)
+t('注册的是 plugins.row.config 这个 keyed slot', clientSrc.includes("'plugins.row.config'"))
+t('slot key 带 <包名>#<行 id> 结构（插件页按这个 key 找配置页）',
+  clientSrc.includes('#${ROW_ID}') || clientSrc.includes('#scratch'), '')
+t('浏览器半侧导出了 apply（cordis 插件形态）',
+  clientSrc.includes('exports.apply = apply') && clientSrc.includes('exports.inject'))
+t('浏览器半侧只 require 外壳共享模块表里的东西（react / 官方 client 包）',
+  (clientSrc.match(/require\(['"]([^'"]+)['"]\)/g) || []).every(m => /require\(['"](react|react\/jsx-runtime|@deepseek-ai\/dsh-client-[^'"]+)['"]\)/.test(m)),
+  (clientSrc.match(/require\(['"]([^'"]+)['"]\)/g) || []).join(','))
+
+t('带了 Win32 窗口探针（隐藏窗口只能靠 EnumWindows 查出来）',
+  existsSync(join(PKG_DIR, 'win32-window.ps1')))
+const psBuf = existsSync(join(PKG_DIR, 'win32-window.ps1')) ? readFileSync(join(PKG_DIR, 'win32-window.ps1')) : Buffer.alloc(0)
+const psProbe = psBuf.toString('utf8')
+t('探针用的是 EnumWindows + IsWindowVisible（MainWindowHandle 对隐藏窗口恒为 0，会误判）',
+  psProbe.includes('EnumWindows') && psProbe.includes('IsWindowVisible'))
+t('探针能修：ShowWindow 用 SW_RESTORE/SW_SHOW', psProbe.includes('ShowWindow'))
+t('探针文件带 UTF-8 BOM（Windows PowerShell 5.1 不带 BOM 会把中文读成乱码 → 语法错）',
+  psBuf.slice(0, 3).toString('hex') === 'efbbbf', psBuf.slice(0, 3).toString('hex'))
+
+const indexSrc = readFileSync(join(PKG_DIR, 'index.js'), 'utf8')
+t('GUI 启动不再硬编码 windowsHide: true（带了窗口会以隐藏态创建，用户什么都看不到）',
+  !/spawn\([^;\n]*windowsHide:\s*true/.test(indexSrc), '')
+t('spawnDetached 的控制台隐藏是「按需」的（hide 参数 + windowsHide: hide）',
+  /function spawnDetached\(cmd, args, \{ hide = false \}/.test(indexSrc) && indexSrc.includes('windowsHide: hide'))
+t('桌面版连上后报窗口可见性（window 字段）', indexSrc.includes('out.window = before'))
+t('隐藏态会自动 ShowWindow 救回来（windowRepair / windowHidden）',
+  indexSrc.includes('out.windowRepair') && indexSrc.includes('out.windowHidden'))
+t('会话失效的错误提示同时给两条路（桌面版 / 网页版）',
+  /scratch_open_editor\(\{ app: "desktop" \}\)/.test(indexSrc) && indexSrc.includes('tw-bridge-extension'))
+
 console.log(`\n===== 插件工具单测: ${pass} pass / ${fail} fail =====`)
 try { rmSync(STUB_DIR, { recursive: true, force: true }); rmSync(HOME, { recursive: true, force: true }) } catch {}
 process.exit(fail ? 1 : 0)

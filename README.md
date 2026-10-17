@@ -76,35 +76,34 @@ dsh 插件（Node，19 个 scratch_* 工具 + WebSocket 桥 :31820）
 > Edge 上唯一那条"失败"是验收脚本自己的断言：`Extensions.loadUnpacked` 是 Chrome 专属的 CDP 域，
 > Edge 没有（脚本会自动回退 `--load-extension`，扩展照样装上了）。那条断言现在改成"两条路有一条走通"。
 
-### 2. dsh 插件
+### 2. dsh 插件（走官方安装，别手改 YAML）
 
-把 `packages/dsh-plugin-scratch` 复制到你的 dsh profile 下：
+**在 dsh 的「插件」页里装**：侧栏 **插件** → **添加插件** → 把这一行的绝对路径粘进去：
 
 ```
-%APPDATA%\dsh-desktop\harness\profiles\local-plugins\dsh-plugin-scratch
+G:\09 Eutopia\demo\DSH Turbowarp插件\packages\dsh-plugin-scratch
 ```
 
-并建一个同名包链接（这样设置页里显示的是插件名，而不是 `index.js`）：
+（这就是「从本地目录安装一个组合包」：dsh 会 `pnpm add file:<那个路径>`，把包装进
+`profiles\<profile>\node_modules`，并加进 `dsh.profile.bundles`。）
 
-```powershell
-New-Item -ItemType Junction `
-  -Path "$env:APPDATA\dsh-desktop\harness\profiles\node_modules\dsh-plugin-scratch" `
-  -Target "$env:APPDATA\dsh-desktop\harness\profiles\local-plugins\dsh-plugin-scratch"
-```
+装完插件页里会出现一张 `dsh-plugin-scratch` 卡片，点进去是：
 
-然后在 `profiles\desktop\cordis.patch.yml` 末尾追加：
+- **组合包开关** —— 关掉 = 从 `dsh.profile.bundles` 撤掉，插件停止运行；
+- **`scratch` 这一行** —— 单独关掉 = 只停插件、保留安装（写进 profile patch 的 `disabled`）；
+- **配置**（这一行的配置控件）—— `safety` / `bridgePort` / `desktopPath` / `desktopDebugPort` /
+  `snapshotsDir` / 三个快照上限 / `skillsEnabled` / `browserPath`。改完点保存即写回 profile 的
+  `cordis.patch.yml` 并**立即生效**（端口约 2 秒自动重绑，不用重启 dsh）。
 
-```yaml
-- insert:
-    - id: scratch
-      name: dsh-plugin-scratch
-      config:
-        safety: preview
-        bridgePort: 31820
-        skillsEnabled: true
-```
+为什么不能像以前那样手改 YAML：插件页只列**组合包**（`package.json` 声明了 `dsh.bundle.patch`
+的包）。把手写的 `insert:` 塞进 profile patch 属于「绕过插件管理器的注入」—— 插件能跑，
+但插件页里**根本没有它**，于是开关和配置页全都没有（用户实测踩过）。现在
+`packages/dsh-plugin-scratch/package.json` 自带 `dsh.bundle.patch` + `dsh.client`，profile 的
+patch 里只留一段**配置覆盖**（按 id 整段替换，所以字段要写全）。
 
-重启 dsh。`ws` 和 `@deepseek-ai/dsh-tools` 会从 `profiles/node_modules` 向上解析，不用自己 `npm install`。
+> 宿主提供 `@deepseek-ai/dsh-tools` 和 `@deepseek-ai/schemastery`，插件**不要**把它们写进
+> `dependencies`：写进去会装一份旧版进 profile，把宿主的 `tools` 行顶掉（实测被判版本不兼容，
+> 然后整个插件加载不起来 —— 报错还完全不指向这里）。
 
 ### 3. token 从哪来
 
@@ -126,6 +125,11 @@ New-Item -ItemType Junction `
   返回值里给 `loaded`。
 - 工具会**等编辑器里真有角色了**才回报 `ready: true`：桌面版冷启动是"GUI 先出来、项目后加载"，
   刚接上时 `targets` 可能是空的，直接回报就绪会害 AI 往不存在的角色里塞积木。
+- **窗口到底显示没有，工具自己会看**：返回值里带 `window: { hwnd, visible, minimized, rect, title }`
+  （`EnumWindows` + `IsWindowVisible` 拿的，`Get-Process ... MainWindowHandle` 对隐藏窗口恒返回 0，
+  会得出"没有窗口"的错误结论）。发现窗口是隐藏的会自动 `ShowWindow` 救回来，并回报
+  `windowRepair`；救不回来给 `windowHidden: true` + 让用户按 Alt+Tab 的提示。
+  `scratch_list_sessions` 也会带这个字段，AI 随时能自检"用户看得见吗"。
 - **接管你自己开的那份窗口**：仓库根有个 `启动TurboWarp(AI可接管).cmd`，它和双击 TurboWarp 的
   区别只有一个 —— 多了 `--remote-debugging-port=31821`。以后用它开桌面版，AI 每次
   `app: "desktop"` 都会先探这个固定端口（配置项 `desktopDebugPort` 可改），探到就直接接管
@@ -168,6 +172,21 @@ New-Item -ItemType Junction `
    `socket=open authed=true`，但**每个 op 都超时**（project_meta 15s、snapshot 120s）。
    现在由 `tagForPage()`（`cdp.js`）负责贴标签，并且有单测断言守着。
 
+5. **别用 `windowsHide` 启动 GUI 程序。**
+   `spawn(..., { windowsHide: true })` 会让子进程带着 `SW_HIDE` 的启动信息创建 —— 对 TurboWarp
+   Desktop 这种 Electron 应用，窗口对象**存在、CDP 连得上、积木也能改**，但用户在屏幕上看不到它。
+   最坑的是两个"看起来能判断"的办法都失效：`Get-Process ... MainWindowHandle` 对隐藏窗口恒返回 0
+   （会误判成"没有窗口"），`document.visibilityState` 在 Electron 里照样是 `visible`。
+   只能 `EnumWindows` + `IsWindowVisible`（`packages/dsh-plugin-scratch/win32-window.ps1`）。
+   现在 GUI 启动不带这个字段，并且会回报 `window.visible` / 自动 `ShowWindow` 补救。
+
+6. **第三方插件不要依赖 `@deepseek-ai/*`，而且配置字段必须是 `.volatile()`。**
+   - 依赖 `@deepseek-ai/dsh-tools` 会在 profile 里装一份旧版本，**遮蔽宿主运行时**，
+     宿主的 `tools` 行被判版本不兼容 → 整个插件加载不起来（报错完全不指向这里）。
+   - dsh 的 settings 服务只给「Config schema 里至少有一个 volatile 字段」的条目生成配置表单；
+     普通字段只能在 YAML 里改，插件页上根本不出现配置控件（用户以为"设置参数坏了"）。
+     浏览器半侧还要注册 `plugins.row.config`（key = `<包名>#<行 id>`）才有「配置」入口。
+
 ## 验靶（能自己复跑的自动化）
 
 ```powershell
@@ -179,12 +198,12 @@ cd lab; node test-content-ops.js
 $env:SB3_FIXTURE='<某个 .sb3>'      # 可选：顺带验打开真实作品（断言会更多）
 node real-machine-check.mjs
 
-# 真机层 B：TurboWarp Desktop + CDP 直连（54 条，会真开一个窗口、跑完自动关掉）
+# 真机层 B：TurboWarp Desktop + CDP 直连（61 条，会真开一个窗口、跑完自动关掉）
 node desktop-cdp-check.mjs
 
 # 插件侧
 cd ..\packages\dsh-plugin-scratch
-node test-tools.mjs          # 50 条
+node test-tools.mjs          # 73 条（含打包契约：组合包 / volatile 配置 / 浏览器半侧）
 node test-skills.mjs         # 23 条
 node test-bridge-auth.mjs    # 21 条
 
@@ -201,6 +220,8 @@ TurboWarp 时会 SKIP，不打扰你。
 
 ```
 packages/dsh-plugin-scratch/   dsh 插件：桥服务端 + 19 个工具 + 经验库 + CDP 直连 + 单测
+                               lib/client.js = 浏览器半侧（插件页里的配置表单，手写不用打包）
+                               win32-window.ps1 = 窗口可见性探针（EnumWindows，Windows only）
 packages/tw-bridge-extension/  MV3 扩展：SW 持 socket，内容脚本操作 window.vm
                                （CDP 那条路注的就是这份执行器，靠 lab/sync-executor.mjs 同步副本）
 lab/                           验靶：替身 VM 层 + 真机层（Chrome/Edge）+ 桌面版 CDP 层 + 执行器同步

@@ -1,4 +1,4 @@
-# dsh-plugin-scratch — TurboWarp 桥插件（v0.3.0 · M2 + Skill 区 + CDP 直连）
+# dsh-plugin-scratch — TurboWarp 桥插件（v0.6.0 · 组合包安装 + 插件页配置 + CDP 直连）
 
 DSH（DeepSeek Harness）插件：把 TurboWarp 编辑器接入 agent。
 AI 通过 `scratch_*` 工具读取/修改 Scratch 项目，用户在 TurboWarp 界面里**实时**看到变化。
@@ -30,26 +30,54 @@ AI 通过 `scratch_*` 工具读取/修改 Scratch 项目，用户在 TurboWarp �
 
 ## 装到 dsh（DSH Desktop）
 
-1. 把 `packages/dsh-plugin-scratch` 这个文件夹整个放到 dsh 的 profile 目录下
-   （必须位于 `...\harness\profiles\` 之下一层，否则它上溯不到 `profiles\node_modules`，
-   `@deepseek-ai/*` 解析会失败）。参考路径：
-   `%APPDATA%\dsh-desktop\harness\profiles\local-plugins\dsh-plugin-scratch`
-2. 在该目录执行 `npm install`（装 `ws` + `@deepseek-ai/dsh-tools`）
-3. 在该目录建 `cordis.patch.yml`（内容见本包自带的那份），确认 `name:` 指向插件入口
-4. 重启 DSH Desktop。终端/日志里出现 `TurboWarp bridge plugin loaded` 即加载成功
+**走插件页的官方安装，别手改 YAML。**
 
-`name` 的三种写法（dsh 0.1.2-rc.1 实测）：
+1. dsh 侧栏 → **插件** → **添加插件**（可以点主按钮右边的箭头选「安装第三方插件」）
+2. 把本包的**绝对路径**粘进去（dsh 会 `pnpm add file:<路径>`，把包装进
+   `profiles\<profile>\node_modules` 并加进 `dsh.profile.bundles`）：
+   ```
+   G:\09 Eutopia\demo\DSH Turbowarp插件\packages\dsh-plugin-scratch
+   ```
+3. 装完插件页里会出现 `dsh-plugin-scratch` 卡片：里面对应一个 `scratch` 行，
+   可以**分别开关**（组合包开关 = 停用/启用整个包；行开关 = 只停插件）。
 
-| 写法 | 例子 | 说明 |
+装好之后**不要**再去 `cordis.patch.yml` 里手写 `insert:`。手写 insert 能跑，但插件页里看不到它
+——没有启用/禁用开关、没有配置页（这是真机上踩过的坑）。profile patch 只用来**覆盖配置**：
+
+```yaml
+- id: scratch
+  name: dsh-plugin-scratch
+  config:
+    bridgePort: 31820
+    snapshotsDir: 'G:\某个不占系统盘的地方\scratch-snapshots'
+```
+
+（patch 是按 id **整段替换**，覆盖时要把想保留的字段写全。行本身由本包的
+`cordis.patch.yml` 提供 —— 那是 `dsh.bundle.patch` 声明的组合包层。）
+
+### 插件页里的配置（10 项，改完立即生效）
+
+| 字段 | 默认 | 说明 |
 |---|---|---|
-| 包名 | `dsh-plugin-scratch` | 从 profile 目录做 ESM 解析（需已装进 profile） |
-| 相对路径 | `../local-plugins/dsh-plugin-scratch/index.js` | **相对补丁文件自己所在的目录** |
-| file:// URL | `file:///C:/path/to/index.js` | 绝对路径 |
+| `safety` | `preview` | `preview` 先给 planId 等确认 / `auto` 直接落盘 / `suggest` 只给建议 |
+| `bridgePort` | `31820` | 桥监听端口（扩展那条路用）。改完约 2 秒**自动重绑**，不用重启 |
+| `desktopDebugPort` | `31821` | 「可接管」固定调试端口，与 `启动TurboWarp(AI可接管).cmd` 保持一致 |
+| `desktopPath` | 空 | TurboWarp Desktop 的 exe，留空自动找 |
+| `browserPath` | 空 | 网页版用哪个浏览器，留空 = 系统默认 |
+| `snapshotsDir` | 空 | 快照目录，留空 = 系统临时目录 |
+| `maxSnapshots` | `30` | 内存里最多留几份快照 |
+| `maxSnapshotMemMb` | `64` | 快照内存上限（MB） |
+| `maxSnapshotDiskMb` | `256` | 快照落盘上限（MB） |
+| `skillsEnabled` | `true` | Skill 经验库总开关 |
 
-⚠️ 裸 Windows 路径（`G:\...\index.js`）不被支持，会被当成 `g:` 协议。
+这些字段在 `index.js` 的 `Config` 里都声明了 `.volatile()`：dsh 的 settings 服务**只**为
+volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引用 —— 所以插件每次读配置都取
+最新值，UI 保存后不用重启。浏览器半侧在 `lib/client.js`（手写的 `__ModuleLoader__` bundle，
+注册 `plugins.row.config`，key = `dsh-plugin-scratch#scratch`）。
 
-DSH Desktop 内部固定用自己的单个 `--patch`，所以用户侧没有 `--patch` 这个口子——
-走 profile 目录 + `cordis.patch.yml` 是 Desktop 上的正路。
+⚠️ **不要**把 `@deepseek-ai/dsh-tools`、`@deepseek-ai/schemastery` 写进 `dependencies`：
+宿主会提供它们；写进 deps 会装一份旧版进 profile 并把宿主的 `tools` 行顶掉（版本不兼容 → 整个
+插件加载不起来，报错还完全不指向这里）。
 
 ## 桥的握手 token（必配一次）
 
@@ -175,13 +203,15 @@ DSH Desktop 内部固定用自己的单个 `--patch`，所以用户侧没有 `--
 - `cdp.js` — **CDP 直连**：给桌面版带调试端口启动、注入执行器、`tagForPage()` 贴协议标签
 - `vm-executor.js` — 扩展 `content-main.js` 的**逐字节副本**（CDP 注的就是它；
   改完扩展执行器跑 `node ../lab/sync-executor.mjs` 同步，`test-tools.mjs` 有一致性断言守着）
+- `lib/client.js` — **浏览器半侧**（手写的 __ModuleLoader__ bundle：插件页里的配置表单）
+- `win32-window.ps1` — 窗口可见性探针（EnumWindows + ShowWindow，Windows only）
 - `skills/` — 内置 8 篇经验 + `INDEX.md`
-- `cordis.patch.yml` — dsh 插件层（`name` 三种写法见注释）
+- `cordis.patch.yml` — **组合包层**（`dsh.bundle.patch` 指向它，安装时自动插入 `scratch` 行）
 - `test-skills.mjs` — skill 区单测（23 断言）
 - `test-bridge-auth.mjs` — 桥的握手认证与应答来源校验（21 断言，别删）
 - `test-tools.mjs` — 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 /
   CDP 桌面分支的启动参数与诚实报错 / `tagForPage` 四连 / 执行器副本一致性 / 桥端口被占自愈 /
-  返回值无损 JSON，50 断言）
+  返回值无损 JSON / 打包契约（组合包字段、volatile 配置、浏览器半侧格式、窗口探针），73 断言）
 
 ## 测试状态（2026-10-17 本轮实测，VPN 全程关闭）
 
@@ -189,10 +219,10 @@ DSH Desktop 内部固定用自己的单个 `--patch`，所以用户侧没有 `--
 |---|---|
 | `test-skills.mjs` | 23/23 ✅ |
 | `test-bridge-auth.mjs` | 21/21 ✅ |
-| `test-tools.mjs` | 50/50 ✅ |
-| `../lab/test-content-ops.js` | 112/112 ✅ |
+| `test-tools.mjs` | 73/73 ✅（含打包契约：组合包 / volatile 配置 / 浏览器半侧 / 窗口探针） |
+| `../lab/test-content-ops.js` | 114/114 ✅ |
 | `../lab/real-machine-check.mjs`（真 Chrome / Edge + 真 turbowarp.org；不传 `SB3_FIXTURE`） | 115/115 ✅（Chrome、Edge 各一遍） |
-| `../lab/desktop-cdp-check.mjs`（TurboWarp Desktop + CDP；真开一个窗口、跑完自动关） | 54/54 ✅ |
+| `../lab/desktop-cdp-check.mjs`（TurboWarp Desktop + CDP；真开一个窗口、跑完自动关） | 61/61 ✅（含窗口可见性交叉验证） |
 
 真机那一轮跑的是完整闭环，**19 个工具全覆盖**：唤起编辑器（含"没有会话时给 token 步骤"这条路）
 → 装扩展 → 填 token → 打开 turbowarp.org/editor → 握手认证 → list_sessions → snapshot

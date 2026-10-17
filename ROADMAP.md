@@ -230,6 +230,46 @@ CDP 那条路也有它自己的盲区：`desktop-cdp-check.mjs` 只在装了 Tur
   这条由 `lab` 里的往返测试守住（存进去的东西不能用 = 背包没用）。
 - 和 skill 区的关系：skill 讲"怎么做"，背包给"现成的东西"。两者共用同一套开关/索引习惯。
 
+## 插件页化 + 真实工作反馈（2026-10-17 晚）
+
+### 这一轮做掉的
+
+| 问题 | 处理 |
+|---|---|
+| 插件页里**看不到**本插件 → 开关、配置全用不了 | 包改成标准**组合包**（`dsh.bundle.patch` + `manifestVersion` + `engines.dsh`），改用插件页「添加插件」安装；profile patch 里只留配置覆盖。**手写 `insert:` + junction 那套已删除** |
+| 依赖 `@deepseek-ai/dsh-tools@0.2.0-rc.2` 把宿主 `tools` 行顶挂 | 从 `dependencies` 删除（宿主提供 `dsh-tools` / `schemastery`）；`test-tools.mjs` 有断言守着 |
+| 「设置参数用不了」 | Config schema 10 个字段全部 `.volatile()` + `index.js` 用活视图读配置；新增手写浏览器半侧 `lib/client.js` 注册 `plugins.row.config`（key `dsh-plugin-scratch#scratch`）。保存写回 profile patch，端口约 2 秒自动重绑 |
+| **P0** 桌面版窗口以隐藏态被拉起（用户全程看不到） | 根因是 `spawn(..., windowsHide: true)`；GUI 启动不再带。新增 `win32-window.ps1`（EnumWindows + IsWindowVisible + ShowWindow），`open_editor` / `list_sessions` 回报 `window`，隐藏态自动救 |
+| **P1-2** 无会话/会话失效的错误只推扩展那条路 | 错误提示与 `setup` 都改成「① 桌面版零安装（通常最快）② 网页版扩展」，并说明会话可能是被关掉了 |
+
+### 真实工作反馈里排队的（按代价/价值）
+
+| 编号 | 问题 | 状态 |
+|---|---|---|
+| P1-1 | `scratch_locate` 不接受 `session`/`target`，只在当前编辑目标里搜 → 多角色项目基本不可用 | **待做**（加 target + 跨角色搜索 + 命中后自动切编辑目标） |
+| P1-3 | session 缺窗口可观测性 | ✅ 已做（`window` 字段 + `windowRepair`/`windowHidden`） |
+| P2-1 | 手动带 `--remote-debugging-port` 的实例不会被发现 | 部分：固定端口 `desktopDebugPort`（31821）会被探测并接管；任意端口仍不行（可加 `port` 参数） |
+| P2-2 | `scratch_read_script` 输出爆炸（475KB～7.5MB，连带 variables/lists） | **待做**：`includeVariables:false` / `opcodes` 过滤 / `summary:true` / `limit` |
+| P2-3 | 每个写操作都要 preview→apply 两次往返 | **待做**：`confirmPolicy:"auto"`（会话级或 open_editor 参数） |
+| P2-4 | `open_editor` 没有窗口选项 | 部分：默认自动显示 + 回报可见性；仍缺显式 `showWindow:false` / 摆位 |
+| P3-1 | `sessionId`（`cd-1`）重启即变 | 低优先（可加 `pid:port` 别名） |
+| P3-2 | 写操作返回字段不统一（`added`/`updated`/`deleted`/`applied`） | 低优先（统一成 `{before, after, changed}`） |
+
+### 能力缺口（真实工作暴露的最大一条）
+
+19 个工具全是**静态读写**，而完成一件真活需要闭环：**启动 → 点绿旗 → 交互 → 读运行时 → 量性能 →
+定位/高亮 → 改 → 截图给用户看 → 再量**。缺的入口/出口/度量/批处理，AI 只能自己在外面写脚本补
+（实测补了 36 个文件 / 2334 行，比插件本体还大）。排期：
+
+1. **运行控制**：`scratch_run({greenflag|stop})`、`scratch_click`、`scratch_press_key`、`scratch_state`、
+   `scratch_screenshot`、`scratch_reveal_block`（这批在真机上都被验证过可行：`runtime.greenFlag()`、
+   `ioDevices.mouse.postData`、`Blockly.getMainWorkspace().centerOnBlock`、`Page.captureScreenshot` 180ms）
+2. **批处理**：`scratch_batch({calls:[...]})` —— 一次往返做多件事（实测 7 条命令合并后从
+   「N×20s + N×推理」降到 314ms）
+3. **脚本结构视图**：`scratch_list_scripts`（顶层脚本清单，区分**真脚本**与**游离积木**）、
+   `read_script` 瘦身
+4. **性能**：`scratch_profile({seconds})`（包装 `runtime._step` 量每步耗时，比项目自己的 fps 变量可靠）
+
 ## 以后可以做的（评估过，暂时不做）
 
 | 想法 | 结论 |
