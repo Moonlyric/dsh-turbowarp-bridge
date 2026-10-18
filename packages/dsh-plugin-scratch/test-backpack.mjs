@@ -53,9 +53,10 @@ const exportResult = {
 }
 const opsSeen = []
 let addBlocksArgs = null
+let exportArgs = null
 let snapshotCount = 0
 const pageAnswers = {
-  export_blocks: () => exportResult,
+  export_blocks: (a) => { exportArgs = a; return exportResult },
   add_blocks: (args) => {
     addBlocksArgs = args
     const ids = Object.keys(args.blocks || {})
@@ -158,6 +159,20 @@ r = await call('scratch_backpack', { action: 'save', name: 'pen-text', target: '
 t('overwrite:true 才覆盖，且如实说覆盖了', r.saved === 'pen-text' && r.overwritten === true, JSON.stringify(r).slice(0, 200))
 t('覆盖保留 createdAt（不是把"存了多久"也重置了）', readSnippet('pen-text').createdAt === snippet.createdAt, '')
 // 恢复成完整版本，后面的注入断言要用两条脚本
+await call('scratch_backpack', { action: 'save', name: 'pen-text', target: 'Sprite1', scriptIds: ['sbx_h1', 'sbx_h2'], overwrite: true })
+
+// listLimit 透传：字库那种几万项的表，默认 1000 会存成截断版（取出来少一半字还不报错）
+await call('scratch_backpack', { action: 'save', name: 'pen-text', target: 'Sprite1', scriptIds: ['sbx_h1'], listLimit: 50000, overwrite: true })
+t('save 把 listLimit 透给执行器（大表要能存全）', exportArgs && exportArgs.listLimit === 50000, JSON.stringify(exportArgs))
+// 截断时必须在返回值里明说，别只混在 requires 里写个 1000/42221
+exportResult.requires.lists[0].truncated = true
+exportResult.requires.lists[0].length = 42221
+r = await call('scratch_backpack', { action: 'save', name: 'pen-text', target: 'Sprite1', scriptIds: ['sbx_h1'], overwrite: true })
+t('列表被截断时单独报出来（并提供 listLimit 的补救办法）',
+  Array.isArray(r.truncatedLists) && /42221/.test(String(r.warnings)) && /listLimit/.test(String(r.warnings)),
+  JSON.stringify({ truncatedLists: r.truncatedLists, warnings: r.warnings }))
+delete exportResult.requires.lists[0].truncated
+delete exportResult.requires.lists[0].length
 await call('scratch_backpack', { action: 'save', name: 'pen-text', target: 'Sprite1', scriptIds: ['sbx_h1', 'sbx_h2'], overwrite: true })
 
 // ==================== 4. 列 / 读 / 删 ====================

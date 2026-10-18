@@ -1734,6 +1734,7 @@ export function apply(ctx, config) {
       scriptIds: { type: 'array', description: 'save：要存的脚本根 id（顶层块 id，从 scratch_list_scripts 拿）' },
       blockIds: { type: 'array', description: 'save：要存的块 id（会自动连带 next 链/嵌套块/影子块）' },
       all: { type: 'boolean', description: 'save：把这个角色的全部脚本都存进来（想存整个角色时用）' },
+      listLimit: { type: 'number', description: 'save：列表最多带多少项（默认 1000）。字库/字模这种几万项的大表要显式给大（如 50000），否则存进去的是截断版 —— 取出来会少一半字且不报错' },
       title: { type: 'string', description: 'save：一句话标题（给人看）' },
       description: { type: 'string', description: 'save：什么时候用它（相当于 skill 的「适用场景」）' },
       notes: { type: 'string', description: 'save：怎么用/怎么改参数（会原样带给下次的自己）' },
@@ -1784,7 +1785,8 @@ export function apply(ctx, config) {
           target: args?.target,
           scriptIds: Array.isArray(args?.scriptIds) ? args.scriptIds : undefined,
           blockIds: Array.isArray(args?.blockIds) ? args.blockIds : undefined,
-          all: args?.all === true ? true : undefined
+          all: args?.all === true ? true : undefined,
+          listLimit: Number.isFinite(args?.listLimit) && args.listLimit > 0 ? Math.floor(args.listLimit) : undefined
         }, 60000)
         const now = new Date().toISOString()
         const snippet = {
@@ -1813,6 +1815,9 @@ export function apply(ctx, config) {
         mkdirSync(backpackDir, { recursive: true })
         writeFileSync(file, text)
         rebuildBackpackIndex()
+        // 列表被截断是"取出来少一半字还不报错"那类坑，单独拎出来说，别混在 warnings 里
+        const truncatedLists = (exp.requires.lists || []).filter(v => v.truncated)
+          .map(v => `${v.name}（存了 ${(v.value || []).length} / 共 ${v.length}）`)
         return {
           saved: name,
           file,
@@ -1824,8 +1829,11 @@ export function apply(ctx, config) {
             lists: (exp.requires.lists || []).map(v => `${v.name}(${(v.value || []).length}${v.truncated ? '/' + v.length : ''})`),
             broadcasts: (exp.requires.broadcasts || []).map(v => v.name)
           },
+          truncatedLists: truncatedLists.length ? truncatedLists : undefined,
           overwritten: !!prev,
-          warnings: exp.warnings,
+          warnings: truncatedLists.length
+            ? [...(exp.warnings || []), `列表被截断了：${truncatedLists.join('、')} —— 取出来会缺项且不报错。要存全就带 listLimit（如 listLimit: ${Math.max(...(exp.requires.lists || []).map(v => v.length || 0))}）重存一次。`]
+            : exp.warnings,
           hint: '存好了。下次用 scratch_backpack_load({ name }) 直接注进项目（变量/列表会按名字接上或补建）。'
         }
       }
