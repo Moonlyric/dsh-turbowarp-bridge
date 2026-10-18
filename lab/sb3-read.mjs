@@ -59,6 +59,35 @@ export function inputValue (inp) {
   return undefined
 }
 
+// sb3 的内联原始值编号：4-10 是常量（数字/角度/颜色/文本…），11-13 是**报告器**
+// （11 广播名、12 变量、13 列表）。project.json 里这三类会被压成 `[12,"名字","id"]`
+// 这样的三元组直接放进输入槽，不产生独立的块条目 —— 所以"在块表里查不到 id"并不等于
+// "这里是个常量"。早年就栽在这上面：把 `变量 = 10` 全数成了"两边都写死的比较"。
+const PRIM_LITERAL = new Set([4, 5, 6, 7, 8, 9, 10])
+const PRIM_REPORTER = new Set([11, 12, 13])
+
+/**
+ * 输入槽里到底是什么：'block'（指到块表里的块）/ 'reporter'（内联变量、列表、广播名）/
+ * 'literal'（内联常量）/ 'none'（空槽）。
+ */
+export function inputKind (inp, map) {
+  if (!Array.isArray(inp)) return 'none'
+  const v = inp[1]
+  if (typeof v === 'string') return map && map.has(v) ? 'block' : 'literal'
+  if (Array.isArray(v)) {
+    if (PRIM_REPORTER.has(v[0])) return 'reporter'
+    if (PRIM_LITERAL.has(v[0])) return 'literal'
+    return 'literal'
+  }
+  return 'none'
+}
+
+/** 这个输入槽是不是"写死的常量"（不含变量/列表/广播名这类报告器） */
+export function isConstant (inp, map) {
+  const k = inputKind(inp, map)
+  return k === 'literal' || k === 'none'
+}
+
 /** 字段值（下拉菜单真的落成的值，如 BROADCAST_OPTION / CLONE_OPTION / KEY_OPTION） */
 export function fieldValue (block, name) {
   const f = block && block.fields && block.fields[name]

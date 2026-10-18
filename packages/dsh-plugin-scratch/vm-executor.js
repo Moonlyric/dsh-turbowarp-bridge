@@ -638,9 +638,13 @@
     }
     return null
   }
-  /** opcode → {inputs, fields, source}；procedures_call 的输入名是参数 id，静态推不出来，返回 null */
+  /** opcode → {inputs, fields, source}；自定义块的输入名是**参数 id**，静态推不出来，返回 null */
+  // procedures_call / procedures_prototype 的输入槽键名就是 mutation.argumentids 里那些随机串，
+  // 没有任何静态形状表能对上。早先只放过了 procedures_call，结果**带自定义块的片段一律注不进去**
+  // （背包里 142 块的字库引擎就是这么被拦下的），报的还是"输入名写错了"这种最误导的错。
+  const ARG_ID_OPCODES = new Set(['procedures_call', 'procedures_prototype'])
   function opcodeSpec(vm, opcode) {
-    if (opcode === 'procedures_call') return null
+    if (ARG_ID_OPCODES.has(opcode)) return null
     if (opcodeSpecCache.has(opcode)) return opcodeSpecCache.get(opcode) || null
     let spec = null
     if (INPUTS_BY_OPCODE[opcode]) {
@@ -1266,14 +1270,16 @@
     const listCap = Math.max(0, Number(opts && opts.listLimit) || 1000)
     const seen = new Set()
     // 在**活变量**里查（不再读 sb3）：id 命中就用它，否则按名字 + 类型找
+    // 同时记下"它在谁身上"—— 舞台上的是全局，角色上的是局部。背包要能原样搬回去：
+    // 字库那种 5MB 的表是**全局**的，一个角色一份的话第二个角色就再也接不上了。
     const lookup = (kind, name, id) => {
       for (const owner of [t, stage]) {
         if (!owner) continue
         const vars = owner.variables || {}
-        if (id && vars[id] && (KIND_BY_VAR_TYPE[vars[id].type] || 'variable') === kind) return vars[id]
+        if (id && vars[id] && (KIND_BY_VAR_TYPE[vars[id].type] || 'variable') === kind) return { v: vars[id], owner }
         for (const v of Object.values(vars)) {
           if (!v || v.name !== name) continue
-          if ((KIND_BY_VAR_TYPE[v.type] || 'variable') === kind) return v
+          if ((KIND_BY_VAR_TYPE[v.type] || 'variable') === kind) return { v, owner }
         }
       }
       return null
@@ -1285,11 +1291,13 @@
       if (seen.has(key)) return
       seen.add(key)
       const found = lookup(kind, name, arr[idIdx])
+      const v = found && found.v
       const item = { name }
+      if (kind !== 'broadcast') item.scope = found && found.owner && found.owner.isStage ? 'global' : 'local'
       if (kind === 'broadcast') {
         // 广播只有名字，没有值
       } else if (kind === 'list') {
-        const full = Array.isArray(found && found.value) ? found.value : []
+        const full = Array.isArray(v && v.value) ? v.value : []
         // 列表封顶：字模这类列表只有几十项，但脚本也可能引用 5000 项的巨型列表 ——
         // 整份搬进背包就是把 7MB 又搬一次。超了截断 + 明确标出来。
         if (full.length > listCap) {
@@ -1300,7 +1308,7 @@
           item.value = full
         }
       } else {
-        item.value = found && found.value !== undefined ? found.value : ''
+        item.value = v && v.value !== undefined ? v.value : ''
       }
       out[REFS_KEY[kind]].push(item)
     })
@@ -1350,9 +1358,22 @@
       }
       return undefined
     }
+    // 片段可以要求"这个变量/列表挂舞台上"（scope:'global'）：字库那种几 MB 的表必须全局，
+    // 否则注进第二个角色时又是一份副本，两边内容还会各自漂移。
+    const declaredScope = (kind, name) => {
+      if (!Array.isArray(declared)) return undefined
+      for (const d of declared) {
+        if (!d || typeof d !== 'object' || d.name !== name) continue
+        const dk = d.type === 'list' ? 'list' : d.type === 'broadcast' ? 'broadcast' : 'variable'
+        if (dk === kind && (d.scope === 'global' || d.scope === 'local')) return d.scope
+      }
+      return undefined
+    }
     const create = (kind, name) => {
-      // 广播挂在舞台上（收报积木按 id 查舞台），标量/列表挂在当前目标上（跟原角色一致）
-      const owner = kind === 'broadcast' ? stage : t
+      // 广播挂在舞台上（收报积木按 id 查舞台）；标量/列表默认挂当前目标（跟原角色一致），
+      // 声明了 scope:'global' 的挂舞台。
+      const scope = declaredScope(kind, name)
+      const owner = kind === 'broadcast' || scope === 'global' ? stage : t
       if (!owner) return null
       const id = `dshv-${Math.random().toString(36).slice(2, 10)}`
       try {

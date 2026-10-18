@@ -654,6 +654,20 @@ for (const [label, needle] of v010) {
   t(`执行器：${label}`, executorSrc.includes(needle), needle)
 }
 
+// v0.11.0：两处"带自定义块的片段根本注不进去"的根修
+const v011 = [
+  // procedures_call/prototype 的输入键名就是 argumentids 里那些随机串，形状表里永远查不到。
+  // 早先只放过了 procedures_call，于是**任何带自定义块定义的片段**都会被当成"输入名写错"拒掉
+  // （背包里那个 142 块的字库引擎就是这么被拦下的）。
+  ['自定义块的参数 id 不算"输入名写错"（call + prototype 都放过）', "ARG_ID_OPCODES.has(opcode)"],
+  ['ARG_ID_OPCODES 同时含 call 和 prototype', "'procedures_call', 'procedures_prototype'"],
+  ['背包变量/列表可声明 scope:global 挂舞台', 'const declaredScope = (kind, name) =>'],
+  ['导出时记下变量在谁身上（舞台 = global）', "item.scope = found && found.owner && found.owner.isStage"]
+]
+for (const [label, needle] of v011) {
+  t(`执行器：${label}`, executorSrc.includes(needle), needle)
+}
+
 console.log(`\n===== 插件工具单测: ${pass} pass / ${fail} fail =====`)
 try { rmSync(STUB_DIR, { recursive: true, force: true }); rmSync(HOME, { recursive: true, force: true }) } catch {}
 process.exit(fail ? 1 : 0)

@@ -552,8 +552,9 @@ export function apply(ctx, config) {
   const builtinSkillDir = join(dirname(fileURLToPath(import.meta.url)), 'skills')
   const skillStateFile = join(skillDir, '.enabled.json')
   const builtinVersionFile = join(skillDir, '.builtin-version')
-  const SKILL_BUILTIN_VERSION = '5' // 升级内置 skill 时 bump（5 = 新增 proven-patterns.md：
-                                    //     从真实高完成度作品里读出来的九种写法，替换掉"注意性能"这类空话；
+  const SKILL_BUILTIN_VERSION = '6' // 升级内置 skill 时 bump（6 = 新增 pen-text.md：画笔文字引擎
+                                    //     （字形编码格式 / 用法 / 坑），proven-patterns 第 6 条改为"直接用背包里那条"；
+                                    //     5 = 新增 proven-patterns.md：从真实高完成度作品里读出来的十种写法；
                                     //     4 = 注入语义/平台陷阱/任务路由；3 = 背包那篇；2 = 去掉块数普查）
 
   function skillEnabledMap() {
@@ -1385,7 +1386,7 @@ export function apply(ctx, config) {
       session: { type: 'string' },
       target: { type: 'string', description: '目标精灵名' },
       blocks: { type: 'object', additionalProperties: true, description: 'sb3 blocks dict（同 project.json 里 targets[].blocks 的格式）' },
-      variables: { type: 'array', description: '可选：要一起建的变量/列表声明 [{name, type:"variable"|"list"|"broadcast", value}]（不传则按块里的名字自动建、值为空）' },
+      variables: { type: 'array', description: '可选：要一起建的变量/列表声明 [{name, type:"variable"|"list"|"broadcast", scope:"local"|"global", value}]（不传则按块里的名字自动建、值为空；scope:"global" 挂舞台 —— 几 MB 的字库表必须是全局的）' },
       lenient: { type: 'boolean', description: 'true = 输入名/字段名写错也只警告、照样注入（缺省是直接报错拦下来）' },
       layout: { type: 'string', description: 'auto（缺省，自动排到现有内容右边）| given（尊重你给的 x/y）' },
       follow: { type: 'boolean', description: 'false = 改完不把视口滚过去（缺省会滚）' },
@@ -1862,15 +1863,15 @@ export function apply(ctx, config) {
       // 变量/列表：用背包里存的声明（含值），再按 variableValues 覆盖
       const overrides = (args?.variableValues && typeof args.variableValues === 'object') ? args.variableValues : {}
       const declared = []
-      for (const v of (s.requires?.variables || [])) declared.push({ name: v.name, type: 'variable', value: overrides[v.name] !== undefined ? overrides[v.name] : v.value })
-      for (const v of (s.requires?.lists || [])) declared.push({ name: v.name, type: 'list', value: Array.isArray(overrides[v.name]) ? overrides[v.name] : v.value })
+      for (const v of (s.requires?.variables || [])) declared.push({ name: v.name, type: 'variable', scope: v.scope, value: overrides[v.name] !== undefined ? overrides[v.name] : v.value })
+      for (const v of (s.requires?.lists || [])) declared.push({ name: v.name, type: 'list', scope: v.scope, value: Array.isArray(overrides[v.name]) ? overrides[v.name] : v.value })
       for (const v of (s.requires?.broadcasts || [])) declared.push({ name: v.name, type: 'broadcast' })
       const preview = {
         snippet: s.name,
         title: s.title,
         target: args?.target || '(当前编辑角色)',
         blocks: Object.keys(blocks).length,
-        creates: declared.map(d => `${d.name}${d.type === 'list' ? '[]' : ''}`)
+        creates: declared.map(d => `${d.name}${d.type === 'list' ? '[]' : ''}${d.scope === 'global' ? '(全局)' : ''}`)
       }
       const r = withChanged(await guardedWrite(sid, 'add_blocks', { target: args?.target, blocks, variables: declared },
         `pre-bp-${s.name}`, preview))

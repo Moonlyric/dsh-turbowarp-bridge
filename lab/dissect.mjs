@@ -17,7 +17,7 @@ import { writeFileSync, mkdirSync } from 'node:fs'
 import { basename, extname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import {
-  readProject, blockMap, isReal, inputRef, inputValue, fieldValue,
+  readProject, blockMap, isReal, inputRef, inputValue, fieldValue, isConstant,
   walkFrom, ancestorOpcodes, topLevelBlocks, isHat, listsOf, variablesOf, classifyList
 } from './sb3-read.mjs'
 
@@ -334,11 +334,21 @@ export function dissect (project, meta = {}) {
 
   // ---------- 结论 ----------
   // 两边都写死的比较：标准 TurboWarp 里恒假。真实作品里这种情况常常是"变量名写成了字符串"
+  // 注意必须用 isConstant 判"是不是报告器"—— `[12,"分数","id"]` 这种内联变量在块表里查不到，
+  // 但它是变量，不是常量。
   let constCmp = 0
+  let constCmpSample = null
   for (const m of maps.values()) {
     for (const b of m.values()) {
       if (b.opcode !== 'operator_equals' && b.opcode !== 'operator_lt' && b.opcode !== 'operator_gt') continue
-      if (!inputRef(b.inputs && b.inputs.OPERAND1, m) && !inputRef(b.inputs && b.inputs.OPERAND2, m)) constCmp++
+      const a = b.inputs && b.inputs.OPERAND1
+      const c = b.inputs && b.inputs.OPERAND2
+      if (!isConstant(a, m) || !isConstant(c, m)) continue
+      const va = inputValue(a)
+      const vc = inputValue(c)
+      if (va === undefined && vc === undefined) continue
+      constCmp++
+      if (!constCmpSample) constCmpSample = `${JSON.stringify(String(va ?? ''))} ${b.opcode.replace('operator_', '')} ${JSON.stringify(String(vc ?? ''))}`
     }
   }
   const nonStd = opSorted.filter(([op]) => !/^[a-z0-9]+_[a-zA-Z0-9_]+$/.test(op) || /\b(gandi|gandi_|ext_)/i.test(op))
@@ -352,8 +362,9 @@ export function dissect (project, meta = {}) {
   if (constCmp >= 3) {
     risks.push({
       level: 'mid',
-      text: `${constCmp} 处判断是**两边都写死的常量**（例如 "{Window}type" = "本体"）。标准 TurboWarp 里这种比较恒为假；` +
-        '可能是把变量名当成字符串写进去了，也可能依赖了平台特有的求值方式 —— 搬到别的编辑器之前必须先弄清是哪一种'
+      text: `${constCmp} 处判断的两边都是写死的常量（例如 ${constCmpSample}）。这种比较在运行中永远得到同一个结果 —— ` +
+        '要么是"把变量名当成字符串写进去了"（本意是比变量），要么是调完参数忘删的残留，要么依赖了平台特有的求值方式。' +
+        '它不会报错，只会让那条分支静默失效，所以最该查。'
     })
   }
   if (nonStd.length) risks.push({ level: 'info', text: `${nonStd.length} 种非标准 opcode（疑似扩展或平台方言）：${nonStd.slice(0, 6).map(([o]) => o).join('、')}` })

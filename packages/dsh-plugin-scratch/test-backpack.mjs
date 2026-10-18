@@ -44,8 +44,10 @@ const exportResult = {
   scripts: 2,
   topLevelOpcodes: ['event_whenflagclicked', 'data_deletealloflist'],
   requires: {
-    variables: [{ name: '分数', value: 42 }],
-    lists: [{ name: '字模', value: ['甲', '乙', '丙'] }],
+    // scope 是执行器 collectRefs 的产物（舞台上的 = global）。字模表跟着原角色是 global，
+    // 分数是角色局部 —— 背包要能原样搬回去，所以这两个字段都得存、都得透传。
+    variables: [{ name: '分数', value: 42, scope: 'local' }],
+    lists: [{ name: '字模', value: ['甲', '乙', '丙'], scope: 'global' }],
     broadcasts: [{ name: '开始' }]
   }
 }
@@ -184,6 +186,11 @@ t('变量/列表/广播都以 declared 形式送下去（目标里没有的会�
   addBlocksArgs.variables.some(v => v.name === '字模' && v.type === 'list' && v.value.length === 3) &&
   addBlocksArgs.variables.some(v => v.name === '分数' && v.type === 'variable' && v.value === 42) &&
   addBlocksArgs.variables.some(v => v.name === '开始' && v.type === 'broadcast'),
+  JSON.stringify(addBlocksArgs && addBlocksArgs.variables))
+// scope 要透传：字库那种几 MB 的表必须挂舞台（否则注进第二个角色就是第二份副本）
+t('背包里 scope:"global" 的列表原样送到 add_blocks（挂舞台，不各角色一份）',
+  addBlocksArgs.variables.some(v => v.name === '字模' && v.scope === 'global') &&
+  addBlocksArgs.variables.some(v => v.name === '分数' && v.scope !== 'global'),
   JSON.stringify(addBlocksArgs && addBlocksArgs.variables))
 // 坐标：片段原来两顶层的 min 是 (120,260) → 整体平移 (+280, +340)
 t('x/y 是整体平移（保留片段内部相对排布，不是全部堆到一处）',

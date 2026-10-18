@@ -13,6 +13,7 @@
 | 要把表达式、条件、列表拼对 | **platform-traps.md**（输入名/1-based/空串） | code-patterns.md |
 | 做游戏循环、克隆、弹幕、网格 | code-patterns.md + performance.md | platform-traps.md §4（warp） |
 | 做 UI / 动画 / 转场 | animation-visual.md | architecture.md |
+| **要画中文文字 / 界面文字 / 打字机效果** | **pen-text.md**（背包里现成的引擎） | backpack.md |
 | 项目 > 3 个角色或要长期改 | architecture.md | project-planning.md |
 | 要验证"真的生效了" / 点了没反应 | runtime-control.md | platform-traps.md §0 |
 | 用户没说清要什么 | project-planning.md | — |
@@ -71,7 +72,7 @@
 | 3 | `前缀-字段` 平行列表 | 一行一条记录；**删记录会让 id 错位**，要删就改成墓碑或走空闲索引 |
 | 4 | 对象池 + 空闲索引 | 开场建一次、之后只设变量；从表尾取、**漏还不会报错**只是池慢慢空 |
 | 5 | 逻辑全进 warp 自定义块 | 主循环 8 块，只调 `frame()`；warp 里禁止 forever/wait/broadcast-and-wait |
-| 6 | 自己渲染文字 | 字符宽度表 + 逐字定位，排版就是纯算术 |
+| 6 | 自己渲染文字 | 别自己写 —— **背包里「文字引擎」就是成品**，见 pen-text.md |
 | 7 | 相机 | 实体只存世界坐标，只在渲染那一步减 camX/camY |
 | 8 | 图搜索 | 邻接表 + 队列，出队**只挪头指针，绝不 delete 1** |
 | 9 | 刷新分阶段 | 前置/本体/后置/渲染 四个广播，把"谁先算"变成显式约定 |

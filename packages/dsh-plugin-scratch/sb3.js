@@ -191,14 +191,17 @@ export function buildBlankProject(o = {}) {
     meta: { semver: '3.0.0', vm: '0.2.0', agent: 'dsh-plugin-scratch' }
   }
 
-  const buffer = zipStore([
+  const parts = [
     { name: 'project.json', data: Buffer.from(JSON.stringify(projectJson), 'utf8') },
     { name: backdrop.costume.md5ext, data: backdrop.data },
     { name: costume.costume.md5ext, data: costume.data }
-  ])
+  ]
+  const buffer = zipStore(parts)
   return {
     buffer,
     projectJson,
-    files: ['project.json', backdrop.costume.md5ext, costume.costume.md5ext]
+    files: parts.map(p => p.name),
+    // 原件（名字 + 内容）：要在这份空白作品上再拼积木/变量自己打包时直接改 parts
+    parts
   }
 }

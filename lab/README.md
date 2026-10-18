@@ -49,6 +49,20 @@ node test-bridge-auth.mjs    # 21 条断言（握手认证 + 跨会话伪造防�
 `sb3-read.mjs` 是它和 `inspect-sb3.mjs` 共用的读取层——各写一套的话，同一个文件会报出两个块数。
 报告只输出统计和结构描述，不含积木 JSON。
 
+## build-font-kit.mjs（把画笔文字引擎做成可复用件）
+
+`node build-font-kit.mjs <含字库的作品.sb3|project.json> [--out 目录] [--no-backpack]`
+
+从一份带字库的作品里把 4 个自定义块（`画文本` / `画字` / `找字` / `定位`）和两张字形表提出来，
+产出两样东西：
+
+- `$DSH_HOME/scratch-backpack/文字引擎.json` —— 背包条目，之后 `scratch_backpack_load({ name: "文字引擎" })` 一句话注进项目；
+- `lab/works/font-kit-test.sb3` —— 引擎 + 一段绿旗演示，拖进 TurboWarp 就能看效果。
+
+它会先自检「字库索引」是否按字符升序（二分查找全靠它），不达标就拒绝生成。
+变量统一加 `PTE-` 前缀，免得跟宿主项目的 `x` / `y` / `i` 撞名。用法与字形编码见
+`packages/dsh-plugin-scratch/skills/pen-text.md`。
+
 ## real-machine-check.mjs（真机验收，全自动）
 
 它做的是完整真链路，不是模拟：
