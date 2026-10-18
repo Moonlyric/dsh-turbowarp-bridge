@@ -6,7 +6,7 @@ AI 通过 `scratch_*` 工具读取/修改 Scratch 项目，用户在 TurboWarp �
 架构（两条传输路径，读写的是**同一份**页面执行器）：
 
 ```
-本插件（Node）= WebSocket 服务端（桥 :31820） + CDP 直连客户端 + 30 个 scratch_* 工具 + Skill 经验库 + 积木背包
+本插件（Node）= WebSocket 服务端（桥 :31820） + CDP 直连客户端 + 33 个 scratch_* 工具 + Skill 经验库 + 积木背包
 
   路一 · 扩展桥
         ↕ JSON-RPC over ws（握手 token）
@@ -78,25 +78,29 @@ github:Moonlyric/dsh-turbowarp-bridge#path:packages/dsh-plugin-scratch
 （patch 是按 id **整段替换**，覆盖时要把想保留的字段写全。行本身由本包的
 `cordis.patch.yml` 提供 —— 那是 `dsh.bundle.patch` 声明的组合包层。）
 
-### 插件页里的配置（10 项，改完立即生效）
+### 插件页里的配置（只放 3 项，改完立即生效）
 
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `safety` | `preview` | `preview` 先给 planId 等确认 / `auto` 直接落盘 / `suggest` 只给建议 |
-| `bridgePort` | `31820` | 桥监听端口（扩展那条路用）。改完约 2 秒**自动重绑**，不用重启 |
-| `desktopDebugPort` | `31821` | 「可接管」固定调试端口，与 `启动TurboWarp(AI可接管).cmd` 保持一致 |
-| `desktopPath` | 空 | TurboWarp Desktop 的 exe，留空自动找 |
-| `browserPath` | 空 | 网页版用哪个浏览器，留空 = 系统默认 |
-| `snapshotsDir` | 空 | 快照目录，留空 = 系统临时目录 |
-| `maxSnapshots` | `30` | 内存里最多留几份快照 |
-| `maxSnapshotMemMb` | `64` | 快照内存上限（MB） |
-| `maxSnapshotDiskMb` | `256` | 快照落盘上限（MB） |
-| `skillsEnabled` | `true` | Skill 经验库总开关 |
+页面上只留**用户真会改**的三项；其余是工程参数，要改就去 profile 的 `cordis.patch.yml`（改完重挂这一行）。
 
-这些字段在 `index.js` 的 `Config` 里都声明了 `.volatile()`：dsh 的 settings 服务**只**为
-volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引用 —— 所以插件每次读配置都取
-最新值，UI 保存后不用重启。浏览器半侧在 `lib/client.js`（手写的 `__ModuleLoader__` bundle，
-注册 `plugins.row.config`，key = `dsh-plugin-scratch#scratch`）。
+| 字段 | 默认 | 页面里有？ | 说明 |
+|---|---|---|---|
+| `safety` | `preview` | ✅ | `preview` 先给 planId 等确认 / `auto` 直接落盘 / `suggest` 只给建议 |
+| `desktopPath` | 空 | ✅ | TurboWarp Desktop 的 exe，留空自动找（一般不用填） |
+| `snapshotsDir` | 空 | ✅ | 快照目录，留空 = 系统临时目录 |
+| `bridgePort` | `31820` | — | 桥监听端口（扩展那条路用）。**只在 YAML 里**改，重挂本行生效 |
+| `desktopDebugPort` | `31821` | — | 「可接管」固定调试端口，与 `启动TurboWarp(AI可接管).cmd` 保持一致（改了两边要同步） |
+| `browserPath` | 空 | — | 网页版用哪个浏览器，留空 = 系统默认 |
+| `maxSnapshots` | `30` | — | 内存里最多留几份快照 |
+| `maxSnapshotMemMb` | `64` | — | 快照内存上限（MB） |
+| `maxSnapshotDiskMb` | `256` | — | 快照落盘上限（MB） |
+| `skillsEnabled` | `true` | — | Skill 经验库总开关 |
+
+`Config` 里只有上面打 ✅ 的三个声明了 `.volatile()`：dsh 的 settings 服务**只**为 volatile 字段
+生成表单，而且 volatile 值在运行时是 `{ get() }` 引用 —— 所以插件每次读配置都取最新值，UI 保存后不用重启。
+其余字段刻意**不加** `.volatile()`，避免在设置页里出现一堆"改了也不该由用户改"的旋钮。
+浏览器半侧在 `lib/client.js`（手写的 `__ModuleLoader__` bundle，注册 `plugins.row.config`，
+key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volatile 字段一一对应
+（`test-tools.mjs` 有断言守着：多一个少一个都会红）。
 
 ⚠️ **不要**把 `@deepseek-ai/dsh-tools`、`@deepseek-ai/schemastery` 写进 `dependencies`：
 宿主会提供它们；写进 deps 会装一份旧版进 profile 并把宿主的 `tools` 行顶掉（版本不兼容 → 整个
@@ -122,7 +126,7 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 > **只有浏览器（扩展桥）那条路要 token。** 桌面版走 CDP 直连：不用扩展、不用 token，
 > 因为它连的是"我们自己拉起来、自己注执行器"的进程，没有"本机任意页面都能连进来"这个问题。
 
-## 工具清单（30 个）
+## 工具清单（33 个）
 
 | 工具 | 方向 | 说明 |
 |---|---|---|
@@ -135,10 +139,13 @@ volatile 字段生成表单，而且 volatile 值在运行时是 `{ get() }` 引
 | `scratch_add_blocks` | 写 | 注入块：sb3 dict 进 → 自动转活块形态、ID 换新、扩展自动加载、返回 `idMap` |
 | `scratch_apply` | 写 | preview 档确认后落盘（传 `planId`） |
 | `scratch_locate` | UI | 工作区滚到块并高亮 3 秒（`scrolledBy` 会告诉你实际走的哪条滚动 API） |
-| `scratch_add_costume` | 写 | SVG → 造型 |
+| `scratch_add_costume` | 写 | SVG → 造型（SVG 按**字节**存；载入失败会自己撤掉并报错，不留 "?" 占位造型） |
+| `scratch_costume` | 写 | 造型 `rename` / `delete` / `set`（只剩一个造型时拒绝删除） |
 | `scratch_rollback` | 写 | 回滚快照（内存 + 磁盘双保险，dsh 重启也能滚） |
-| `scratch_update_block` | 写 | 改 `fields` 下拉 / `inputs` 输入值 / `x,y` 坐标 |
+| `scratch_update_block` | 写 | 改 `fields` 下拉 / `inputs` 输入值 / `x,y` 坐标（改完那块会**亮一下**） |
 | `scratch_delete_blocks` | 写 | 删块（级联），返回实删清单 + 悬空引用扫描 |
+| `scratch_move_block` | 写 | 断链/接链：`detach` / `after` / `before` / `input`（自己收拾指针，GUI 跟着重建工作区） |
+| `scratch_variable` | 写 | 变量/列表 `set` / `create` / `delete` / `rename`（删前数引用块，`force` 连引用块一起删；改名会同步积木字段） |
 | `scratch_tidy_blocks` | 写 | 整理布局（列排布） |
 | `scratch_get_opcodes` | 读 | opcode 白名单（防 AI 编造） |
 | `scratch_watch` | 读 | 变量订阅（start/poll/stop，Stage + 角色两层）；**列表默认只报长度**（`includeLists:true` 才跟，且只回首个变化位 + 样本） |

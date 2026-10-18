@@ -258,6 +258,35 @@
     return null
   }
 
+  // ---------------- 「刚动过的积木亮一下」 ----------------
+  // 用编辑器自己的那套，不自己画：GUI 监听 vm 的 BLOCK_GLOW_ON/OFF → workspace.glowBlock(id, on)
+  // → Blockly 给块描一圈黄光（就是积木正在执行时的那种高亮，用户一看就懂）。
+  // ⚠️ 两个坑：
+  //   1) `Blockly.WorkspaceSvg.glowBlock` 对**工作区里没有的块**会直接 throw（扔的是字符串）；
+  //   2) 工作区只有**当前编辑目标**的积木，别的角色的块调了必炸。
+  //   所以每次都先 getBlockById 查一遍，只给查得到的块发光。
+  const GLOW_MS = 1400
+  const glowTimers = new Map()
+  function glowBlocks(vm, ids) {
+    const ws = getBlocklyWorkspace()
+    if (!ws || typeof ws.glowBlock !== 'function' || typeof vm.runtime.glowBlock !== 'function') return 0
+    let n = 0
+    for (const id of (ids || []).slice(0, 8)) {
+      try {
+        if (!id || !ws.getBlockById(id)) continue
+        const prev = glowTimers.get(id)
+        if (prev) clearTimeout(prev)
+        vm.runtime.glowBlock(id, true)
+        glowTimers.set(id, setTimeout(() => {
+          glowTimers.delete(id)
+          try { vm.runtime.glowBlock(id, false) } catch { /* 工作区重建/换角色了，无所谓 */ }
+        }, GLOW_MS))
+        n++
+      } catch { /* 单块失败不影响别的块 */ }
+    }
+    return n
+  }
+
   function findTarget(vm, name) {
     const targets = vm.runtime.targets
     if (!name) return vm.editingTarget
@@ -879,6 +908,247 @@
     return { created, remapped, kept }
   }
 
+  // ==================== M3：精细编辑（断链/接链、变量/列表、造型）====================
+  // 这三个 op 改的是**已有结构**，不是往里加东西。两条共同要求：
+  //   1) 指针必须自己收拾干净 —— 官方 Blocks.moveBlock 只负责"挂到新位置"，
+  //      不 heal 原来的 next 链、也不清 inputs 里的旧指针（Blockly 那边靠多条事件补）。
+  //      直接借它的后果是**重复挂载 + 孤儿块**，跑起来还会双执行。
+  //   2) 改完必须让 GUI 跟着变：safeEmitWorkspaceUpdate(vm) 让编辑器按 vm 的 XML 重建工作区。
+  //      这也是 TurboWarp 自己的做法（`vm.emitWorkspaceUpdate` 会把 xml 推给 GUI）。
+
+  /** 某个块挂在父块的哪儿：{parent, input} 表示输入，{parent, input:null} 表示 next 链；顶层返回 null */
+  function blockSlot(blocks, parentId, childId) {
+    const p = blocks.getBlock(parentId)
+    if (!p) return null
+    for (const [name, inp] of Object.entries(p.inputs || {})) {
+      if (inp.block === childId) return { parent: parentId, input: name }
+    }
+    if (p.next === childId) return { parent: parentId, input: null }
+    return null
+  }
+
+  /** 块自己 + 全部子孙（inputs 的实块/影子块 + next 链）。防环用 */
+  function subtreeIds(blocks, rootId) {
+    const seen = new Set()
+    const walk = (bid) => {
+      const b = blocks.getBlock(bid)
+      if (!b || seen.has(bid)) return
+      seen.add(bid)
+      for (const inp of Object.values(b.inputs || {})) {
+        if (inp.block) walk(inp.block)
+        if (inp.shadow && inp.shadow !== inp.block) walk(inp.shadow)
+      }
+      if (b.next) walk(b.next)
+    }
+    walk(rootId)
+    return seen
+  }
+
+  /**
+   * 把块从当前位置摘下来，并**顺手把断口补上**：
+   *   - 在 next 链中间 → 前后两段接起来（Blockly 拖走中间块时就是这个效果）
+   *   - 挂在输入上 → 输入退回影子块（默认值还在，不是空槽）
+   * @returns {null|{from: object|string}} 顶层块返回 null（顺手从 _scripts 摘掉）
+   */
+  function unlinkBlock(blocks, id) {
+    const b = blocks.getBlock(id)
+    if (!b) return null
+    if (!b.parent) {
+      blocks._deleteScript(id) // 本来就是顶层脚本：出链准备挂到别处
+      return null
+    }
+    const slot = blockSlot(blocks, b.parent, id)
+    const p = blocks.getBlock(b.parent)
+    if (!slot || !p) {
+      // parent 指针不可信（历史损坏的项目里有）—— 只把自己标成顶层，别动别人
+      b.parent = null
+      return { from: 'stale' }
+    }
+    if (slot.input) {
+      const inp = p.inputs[slot.input]
+      inp.block = inp.shadow && inp.shadow !== id ? inp.shadow : null
+    } else {
+      p.next = b.next || null
+      if (b.next) {
+        const n = blocks.getBlock(b.next)
+        if (n) n.parent = p.id
+      }
+      b.next = null
+    }
+    b.parent = null
+    return { from: slot }
+  }
+
+  /**
+   * 接到 parentId 的后面（next 槽）。槽里已经有块时**不挤掉**，插在中间：
+   *   parent → id（+ 自己那段） → 原来的 next → …
+   * 官方 moveBlock 会直接把 parent.next 改成 id，让原来的 next 变孤儿（父指针还指着
+   * parent，于是这块既不在链上、又不在 _scripts 里 —— 既不显示也不执行），所以这里自己拼。
+   */
+  function attachAfter(blocks, id, parentId) {
+    const b = blocks.getBlock(id)
+    const p = blocks.getBlock(parentId)
+    if (!b || !p) throw new Error(`接链失败：找不到块 ${!b ? id : parentId}`)
+    const oldNext = p.next && p.next !== id ? p.next : null
+    p.next = id
+    b.parent = parentId
+    if (oldNext) {
+      // 找 b 这条链的尾巴（刚摘下来的块可能自己就带着一段），把后面那段接回去
+      let tail = b
+      const guard = new Set([id])
+      while (tail.next && !guard.has(tail.next)) {
+        const n = blocks.getBlock(tail.next)
+        if (!n) break
+        guard.add(n.id)
+        tail = n
+      }
+      tail.next = oldNext
+      const on = blocks.getBlock(oldNext)
+      if (on) on.parent = tail.id
+    }
+    blocks._deleteScript(id)
+  }
+
+  /** 把块塞进 parentId 的某个输入槽。原来挂着的块（不是影子）退回顶层，不删 */
+  function attachInput(blocks, id, parentId, inputName) {
+    const p = blocks.getBlock(parentId)
+    const b = blocks.getBlock(id)
+    if (!p || !b) throw new Error(`接链失败：找不到块 ${!p ? parentId : id}`)
+    const input = p.inputs && p.inputs[inputName]
+    if (!input) throw new Error(`块 ${parentId} 没有输入 "${inputName}"（现有: ${Object.keys(p.inputs || {}).join(', ') || '无'}）`)
+    const displaced = input.block && input.block !== input.shadow && input.block !== id ? input.block : null
+    if (displaced) {
+      const d = blocks.getBlock(displaced)
+      if (d) {
+        d.parent = null
+        blocks._addScript(displaced)
+        d.topLevel = true
+      }
+    }
+    const shadow = input.shadow && input.shadow !== id ? input.shadow : null
+    p.inputs[inputName] = { name: inputName, block: id, shadow }
+    b.parent = parentId
+    blocks._deleteScript(id)
+    return { displaced }
+  }
+
+  /** 断链/接链主体。返回一份"从哪来、到哪去、挤掉了谁"的报告 */
+  function moveBlockIn(vm, t, spec) {
+    const blocks = t.blocks
+    const id = String(spec.id || '')
+    const mode = String(spec.mode || 'after')
+    const to = spec.to ? String(spec.to) : ''
+    const b = blocks.getBlock(id)
+    if (!b) throw new Error(`找不到块 ${id}`)
+    if (to && !blocks.getBlock(to)) throw new Error(`找不到目标块 ${to}`)
+    if (to === id) throw new Error('不能把块接到它自己身上')
+    if (to && subtreeIds(blocks, id).has(to)) {
+      throw new Error(`不能把 ${id} 接到它自己的子孙块 ${to} 上（会成环，工作区直接崩）`)
+    }
+
+    const report = { blockId: id, opcode: b.opcode, mode, from: null, to: null, displaced: null }
+
+    if (mode === 'detach') {
+      const r = unlinkBlock(blocks, id)
+      report.from = r ? r.from : 'already-top-level'
+      blocks._addScript(id)
+      blocks.getBlock(id).topLevel = true
+    } else if (mode === 'after' || mode === 'before') {
+      if (!to) throw new Error('after/before 需要 toBlockId')
+      const dest = blocks.getBlock(to)
+      report.from = (unlinkBlock(blocks, id) || {}).from || null
+      if (mode === 'before') {
+        if (!dest.parent) throw new Error(`块 ${to} 是顶层脚本，没有"前面"可插 —— 用 after，或先 detach`)
+        const slot = blockSlot(blocks, dest.parent, to)
+        if (!slot) throw new Error(`块 ${to} 的父指针不对（parent=${dest.parent}），先 scratch_rollback 或手工修`)
+        const parentId = dest.parent
+        const wasInput = slot.input
+        unlinkBlock(blocks, to) // 腾出槽位（它后面的链跟着它走）
+        if (wasInput) attachInput(blocks, id, parentId, wasInput)
+        else attachAfter(blocks, id, parentId)
+        attachAfter(blocks, to, id)
+        report.to = { parent: parentId, input: wasInput || null, before: to }
+      } else {
+        attachAfter(blocks, id, to)
+        report.to = { parent: to, input: null }
+      }
+    } else if (mode === 'input') {
+      if (!to) throw new Error('input 模式需要 toBlockId')
+      if (!spec.input) throw new Error('input 模式需要 inputName（如 CONDITION / SUBSTACK / OPERAND1）')
+      report.from = (unlinkBlock(blocks, id) || {}).from || null
+      const r = attachInput(blocks, id, to, spec.input)
+      report.displaced = r.displaced
+      report.to = { parent: to, input: spec.input }
+    } else {
+      throw new Error(`未知 mode "${mode}"（detach / after / before / input）`)
+    }
+
+    blocks.resetCache()
+    blocks.emitProjectChanged()
+    safeEmitWorkspaceUpdate(vm)
+    // 移动/接链后亮一下：让用户看见"这块被挪到这儿了"
+    report.glowed = glowBlocks(vm, [id, to].filter(Boolean)) || undefined
+    return report
+  }
+
+  const VAR_TYPE_BY_KIND2 = { variable: '', list: 'list', broadcast: 'broadcast_msg' }
+
+  /** 找变量：先按 id、再按名字；scope=local 只看角色、global 只看舞台、缺省先角色再舞台 */
+  function findVariable(vm, t, spec) {
+    const kind = spec.kind === 'list' ? 'list' : 'variable'
+    const type = VAR_TYPE_BY_KIND2[kind]
+    const stage = vm.runtime.getTargetForStage()
+    const owners = []
+    if (spec.scope === 'local') owners.push(t)
+    else if (spec.scope === 'global') owners.push(stage)
+    else owners.push(t, stage)
+    for (const owner of owners) {
+      if (!owner || !owner.variables) continue
+      if (spec.id && owner.variables[spec.id]) return { owner, variable: owner.variables[spec.id], kind, type }
+    }
+    if (spec.name) {
+      for (const owner of owners) {
+        if (!owner || !owner.variables) continue
+        for (const v of Object.values(owner.variables)) {
+          if (v && v.name === spec.name && (v.type || '') === type) return { owner, variable: v, kind, type }
+        }
+      }
+    }
+    return null
+  }
+
+  /** 哪些积木在引用这个变量（全角色扫，删/改名前必须知道） */
+  function variableRefs(vm, varId, kind) {
+    const fieldName = kind === 'list' ? 'LIST' : 'VARIABLE'
+    const hits = []
+    for (const target of vm.runtime.targets || []) {
+      const all = (target.blocks && target.blocks._blocks) || {}
+      for (const [bid, b] of Object.entries(all)) {
+        const f = b && b.fields && b.fields[fieldName]
+        if (f && f.id === varId) hits.push({ target: target.getName(), blockId: bid, opcode: b.opcode })
+      }
+    }
+    return hits
+  }
+
+  /** 造型下标：name 优先，其次 index（1 起，跟编辑器里看到的一致），都没有 = 当前造型 */
+  function costumeIndexOf(t, spec) {
+    const list = t.getCostumes()
+    if (spec.name) {
+      const i = list.findIndex(c => c.name === spec.name)
+      if (i < 0) throw new Error(`角色「${t.getName()}」没有造型「${spec.name}」，现有: ${list.map(c => c.name).join(', ')}`)
+      return i
+    }
+    if (spec.index !== undefined && spec.index !== null && spec.index !== '') {
+      const n = Number(spec.index)
+      if (!Number.isFinite(n) || n < 1 || n > list.length) {
+        throw new Error(`造型序号 ${spec.index} 越界（1..${list.length}）`)
+      }
+      return Math.floor(n) - 1
+    }
+    return t.currentCostume
+  }
+
   async function ops(op, args) {
     const vm = getVM()
     switch (op) {
@@ -1022,6 +1292,8 @@
 
         // 触发 GUI 刷新（用户实时看到新积木）
         safeEmitWorkspaceUpdate(vm)
+        // 新积木亮一下（用户当场能看到"AI 刚往这儿塞了东西"）；影子块不发光，最多 8 块
+        const glowed = glowBlocks(vm, newIds.filter(nid => t.blocks._blocks[nid] && !t.blocks._blocks[nid].shadow))
         return {
           added: newIds.length,
           inputBlocks: Object.keys(index).length,
@@ -1029,6 +1301,7 @@
           expandedBlocks: liveBlocks.length,
           idMap,
           idMapReliable,
+          glowed: glowed || undefined,
           // 变量引用发生了什么（只在真动过时才出现，免得把小输出撑大）
           refs: (refs.created.length || refs.remapped.length)
             ? { created: refs.created.length ? refs.created : undefined, remapped: refs.remapped.length ? refs.remapped : undefined, kept: refs.kept }
@@ -1179,15 +1452,28 @@
       }
       case 'add_costume': {
         // SVG → 造型：storage.createAsset + addCostume
+        //
+        // ⚠️ 坑（真机两轮才定位）：SVG 必须按**字节**存，不能把字符串塞给 createAsset。
+        //    scratch-storage 的 Asset.decodeText() 无条件 `new TextDecoder().decode(this.data)`
+        //    （源码注释自己都写了"data 可能是字符串，但这函数只在字节数组时被调用"），
+        //    传字符串 → 抛 `parameter 1 is not of type 'ArrayBuffer'` → loadCostume 进 catch →
+        //    造型永远拿不到 skin：编辑器里显示成一张 **"?" 占位图**，
+        //    而且 TurboWarp Desktop 会顺着这条错误把整页搞成白屏（vm 都没了）。
+        //    之前浏览器真机那条断言太弱（只判 rotationCenter !== 48），所以一直"绿着坏"。
         const t = findTarget(vm, args && args.target)
         const storage = vm.runtime.storage
         if (!storage) throw new Error('storage 不可用')
+        const svgText = String((args && args.svg) || '')
+        if (!svgText.trim()) throw new Error('svg 不能为空')
+        if (!/<svg[\s>]/i.test(svgText)) throw new Error('svg 看起来不是 SVG 源码（要以 <svg …> 开头）')
+        const bytes = new TextEncoder().encode(svgText)
         const asset = storage.createAsset(
-          storage.AssetType.ImageVector, 'svg', args.svg, null, true
+          storage.AssetType.ImageVector, 'svg', bytes, null, true
         )
         const md5ext = asset.assetId + '.' + asset.dataFormat
+        const name = (args && args.name) || 'ai-costume'
         await vm.addCostume(md5ext, {
-          name: args.name || 'ai-costume',
+          name,
           assetId: asset.assetId, // 5.x 序列化器直接读此字段（缺了会导致快照 sb3 验证失败）
           md5ext, dataFormat: 'svg',
           asset // load-costume 会从它派生 md5 / dataFormat
@@ -1195,7 +1481,27 @@
           // 按真实图形算旋转中心（load-costume.js:409-412）。硬编码 48/50 会把任意尺寸的
           // SVG 旋转中心都钉死在 (48,50)，转起来就歪。
         }, t.id)
-        return { costume: args.name || 'ai-costume', md5ext }
+        // 加完**必须验一下它到底载入没有**：没有 skin 就是坏的，别把 "?" 留在用户项目里
+        const list = t.getCostumes() || []
+        const added = list.filter(c => c && c.assetId === asset.assetId).slice(-1)[0] || list[list.length - 1]
+        const ok = added && added.skinId && Number.isFinite(added.rotationCenterX) && Number.isFinite(added.rotationCenterY)
+        if (!ok) {
+          const idx = list.indexOf(added)
+          if (idx >= 0 && list.length > 1) {
+            try { t.deleteCostume(idx) } catch { /* 撤不掉也要把错误报出来 */ }
+          }
+          throw new Error(
+            '这个 SVG 渲染器没载入（skin 为空）—— 多半是缺 width/height/viewBox、或图形为空。'
+            + '已经把它从项目里撤掉了（不留 "?" 占位造型）。换一个带实际图形和宽高的 SVG 再来。'
+          )
+        }
+        return {
+          costume: added.name || name,
+          md5ext,
+          skin: !!added.skinId,
+          rotationCenter: [added.rotationCenterX, added.rotationCenterY],
+          size: Array.isArray(added.size) ? added.size : undefined
+        }
       }
       case 'restore': {
         // 回滚：整项目重载（快照存的是 project.json）
@@ -1348,10 +1654,12 @@
         // 触发项目变更 + GUI 刷新（changeBlock/moveBlock 内部不保证全发）
         blocks.emitProjectChanged()
         safeEmitWorkspaceUpdate(vm)
+        const glowed = glowBlocks(vm, [id])
         const after = blocks.getBlock(id)
         return {
           updated: id,
           applied,
+          glowed: glowed || undefined,
           notes: notes.length ? notes : undefined,
           block: { opcode: after.opcode, x: after.x, y: after.y }
         }
@@ -1412,6 +1720,202 @@
             ? '有预测该删却还留着的块——项目里可能存在结构性损坏，建议检查/回滚'
             : (dangling.length ? '检测到悬空引用，继续操作前建议 scratch_rollback' : undefined)
         }
+      }
+
+      case 'move_block': {
+        // 断链 / 接链。只动**同一个角色**内的块：跨角色搬运用背包（save → load），
+        // 那条路已经处理好了变量落地和 id 换新，别在这里再造一套。
+        const t = findTarget(vm, args && args.target)
+        if (!args || !args.blockId) throw new Error('blockId 不能为空')
+        return moveBlockIn(vm, t, {
+          id: args.blockId,
+          mode: args.mode,
+          to: args.toBlockId,
+          input: args.inputName
+        })
+      }
+
+      case 'variable': {
+        // 变量 / 列表的增删改与赋值。名字和 id 二选一，scope 不传 = 先角色后舞台。
+        const a = Object.assign({}, args || {})
+        let action = String(a.action || 'set')
+        const kind = a.kind === 'list' ? 'list' : 'variable'
+        const type = VAR_TYPE_BY_KIND2[kind]
+        const stage = vm.runtime.getTargetForStage()
+        const t = a.target ? findTarget(vm, a.target) : vm.editingTarget
+        const label = kind === 'list' ? '列表' : '变量'
+        const notFound = () => new Error(`找不到${label}「${a.name || a.id || ''}」${a.scope ? `（${a.scope === 'local' ? '本角色' : '舞台'}里）` : ''}`
+          + '。要新建就传 action:"create"；想知道现在有哪些，看 snapshot 的 targets[].variables')
+
+        // 赋值时顺手建一个（AI 常先赋值后声明）—— 只在明确传了 create:true 时才这么做
+        if (action === 'set' && !findVariable(vm, t, { id: a.id, name: a.name, kind, scope: a.scope })
+          && (a.create === true)) {
+          action = 'create'
+          if (!a.scope) a.scope = 'local'
+        }
+        const scope = a.scope === 'local' || a.scope === 'global' ? a.scope : undefined
+        const hit = findVariable(vm, t, { id: a.id, name: a.name, kind, scope })
+
+        if (action === 'set') {
+          if (!hit) throw notFound()
+          let value
+          if (kind === 'list') {
+            if (!Array.isArray(a.value)) throw new Error('给列表赋值要传数组（例如 ["甲","乙"]）；只改一项可以整体重写这个数组')
+            value = a.value.slice()
+          } else {
+            value = a.value === undefined || a.value === null ? '' : a.value
+          }
+          vm.setVariableValue(hit.owner.id, hit.variable.id, value)
+          const now = hit.variable.value
+          return {
+            action: 'set',
+            kind,
+            name: hit.variable.name,
+            id: hit.variable.id,
+            scope: hit.owner.isStage ? 'global' : 'local',
+            value: kind === 'list' ? (now || []).slice(0, 200) : clipScalar(now),
+            length: kind === 'list' ? (now || []).length : undefined,
+            truncated: kind === 'list' && (now || []).length > 200 ? true : undefined
+          }
+        }
+
+        if (action === 'create') {
+          const name = String(a.name || '').trim()
+          if (!name) throw new Error('create 需要 name')
+          const owner = scope === 'local' && t && !t.isStage ? t : stage
+          if (scope === 'local' && (!t || t.isStage)) {
+            throw new Error('舞台上的"局部变量"就是全局变量 —— 舞台上直接用 scope:"global"')
+          }
+          // 同名同类型冲突：与官方 var_create 的判定一致（全局要把所有原身角色都扫一遍）
+          const scan = owner.isStage ? (vm.runtime.targets || []).filter(x => x.isOriginal) : [owner]
+          for (const x of scan) {
+            for (const v of Object.values(x.variables || {})) {
+              if (v && v.name === name && (v.type || '') === type) {
+                throw new Error(`${x.isStage ? '舞台' : `角色「${x.getName()}」`}已经有同名${label}「${name}」（id ${v.id}）`)
+              }
+            }
+          }
+          const id = `dshv-${Math.random().toString(36).slice(2, 10)}`
+          owner.createVariable(id, name, type, false)
+          const v = owner.variables && owner.variables[id]
+          if (!v) throw new Error('创建失败：宿主没接受这个变量')
+          if (kind === 'list') v.value = Array.isArray(a.value) ? a.value.slice() : []
+          else v.value = a.value === undefined || a.value === null ? 0 : a.value
+          safeEmitWorkspaceUpdate(vm) // 工具箱的分类要跟着多一项
+          return {
+            action: 'create',
+            kind,
+            name,
+            id,
+            scope: owner.isStage ? 'global' : 'local',
+            value: kind === 'list' ? v.value.slice() : v.value
+          }
+        }
+
+        if (action === 'delete') {
+          if (!hit) throw notFound()
+          const refs = variableRefs(vm, hit.variable.id, kind)
+          const who = hit.owner.isStage ? '舞台（全局）' : `角色「${hit.owner.getName()}」（局部）`
+          if (refs.length && !a.force) {
+            const head = refs.slice(0, 8).map(r => `${r.target}:${r.blockId}(${r.opcode})`).join('、')
+            throw new Error(`${label}「${hit.variable.name}」（${who}）还被 ${refs.length} 个积木引用：${head}${refs.length > 8 ? ' …' : ''}。`
+              + '先把这些积木改掉/删掉，或者传 force:true 连它们一起删（会一并删掉这些积木及其子块）')
+          }
+          const removed = []
+          for (const r of refs) {
+            const bt = (vm.runtime.targets || []).find(x => x.getName() === r.target)
+            if (!bt || !bt.blocks.getBlock(r.blockId)) continue
+            unlinkBlock(bt.blocks, r.blockId) // 先补断口再删，别留悬空指针
+            bt.blocks.deleteBlock(r.blockId)
+            removed.push(r.blockId)
+          }
+          hit.owner.deleteVariable(hit.variable.id)
+          if (hit.owner.blocks) hit.owner.blocks.emitProjectChanged()
+          safeEmitWorkspaceUpdate(vm)
+          return {
+            action: 'delete',
+            kind,
+            name: hit.variable.name,
+            id: hit.variable.id,
+            scope: hit.owner.isStage ? 'global' : 'local',
+            removedBlocks: removed.length ? removed : undefined
+          }
+        }
+
+        if (action === 'rename') {
+          if (!hit) throw notFound()
+          const newName = String(a.newName || a.value || '').trim()
+          if (!newName) throw new Error('rename 需要 newName')
+          for (const v of Object.values(hit.owner.variables || {})) {
+            if (v && v.id !== hit.variable.id && v.name === newName && (v.type || '') === type) {
+              throw new Error(`${hit.owner.isStage ? '舞台' : `角色「${hit.owner.getName()}」`}里已经有「${newName}」了`)
+            }
+          }
+          const from = hit.variable.name
+          hit.owner.renameVariable(hit.variable.id, newName)
+          // 引用它的积木里，字段存的是**名字**，必须同步改（stage 的变量可能被任意角色引用）
+          const updaters = hit.owner.isStage ? (vm.runtime.targets || []) : [hit.owner]
+          for (const x of updaters) {
+            try {
+              if (x.blocks && x.blocks.updateBlocksAfterVarRename) x.blocks.updateBlocksAfterVarRename(hit.variable.id, newName)
+            } catch { /* 宿主差异：字段没同步只影响显示 */ }
+          }
+          safeEmitWorkspaceUpdate(vm)
+          return { action: 'rename', kind, id: hit.variable.id, scope: hit.owner.isStage ? 'global' : 'local', from, to: hit.variable.name }
+        }
+
+        throw new Error(`未知 action "${action}"（set / create / delete / rename）`)
+      }
+
+      case 'costume': {
+        // 造型的改名/删除/切换。造型是"序号 + 名字"双身份的，改名会自动去重加后缀，
+        // 删除会连带把"下一个造型"之类的引用错位（下标型积木天然如此），所以只在本角色内动。
+        const a = args || {}
+        const t = findTarget(vm, a.target)
+        const action = String(a.action || '')
+        const idx = costumeIndexOf(t, a)
+        const list = t.getCostumes()
+
+        if (action === 'rename') {
+          if (!a.newName) throw new Error('rename 需要 newName')
+          const before = list[idx].name
+          if (typeof t.renameCostume === 'function') t.renameCostume(idx, String(a.newName))
+          else list[idx].name = String(a.newName)
+          const after = t.getCostumes()[idx].name
+          // 造型名会出现在 "looks_switchcostumeto" 的字段里，改名后要让积木跟着变
+          safeEmitWorkspaceUpdate(vm)
+          return {
+            action: 'rename',
+            target: t.getName(),
+            index: idx + 1,
+            from: before,
+            to: after,
+            deduped: after !== String(a.newName) || undefined
+          }
+        }
+
+        if (action === 'delete') {
+          if (list.length <= 1) {
+            throw new Error(`角色「${t.getName()}」只剩一个造型（${list[0].name}），删掉就没得显示了`)
+          }
+          const gone = t.deleteCostume(idx)
+          if (!gone) throw new Error(`删除失败：下标 ${idx + 1} 越界，或宿主拒绝`)
+          return {
+            action: 'delete',
+            target: t.getName(),
+            deleted: gone.name,
+            index: idx + 1,
+            remaining: t.getCostumes().map(c => c.name),
+            current: t.currentCostume + 1
+          }
+        }
+
+        if (action === 'set') {
+          t.setCostume(idx)
+          return { action: 'set', target: t.getName(), current: t.currentCostume + 1, name: list[idx].name }
+        }
+
+        throw new Error(`未知 action "${action}"（rename / delete / set）`)
       }
 
       case 'tidy_blocks': {

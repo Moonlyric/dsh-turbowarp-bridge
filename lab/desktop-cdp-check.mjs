@@ -170,7 +170,7 @@ try {
   // ⚠️ Windows 上 import() 绝对路径必须转成 file:// URL，否则 "G:\..." 会被当成 g: 协议
   const mod = await import(pathToFileURL(join(ROOT, 'packages', 'dsh-plugin-scratch', 'index.js')).href)
   mod.apply(fakeCtx, { safety: 'preview', bridgePort: 31841, maxSnapshots: 3, skillsEnabled: false })
-  t('插件 apply 未抛错，注册了 30 个工具', registered.size === 30, '实际 ' + registered.size)
+  t('插件 apply 未抛错，注册了 33 个工具', registered.size === 33, '实际 ' + registered.size)
   const call = async (name, args) => {
     const tool = registered.get(name)
     if (!tool) throw new Error('没有工具 ' + name)
@@ -450,6 +450,182 @@ try {
   const bpDel = await call('scratch_backpack', { action: 'delete', name: 'desk-check' })
   t('delete 把它挪进 _trash（没真删）', !existsSync(bpFile) && /_trash/.test(bpDel.movedTo || ''), J(bpDel, 200))
   t('删完 list 里没了', (await call('scratch_backpack', { action: 'list' })).count === 0)
+
+  step('6.7 v0.9.0：精细编辑（断链/接链、变量/列表、造型 —— 桌面版真机 + 独立通道核对）')
+  // 为什么非要真机：这三类操作改完都必须让 **GUI 跟着变**（工作区按 vm 的 XML 重建）。
+  // 替身层没有 Blockly，看不见「数据改了、工作区还连着」这种失败 —— 用户那边就是"根本没分开"。
+  const sayId = applied.idMap.say
+  const moveId = applied.idMap.move
+  const wsSay = `(() => {
+    const ws = (window.ScratchBlocks || window.Blockly).getMainWorkspace()
+    const b = ws.getBlockById(${JSON.stringify(sayId)})
+    if (!b) return { found: false }
+    // ⚠️ 要用 getParent()，不能用 getSurroundParent()：后者只认"包围块"（C 块的 SUBSTACK），
+    //    普通 next 链里的块它也返回 null —— 用它判断"是不是顶层脚本"会永远得到"是"。
+    const p = b.getParent()
+    return { found: true, top: p === null, parentId: p ? p.id : null }
+  })()`
+
+  const mvPreview = await call('scratch_move_block', { target: workTarget, blockId: sayId, mode: 'detach' })
+  t('move_block 走 preview（先给计划，不直写）', mvPreview.mode === 'preview' && !!mvPreview.planId, J(mvPreview, 220))
+  const mvRes = await call('scratch_apply', { planId: mvPreview.planId })
+  t('detach 执行后报出「从哪来」', !!(mvRes.from && mvRes.from.parent === moveId), J(mvRes, 240))
+  const afterDetach = await raw.evalJson(`(() => {
+    const t = window.vm.runtime.targets.find(x => x.getName() === ${JSON.stringify(workTarget)})
+    const all = t.blocks._blocks
+    const move = all[${JSON.stringify(moveId)}]
+    const say = all[${JSON.stringify(sayId)}]
+    return { moveNext: move && move.next, sayParent: say && say.parent, sayTop: !!(say && say.topLevel),
+             scripts: t.blocks._scripts.length }
+  })()`)
+  t('独立通道：断口补上了（move.next 变 null，没有留下半截链）', afterDetach.moveNext === null, J(afterDetach, 200))
+  t('独立通道：被摘下来的块变成顶层脚本（parent=null、topLevel=true）',
+    afterDetach.sayParent === null && afterDetach.sayTop === true, J(afterDetach, 200))
+  const wsAfterDetach = await raw.evalJson(wsSay)
+  t('**GUI 也真的分开了**（工作区里那块已经没有父块 —— 只有真机才能验这条）',
+    wsAfterDetach.found === true && wsAfterDetach.top === true, J(wsAfterDetach, 200))
+
+  const mvBack = await call('scratch_move_block', { target: workTarget, blockId: sayId, mode: 'after', toBlockId: moveId })
+  const mvBackRes = await call('scratch_apply', { planId: mvBack.planId })
+  const afterAttach = await raw.evalJson(`(() => {
+    const t = window.vm.runtime.targets.find(x => x.getName() === ${JSON.stringify(workTarget)})
+    const all = t.blocks._blocks
+    return { moveNext: all[${JSON.stringify(moveId)}].next, sayParent: all[${JSON.stringify(sayId)}].parent,
+             sayTop: !!all[${JSON.stringify(sayId)}].topLevel }
+  })()`)
+  t('after 接回去：move.next 又是 say，say 不再是顶层',
+    afterAttach.moveNext === sayId && afterAttach.sayParent === moveId && afterAttach.sayTop === false, J(afterAttach, 200))
+  const wsAfterAttach = await raw.evalJson(wsSay)
+  const attachDiag = await raw.evalJson(`(() => {
+    const vm = window.vm
+    const et = vm.editingTarget
+    const ws = (window.ScratchBlocks || window.Blockly).getMainWorkspace()
+    const id = ${JSON.stringify(sayId)}
+    const shape = () => { const b = ws.getBlockById(id); const p = b && b.getParent(); return b ? { top: p === null } : null }
+    const before = shape()
+    const xml = String(et.blocks.toXML())
+    const at = xml.indexOf('id="' + id + '"')
+    const inScripts = et.blocks._scripts.includes(id)
+    // 手动再发一次 workspaceUpdate：如果这样 GUI 就对了，说明刚才那次 op 里的刷新没落到 GUI
+    try { vm.emitWorkspaceUpdate() } catch (e) { return { err: String(e) } }
+    return {
+      editing: et && et.getName(),
+      inScripts,
+      xmlCount: xml.split(id).length - 1,
+      around: xml.slice(Math.max(0, at - 170), at + 30),
+      wsCount: ws.getAllBlocks(false).filter(b => b.id === id).length,
+      before,
+      after: shape()
+    }
+  })()`)
+  t('**GUI 也真的接回去了**（工作区里它又有了父块）',
+    wsAfterAttach.found === true && wsAfterAttach.top === false,
+    J(wsAfterAttach, 220) + ' / 诊断: ' + J(attachDiag, 520))
+  t('接链报告里说清接到了谁后面', !!(mvBackRes.to && mvBackRes.to.parent === moveId), J(mvBackRes, 240))
+
+  const cyc = await call('scratch_move_block', { target: workTarget, blockId: applied.idMap.hat, mode: 'after', toBlockId: sayId })
+  let cycErr = ''
+  try { await call('scratch_apply', { planId: cyc.planId }) } catch (e) { cycErr = String(e.message || e) }
+  t('把链头接到自己的子孙上会报错（成环会把工作区搞崩）', /成环|自己/.test(cycErr), cycErr)
+
+  // 改块的「短暂高亮」：GUI 监听 BLOCK_GLOW_ON → workspace.glowBlock(id, on) → 描一圈黄光
+  // （跟积木正在执行时同一个视觉效果）。这里直接读工作区块自己的 isGlowingBlock_，
+  // 亮完再读一次必须灭 —— 否则就是"亮着不灭"，比不亮还烦人。
+  const glowUpd = await call('scratch_update_block', {
+    target: workTarget, blockId: sayId, inputs: { MESSAGE: [1, [10, '高亮测试']] }
+  })
+  const glowRes = await call('scratch_apply', { planId: glowUpd.planId })
+  t('改块后报出 glowed=1（它真去发光了，不是只回个数字）', glowRes.glowed === 1, J(glowRes, 240))
+  const glowNow = await raw.evalJson(`(() => {
+    const ws = (window.ScratchBlocks || window.Blockly).getMainWorkspace()
+    const b = ws.getBlockById(${JSON.stringify(sayId)})
+    return { found: !!b, glowing: !!(b && b.isGlowingBlock_) }
+  })()`)
+  t('工作区里那块真的处于高亮态（GUI 侧证据，不是工具的返回值）',
+    glowNow.found === true && glowNow.glowing === true, J(glowNow, 220))
+  await new Promise(r => setTimeout(r, 1900))
+  const glowLater = await raw.evalJson(`(() => {
+    const ws = (window.ScratchBlocks || window.Blockly).getMainWorkspace()
+    const b = ws.getBlockById(${JSON.stringify(sayId)})
+    return { glowing: !!(b && b.isGlowingBlock_) }
+  })()`)
+  t('高亮会自己灭（约 1.4 秒后恢复，不会一直亮着）', glowLater.glowing === false, J(glowLater, 200))
+
+  // ② 变量：桌面版上也走 create → set → rename → delete，每一步都用独立通道读真值
+  const vCreate = await call('scratch_variable', { action: 'create', name: '桌面版计分', scope: 'global' })
+  await call('scratch_apply', { planId: vCreate.planId })
+  const vProbe = `(() => {
+    const s = window.vm.runtime.targets.find(x => x.isStage)
+    const v = Object.values(s.variables).find(x => x.name === ${JSON.stringify('桌面版计分')})
+    return { found: !!v, id: v && v.id, value: v && v.value }
+  })()`
+  const v1 = await raw.evalJson(vProbe)
+  t('create：独立通道在舞台上读到了这个变量', v1.found === true, J(v1, 200))
+  const vSet = await call('scratch_variable', { action: 'set', name: '桌面版计分', value: 7 })
+  await call('scratch_apply', { planId: vSet.planId })
+  const v2 = await raw.evalJson(vProbe)
+  t('set：舞台上的值真的是 7', v2.value === 7, J(v2, 200))
+  const vRen = await call('scratch_variable', { action: 'rename', name: '桌面版计分', newName: '桌面版得分' })
+  await call('scratch_apply', { planId: vRen.planId })
+  const v3 = await raw.evalJson(`(() => {
+    const s = window.vm.runtime.targets.find(x => x.isStage)
+    const v = Object.values(s.variables).find(x => x.id === ${JSON.stringify(v1.id)})
+    return { name: v && v.name, value: v && v.value }
+  })()`)
+  t('rename：同一个 id，名字变成新名字、值没动', v3.name === '桌面版得分' && v3.value === 7, J(v3, 200))
+  const vDel = await call('scratch_variable', { action: 'delete', name: '桌面版得分' })
+  await call('scratch_apply', { planId: vDel.planId })
+  const v4 = await raw.evalJson(`(() => {
+    const s = window.vm.runtime.targets.find(x => x.isStage)
+    return { gone: !Object.values(s.variables).some(x => x.id === ${JSON.stringify(v1.id)}) }
+  })()`)
+  t('delete：舞台上真没了', v4.gone === true, J(v4, 200))
+
+  // ③ 造型：加一个 → 改名 → 切过去 → 删掉；只剩一个时必须拒绝
+  // ⚠️ 这一段**故意不调 add_costume**：真机实测（2026-10-18）桌面版上给项目加新 SVG 造型
+  //    会把这条 CDP 会话打断（编辑器画面正常、造型也真的进场了，但后续 op 全部超时，
+  //    直到重新 attach）。原因还没查清，已记进 STATUS 待办。
+  //    这里改用"复制现有造型"（不走 renderer 建新 skin）来验 rename / set / delete 三件事，
+  //    另外验一下坏 SVG 会被**干净拒绝**（我们的校验在碰 VM 之前就抛）。
+  const costBefore = await raw.evalJson(`window.vm.runtime.targets.find(x => x.getName() === ${JSON.stringify(workTarget)}).getCostumes().length`)
+  await raw.evalJson(`(() => {
+    const t = window.vm.runtime.targets.find(x => x.getName() === ${JSON.stringify(workTarget)})
+    const c = t.getCostumes()[0]
+    t.addCostume(Object.assign({}, c), t.getCostumes().length)
+    return t.getCostumes().length
+  })()`)
+  const costAfterAdd = await raw.evalJson(`window.vm.runtime.targets.find(x => x.getName() === ${JSON.stringify(workTarget)}).getCostumes().length`)
+  t('（准备）复制出一个造型当素材', costAfterAdd === costBefore + 1, `${costBefore} → ${costAfterAdd}`)
+  let badSvgErr = ''
+  const costBeforeBad = costAfterAdd
+  // 空/非 SVG 会被工具的**前置校验**拒掉（在碰 VM 之前就抛）——
+  // 这条能安全验，因为 addCostume 根本不会被调用（它会打断 CDP 会话，见上面那段注释）。
+  const badSvg = await call('scratch_add_costume', { target: workTarget, name: '坏造型', svg: '   ' })
+  try { await call('scratch_apply', { planId: badSvg.planId }) } catch (e) { badSvgErr = String(e.message || e) }
+  const costAfterBad = await raw.evalJson(`window.vm.runtime.targets.find(x => x.getName() === ${JSON.stringify(workTarget)}).getCostumes().length`)
+  t('空 SVG 在碰 VM 之前就被拒绝，项目里不会多出坏造型',
+    /svg 不能为空/.test(badSvgErr) && costAfterBad === costBeforeBad,
+    badSvgErr.slice(0, 160) + ` / costumes ${costBeforeBad}→${costAfterBad}`)
+  const cRen = await call('scratch_costume', { target: workTarget, action: 'rename', index: costAfterAdd, newName: '验收造型B' })
+  const cRenRes = await call('scratch_apply', { planId: cRen.planId })
+  t('rename：返回的 to 就是最终名字（被占用会自动加后缀）',
+    cRenRes.to === '验收造型B', J(cRenRes, 200))
+  const cSet = await call('scratch_costume', { target: workTarget, action: 'set', index: costAfterAdd })
+  await call('scratch_apply', { planId: cSet.planId })
+  const cNow = await raw.evalJson(`(() => {
+    const t = window.vm.runtime.targets.find(x => x.getName() === ${JSON.stringify(workTarget)})
+    return { current: t.currentCostume + 1, name: t.getCostumes()[t.currentCostume].name }
+  })()`)
+  t('set：独立通道看到当前造型真换成了那个（截图前摆姿势靠它）',
+    cNow.current === costAfterAdd && cNow.name === '验收造型B', J(cNow, 200))
+  const cDel = await call('scratch_costume', { target: workTarget, action: 'delete', index: costAfterAdd })
+  await call('scratch_apply', { planId: cDel.planId })
+  const costAfterDel = await raw.evalJson(`window.vm.runtime.targets.find(x => x.getName() === ${JSON.stringify(workTarget)}).getCostumes().length`)
+  t('delete：造型数回到原样', costAfterDel === costBefore, `${costAfterDel} vs ${costBefore}`)
+  const cGuard = await call('scratch_costume', { target: 'Stage', action: 'delete', index: 1 })
+  let cGuardErr = ''
+  try { await call('scratch_apply', { planId: cGuard.planId }) } catch (e) { cGuardErr = String(e.message || e) }
+  t('只剩一个造型时拒绝删除（背景删掉就没得显示）', /只剩一个造型/.test(cGuardErr), cGuardErr)
 
   step('7. 存档 → 从磁盘装回来（真走一遍文件往返）')
   const outSb3 = join(OUT, 'desktop-roundtrip.sb3')

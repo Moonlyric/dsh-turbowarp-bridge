@@ -21,29 +21,32 @@ export const name = 'dsh-plugin-scratch'
 export const inject = ['tools'] // dsh 规范：用到 ctx.tools 必须声明，框架保证注入后才加载
 
 // ---------------- 配置 schema ----------------
-// 为什么是 `.volatile()`：dsh 的「插件页 → 点进组合包 → 点某一行 → 配置」只渲染
-// **volatile 字段**（dsh-settings 的 volatileForm）。普通字段依旧只能改 YAML 文件，
-// 页面上根本不会出现配置控件 —— 这就是「设置参数用不了」的根因。
-// volatile 字段在运行时是 `{ get() }` 引用（cosmokit 的 createVolatile），不改 profile、
-// 不重挂插件就能读到新值；所以下面所有读取都走 cfg（每次读都 get() 一次），改完立即生效。
+// 页面上只放**用户真会改**的三项（`.volatile()` = 会出现在插件页的配置表单里，
+// 且改完立即生效、不用重挂插件）：写操作档位 / 桌面版路径 / 快照目录。
+// 其余是工程参数（端口、快照上限、浏览器路径、skill 总开关）：它们**不进配置页**，
+// 需要时改 profile 的 cordis.patch.yml，然后重挂这一行（端口类本来就要重连才生效）。
+// 为什么必须留 volatile：dsh-settings 靠 volatile 字段生成表单，一个都没有 = 配置页直接不出现。
+// volatile 字段在运行时是 `{ get() }` 引用（cosmokit 的 createVolatile），下面所有读取都走 cfg。
 // ⚠️ 字段名/类型必须与已写入 profile 的 YAML 值兼容（字符串存端口会报校验错）。
 export const Config = z.object({
   safety: z.union(['auto', 'preview', 'suggest']).default('preview').volatile()
     .description('写操作落地方式：preview 先给 diff 等确认，auto 直接落盘，suggest 只给建议'),
-  bridgePort: z.natural().min(1).max(65535).default(31820).volatile()
-    .description('桥监听端口（浏览器扩展连这个端口）。改完 ~2 秒内自动重绑，不用重启'),
-  snapshotsDir: z.string().default('').volatile()
-    .description('快照目录，留空 = 系统临时目录。大项目别堆在系统盘'),
-  maxSnapshots: z.natural().default(30).volatile().description('内存里最多留几份快照'),
-  maxSnapshotMemMb: z.natural().default(64).volatile().description('快照内存上限（MB）'),
-  maxSnapshotDiskMb: z.natural().default(256).volatile().description('快照落盘上限（MB）'),
-  skillsEnabled: z.boolean().default(true).volatile()
-    .description('Skill 经验库总开关（关掉后 scratch_skills 只回 disabled）'),
   desktopPath: z.string().default('').volatile()
     .description('TurboWarp Desktop 的 exe 路径，留空 = 自动找'),
-  desktopDebugPort: z.natural().min(1).max(65535).default(31821).volatile()
+  snapshotsDir: z.string().default('').volatile()
+    .description('快照目录，留空 = 系统临时目录。大项目别堆在系统盘'),
+
+  // ---- 以下仅 YAML 可改（不进配置页）----
+  bridgePort: z.natural().min(1).max(65535).default(31820)
+    .description('桥监听端口（浏览器扩展连这个端口）。改完重挂本行生效'),
+  maxSnapshots: z.natural().default(30).description('内存里最多留几份快照'),
+  maxSnapshotMemMb: z.natural().default(64).description('快照内存上限（MB）'),
+  maxSnapshotDiskMb: z.natural().default(256).description('快照落盘上限（MB）'),
+  skillsEnabled: z.boolean().default(true)
+    .description('Skill 经验库总开关（关掉后 scratch_skills 只回 disabled）'),
+  desktopDebugPort: z.natural().min(1).max(65535).default(31821)
     .description('「AI 可接管」的固定调试端口（与仓库里的 启动TurboWarp(AI可接管).cmd 保持一致）'),
-  browserPath: z.string().default('').volatile()
+  browserPath: z.string().default('')
     .description('网页版用哪个浏览器打开，留空 = 系统默认浏览器'),
 })
 
@@ -1286,6 +1289,36 @@ export function apply(ctx, config) {
   }))
 
   ctx.tools.register(defineTool({
+    name: 'scratch_costume',
+    description: '造型的改名 / 删除 / 切换（添加造型仍用 scratch_add_costume）。'
+      + 'action=rename（新名被占用会自动加后缀，返回的 to 才是最终名字）/ delete（只剩一个造型时会拒绝）/ '
+      + 'set（切到指定造型 —— 截图前把角色摆成某个造型常用）。'
+      + '用 name 或 index（1 起，跟编辑器里显示的一致）指定，都不给 = 当前造型。',
+    parameters: {
+      session: { type: 'string' },
+      target: { type: 'string', description: '角色名，缺省当前编辑目标' },
+      action: { type: 'string', description: 'rename | delete | set' },
+      name: { type: 'string', description: '按造型名指定' },
+      index: { type: 'integer', description: '按序号指定（1 起）' },
+      newName: { type: 'string', description: 'rename 必填：新名字' }
+    },
+    output: jsonOut,
+    async execute(args) {
+      const sid = needSession(args?.session)
+      const action = String(args?.action || '')
+      if (!action) throw new Error('action 必填：rename / delete / set')
+      return await guardedWrite(sid, 'costume', {
+        target: args.target, action, name: args.name, index: args.index, newName: args.newName
+      }, `pre-costume-${action}`, {
+        target: args.target,
+        action,
+        which: args.name || (args.index !== undefined ? `第 ${args.index} 个` : '当前造型'),
+        newName: args.newName
+      })
+    }
+  }))
+
+  ctx.tools.register(defineTool({
     name: 'scratch_rollback',
     description: '回滚到某个快照（AI 改坏项目时的后悔药）。不带参数回滚到最近一次。快照双保险：内存 + 磁盘（dsh 重启后也能滚）。',
     parameters: {
@@ -1695,6 +1728,44 @@ export function apply(ctx, config) {
   }))
 
   ctx.tools.register(defineTool({
+    name: 'scratch_variable',
+    description: '变量 / 列表的增删改与赋值（写操作，受 safety 档位管）。'
+      + 'action=set 赋值（kind=list 时 value 给数组 = 整体替换）/ create 新建 / delete 删除 / rename 改名。'
+      + 'scope=global 挂舞台、local 挂当前角色；不传则先角色后舞台地找。'
+      + 'delete 时如果还有积木在引用它会被拒绝，并列出是哪几个块；确认要连积木一起删就传 force:true。'
+      + 'rename 会把引用它的积木字段一起改（不改就会变成「变量未找到」）。',
+    parameters: {
+      session: { type: 'string' },
+      action: { type: 'string', required: true, description: 'set | create | delete | rename' },
+      kind: { type: 'string', description: 'variable（缺省）| list' },
+      name: { type: 'string', description: '变量名（create 必填；其它动作按名字找）' },
+      id: { type: 'string', description: '变量 id（比名字更准，可选）' },
+      scope: { type: 'string', description: 'global（舞台）| local（当前角色）；不传则两个都找' },
+      target: { type: 'string', description: '局部变量所属角色，缺省当前编辑目标' },
+      value: { type: 'json', description: 'set 的值；create 时可带初始值（列表给数组）' },
+      newName: { type: 'string', description: 'rename 的新名字' },
+      force: { type: 'boolean', description: 'delete 时连引用它的积木一起删' }
+    },
+    output: jsonOut,
+    async execute(args) {
+      const sid = needSession(args?.session)
+      const action = String(args?.action || '')
+      if (!action) throw new Error('action 必填：set / create / delete / rename')
+      if (action === 'create' && !args?.name) throw new Error('create 需要 name')
+      const valueMeta = Array.isArray(args?.value)
+        ? `[${args.value.length} 项]`
+        : (typeof args?.value === 'string' && args.value.length > 60 ? args.value.slice(0, 57) + '…' : args?.value)
+      return await guardedWrite(sid, 'variable', {
+        target: args.target, action, kind: args.kind, name: args.name, id: args.id,
+        scope: args.scope, value: args.value, newName: args.newName, force: args.force === true
+      }, `pre-variable-${action}`, {
+        target: args.target, action, kind: args.kind || 'variable',
+        name: args.name, id: args.id, scope: args.scope, newName: args.newName, value: valueMeta
+      })
+    }
+  }))
+
+  ctx.tools.register(defineTool({
     name: 'scratch_delete_blocks',
     description: '删除积木（blockIds 数组）。注意：删除会级联删除 next 链上的后续块和嵌套实块（与 GUI 行为一致），返回实际删除的全部块 ID。删链中间某块前先想清楚后面要不要保留。',
     parameters: {
@@ -1709,6 +1780,36 @@ export function apply(ctx, config) {
         { target: args.target, blockIds: args.blockIds },
         'pre-delete_blocks',
         { target: args.target, blockIds: args.blockIds }))
+    }
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'scratch_move_block',
+    description: '断链 / 接链：把一块从它现在的位置摘下来、接到别处（**同一个角色内**）。'
+      + 'mode=detach 摘成独立脚本（原来的断口会自动接上）；'
+      + 'after 接到 toBlockId 后面（槽里已有块就插在中间，后面那段跟着走，不会丢）；'
+      + 'before 插到 toBlockId 前面；input 塞进 toBlockId 的输入槽（inputName 例如 CONDITION / SUBSTACK / OPERAND1，被替换的块退回顶层、不删）。'
+      + '跨角色搬积木请用背包（scratch_backpack save → scratch_backpack_load），别用这个。'
+      + '接到自己的子孙上会被拒绝（成环会把工作区搞崩）。',
+    parameters: {
+      session: { type: 'string' },
+      target: { type: 'string', description: '块所在角色，缺省当前编辑目标' },
+      blockId: { type: 'string', required: true, description: '要移动的块 id' },
+      mode: { type: 'string', description: 'detach | after | before | input（缺省 after）' },
+      toBlockId: { type: 'string', description: '目标块 id（after / before / input 必填）' },
+      inputName: { type: 'string', description: 'input 模式必填：目标输入槽名，如 CONDITION / SUBSTACK / OPERAND1' }
+    },
+    output: jsonOut,
+    async execute(args) {
+      const sid = needSession(args?.session)
+      if (!args?.blockId) throw new Error('blockId 必填')
+      return await guardedWrite(sid, 'move_block', {
+        target: args.target, blockId: args.blockId, mode: args.mode,
+        toBlockId: args.toBlockId, inputName: args.inputName
+      }, 'pre-move_block', {
+        target: args.target, blockId: args.blockId, mode: args.mode || 'after',
+        toBlockId: args.toBlockId, inputName: args.inputName
+      })
     }
   }))
 

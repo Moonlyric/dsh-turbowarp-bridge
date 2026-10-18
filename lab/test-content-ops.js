@@ -166,6 +166,10 @@ async function main() {
     // sb3 的读写全靠这两个（base64 ←→ 字节），缺了 save_project 会直接 "btoa is not defined"。
     atob: (s) => Buffer.from(String(s), 'base64').toString('binary'),
     btoa: (s) => Buffer.from(String(s), 'binary').toString('base64'),
+    // 同理：add_costume 要把 SVG 存成**字节**（scratch-storage 的 decodeText 只吃字节数组），
+    // 所以执行器里用了 TextEncoder。vm 沙箱的新 context 不继承它，得显式给。
+    TextEncoder,
+    TextDecoder,
     location: { href: 'https://turbowarp.org/editor', origin: 'https://turbowarp.org' },
     document: { title: '测试项目 - TurboWarp' },
     addEventListener: (type, fn) => { (pageListeners[type] = pageListeners[type] || []).push(fn) },
@@ -1135,6 +1139,192 @@ async function main() {
   t('既没 scriptIds 也没 all 时明确报错', r.ok === false && /scriptIds/.test(r.error), r.error)
   r = await rpc('export_blocks', { target: 'Sprite1', scriptIds: ['nope'] })
   t('id 全不存在时明确报错（不返回空片段）', r.ok === false && /都不在角色/.test(r.error), r.error)
+
+  // ==================== M3：断链/接链、变量/列表、造型 ====================
+  // 这一节的共同敌人是「指针没收拾干净」：重复挂载、孤儿块、悬空 parent。
+  // 症状极隐蔽 —— 积木在 GUI 里看不见但还在执行（或反过来），快照/回滚都救不回来。
+  // 所以每条操作之后都跟一次**双向指针体检**（block.parent ↔ parent 的槽必须互指）。
+  console.log('[test] move_block（断链/接链）')
+  const t1 = vm.runtime.targets.find(x => x.getName() === 'Sprite1')
+  const bl = t1.blocks
+  r = await rpc('add_blocks', {
+    target: 'Sprite1',
+    blocks: {
+      m_hat: { opcode: 'event_whenflagclicked', next: 'm_a', parent: null, inputs: {}, fields: {}, shadow: false, topLevel: true, x: 40, y: 700 },
+      m_a: { opcode: 'motion_movesteps', next: 'm_b', parent: 'm_hat', inputs: { STEPS: [1, [4, '10']] }, fields: {}, shadow: false, topLevel: false },
+      m_b: { opcode: 'control_wait', next: 'm_c', parent: 'm_a', inputs: { DURATION: [1, [5, '1']] }, fields: {}, shadow: false, topLevel: false },
+      m_c: { opcode: 'looks_say', next: null, parent: 'm_b', inputs: { MESSAGE: [1, [10, 'hi']] }, fields: {}, shadow: false, topLevel: false },
+      m_setx: { opcode: 'motion_setx', next: null, parent: null, inputs: { X: [1, [4, '0']] }, fields: {}, shadow: false, topLevel: true, x: 40, y: 900 },
+      m_xpos: { opcode: 'motion_xposition', next: null, parent: null, inputs: {}, fields: {}, shadow: false, topLevel: true, x: 40, y: 1000 }
+    }
+  })
+  t('素材注入成功（三块链 + 一条独立脚本 + 一个报告块）', r.ok === true, r.error)
+  const mid = r.result && r.result.idMap
+  t('注入后链是 帽子→A→B→C', !!mid && bl.getBlock(mid.m_hat).next === mid.m_a &&
+    bl.getBlock(mid.m_a).next === mid.m_b && bl.getBlock(mid.m_b).next === mid.m_c,
+    J2(mid))
+
+  r = await rpc('move_block', { target: 'Sprite1', blockId: mid.m_b, mode: 'detach' })
+  t('detach 成功，并报出「从哪来」', r.ok === true && r.result.from && r.result.from.parent === mid.m_a,
+    r.error + ' / ' + J2(r.result))
+  t('detach 把断口补上了：前一块直接接上后一块（不留孤儿）',
+    bl.getBlock(mid.m_a).next === mid.m_c && bl.getBlock(mid.m_c).parent === mid.m_a,
+    `a.next=${J2(bl.getBlock(mid.m_a).next)} c.parent=${J2(bl.getBlock(mid.m_c).parent)}`)
+  t('detach 出来的块变成顶层脚本（_scripts 有它、topLevel=true）',
+    bl._scripts.includes(mid.m_b) && bl.getBlock(mid.m_b).topLevel === true, J2(bl._scripts))
+
+  r = await rpc('move_block', { target: 'Sprite1', blockId: mid.m_b, mode: 'after', toBlockId: mid.m_a })
+  t('after 插回中间：槽里已有块时插进去，后面那段跟着走（不能把 C 丢了）',
+    r.ok === true && bl.getBlock(mid.m_a).next === mid.m_b &&
+    bl.getBlock(mid.m_b).next === mid.m_c && bl.getBlock(mid.m_c).parent === mid.m_b,
+    r.error + ' / ' + J2(bl.getBlock(mid.m_a).next))
+  t('接回去以后不再是顶层脚本', !bl._scripts.includes(mid.m_b))
+  // GUI 是按 vm 的 XML 重建工作区的（onWorkspaceUpdate → clearWorkspaceAndLoadFromXml），
+  // 所以「块在 XML 里只出现一次、且嵌在父块里」是"用户真的看到它接上去了"的充分条件。
+  // 真机踩过：数据对了但 GUI 没变 —— 就是这里 XML 把块又当成顶层脚本吐了一遍。
+  const xmlOnce = String(bl.toXML())
+  const occurrences = xmlOnce.split(mid.m_b).length - 1
+  t('接回去之后，块在 toXML 里只出现一次（不会既当顶层脚本又当子块）',
+    occurrences === 1, `出现 ${occurrences} 次`)
+
+  r = await rpc('move_block', { target: 'Sprite1', blockId: mid.m_c, mode: 'before', toBlockId: mid.m_b })
+  t('before 插到目标前面，目标原来的槽位不变（A→C→B）',
+    r.ok === true && bl.getBlock(mid.m_a).next === mid.m_c &&
+    bl.getBlock(mid.m_c).next === mid.m_b && bl.getBlock(mid.m_b).next === null &&
+    bl.getBlock(mid.m_b).parent === mid.m_c,
+    r.error + ' / ' + J2(r.result))
+
+  r = await rpc('move_block', { target: 'Sprite1', blockId: mid.m_xpos, mode: 'input', toBlockId: mid.m_setx, inputName: 'X' })
+  t('input 模式把报告块塞进输入槽', r.ok === true &&
+    bl.getBlock(mid.m_setx).inputs.X.block === mid.m_xpos && bl.getBlock(mid.m_xpos).parent === mid.m_setx,
+    r.error + ' / ' + J2(r.result))
+  t('被塞满的输入里，原来那块字面量影子块还在（值不丢，拖出来还能用）',
+    !!bl.getBlock(mid.m_setx).inputs.X.shadow && bl.getBlock(mid.m_setx).inputs.X.shadow !== mid.m_xpos,
+    J2(bl.getBlock(mid.m_setx).inputs.X))
+  t('塞进输入的报告块不再是顶层脚本', !bl._scripts.includes(mid.m_xpos))
+
+  r = await rpc('move_block', { target: 'Sprite1', blockId: mid.m_xpos, mode: 'detach' })
+  t('报告块能再拖出来：输入退回影子块（不是空槽）',
+    r.ok === true && bl.getBlock(mid.m_setx).inputs.X.block === bl.getBlock(mid.m_setx).inputs.X.shadow,
+    r.error + ' / ' + J2(bl.getBlock(mid.m_setx) && bl.getBlock(mid.m_setx).inputs.X))
+  t('拖出来的报告块回到顶层脚本', bl._scripts.includes(mid.m_xpos))
+
+  r = await rpc('move_block', { target: 'Sprite1', blockId: mid.m_hat, mode: 'after', toBlockId: mid.m_c })
+  t('把链头接到自己的子孙上会被拒绝（成环会直接崩工作区）',
+    r.ok === false && /成环|自己/.test(r.error), r.error)
+  r = await rpc('move_block', { target: 'Sprite1', blockId: mid.m_a, mode: 'after', toBlockId: mid.m_a })
+  t('接到自己身上被拒绝', r.ok === false && /自己/.test(r.error), r.error)
+  r = await rpc('move_block', { target: 'Sprite1', blockId: mid.m_a, mode: 'input', toBlockId: mid.m_setx })
+  t('input 模式缺 inputName 时明确报错', r.ok === false && /inputName/.test(r.error), r.error)
+
+  // 双向指针体检：parent 指过去，对面必须指回来
+  const ptrBad = []
+  for (const [bid, b] of Object.entries(bl._blocks)) {
+    if (b.parent) {
+      const p = bl.getBlock(b.parent)
+      if (!p) ptrBad.push(`${bid}.parent 指向不存在的块`)
+      else if (!Object.values(p.inputs || {}).some(i => i.block === bid) && p.next !== bid) {
+        ptrBad.push(`${bid}.parent→${b.parent}，但对面没指回来`)
+      }
+    }
+    if (b.next) {
+      const n = bl.getBlock(b.next)
+      if (!n) ptrBad.push(`${bid}.next 指向不存在的块`)
+      else if (n.parent !== bid) ptrBad.push(`${bid}.next→${b.next}，但它的 parent=${J2(n.parent)}`)
+    }
+  }
+  t('一通断链/接链之后，指针双向一致（没有孤儿、没有重复挂载）', ptrBad.length === 0, ptrBad.slice(0, 4).join(' ｜ '))
+  t('断链/接链没破坏活块模型（inputs/fields 形态仍然合法）',
+    liveModelViolations(t1).length === 0, liveModelViolations(t1).slice(0, 3).join(' ｜ '))
+
+  console.log('[test] variable（变量/列表的增删改）')
+  r = await rpc('variable', { target: 'Sprite1', action: 'create', name: 'm3分', scope: 'global' })
+  t('create 全局变量成功（返回 id 与 scope）', r.ok === true && r.result.scope === 'global' && !!r.result.id,
+    r.error + ' / ' + J2(r.result))
+  const scoreId = r.result && r.result.id
+  t('变量真的挂在舞台上（不是角色局部）', !!stageT.variables[scoreId], Object.keys(stageT.variables).join(','))
+  r = await rpc('variable', { action: 'create', name: 'm3分', scope: 'global' })
+  t('同名变量会被拒绝，并说清是哪儿重名', r.ok === false && /已经有同名/.test(r.error), r.error)
+  r = await rpc('variable', { action: 'set', name: 'm3分', value: 42 })
+  t('set 赋值成功（数字保持数字，不变成字符串）', r.ok === true && r.result.value === 42, J2(r.result))
+  r = await rpc('variable', { action: 'set', name: 'm3分', value: 'abc' })
+  t('set 赋字符串', r.ok === true && r.result.value === 'abc', J2(r.result))
+  r = await rpc('variable', { action: 'set', name: '不存在的变量', value: 1 })
+  t('给不存在的变量赋值时明确报错并指路 create', r.ok === false && /找不到/.test(r.error) && /create/.test(r.error), r.error)
+
+  r = await rpc('add_blocks', {
+    target: 'Sprite1',
+    blocks: {
+      v_set: { opcode: 'data_setvariableto', next: null, parent: null, inputs: { VALUE: [1, [10, '1']] }, fields: { VARIABLE: ['m3分', ''] }, shadow: false, topLevel: true, x: 400, y: 700 }
+    }
+  })
+  t('引用变量的积木注入成功，且字段 id 落到真变量上（resolveRefs）',
+    r.ok === true && bl.getBlock(r.result.idMap.v_set).fields.VARIABLE.id === scoreId,
+    r.error + ' / ' + J2(r.result && bl.getBlock(r.result.idMap.v_set)))
+  const vBlockId = r.result && r.result.idMap.v_set
+
+  r = await rpc('variable', { action: 'rename', name: 'm3分', newName: 'm3得分' })
+  t('rename 成功', r.ok === true && r.result.to === 'm3得分' && r.result.from === 'm3分', J2(r.result))
+  t('引用它的积木字段跟着改名（字段里存的是名字，不改就变「变量未找到」）',
+    bl.getBlock(vBlockId).fields.VARIABLE.value === 'm3得分', J2(bl.getBlock(vBlockId).fields.VARIABLE))
+  r = await rpc('variable', { action: 'delete', name: 'm3得分' })
+  t('还有积木引用时拒绝删除，并报出是哪个块',
+    r.ok === false && /还被 \d+ 个积木引用/.test(r.error) && r.error.includes(vBlockId), r.error)
+  r = await rpc('variable', { action: 'delete', name: 'm3得分', force: true })
+  t('force 时连引用它的积木一起删（不留「变量未找到」的孤儿块）',
+    r.ok === true && !stageT.variables[scoreId] && !bl.getBlock(vBlockId) &&
+    (r.result.removedBlocks || []).includes(vBlockId),
+    J2(r.result))
+
+  r = await rpc('variable', { target: 'Sprite1', action: 'create', name: '名字表', kind: 'list', scope: 'local' })
+  t('create 列表成功（type=list，挂在本角色）',
+    r.ok === true && !!t1.variables[r.result.id] && t1.variables[r.result.id].type === 'list',
+    r.error + ' / ' + J2(r.result))
+  const listId = r.result && r.result.id
+  r = await rpc('variable', { action: 'set', name: '名字表', kind: 'list', value: ['甲', '乙'] })
+  t('列表整体赋值', r.ok === true && JSON.stringify(r.result.value) === '["甲","乙"]' && r.result.length === 2, J2(r.result))
+  r = await rpc('variable', { action: 'set', name: '名字表', kind: 'list', value: '不是数组' })
+  t('给列表赋非数组会被明确拒绝（别悄悄变成一项）', r.ok === false && /数组/.test(r.error), r.error)
+  r = await rpc('variable', { action: 'delete', name: '名字表', kind: 'list' })
+  t('没被引用的列表可以直接删', r.ok === true && !t1.variables[listId], J2(r.result))
+
+  console.log('[test] costume（造型改名/删除/切换）')
+  const tinySvg = '<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"></svg>'
+  const beforeCount = t1.getCostumes().length
+  r = await rpc('add_costume', { target: 'Sprite1', name: 'm3造型A', svg: tinySvg })
+  t('先加一个造型当素材', r.ok === true, r.error)
+  // ⚠️ 这条守的是「"?" 占位造型」那个真 bug：SVG 必须按**字节**存进 asset。
+  //    存字符串时 scratch-storage 的 decodeText() 会抛 TypeError → loadCostume 走 catch →
+  //    造型永远没有 skin，编辑器里显示成一张 "?"（浏览器/桌面版都会）。
+  t('加造型后真的载入了皮肤（有 skinId + 有限的旋转中心）',
+    r.ok === true && r.result.skin === true && Number.isFinite(r.result.rotationCenter[0]),
+    J2(r.result))
+  const emptySvg = await rpc('add_costume', { target: 'Sprite1', svg: '   ' })
+  t('空 SVG 在碰 storage 之前就被拒绝（别把坏 asset 塞进项目）',
+    emptySvg.ok === false && /svg 不能为空/.test(emptySvg.error), emptySvg.error)
+  const addedIdx = t1.getCostumes().length // 1 起（与编辑器里显示一致）
+  const addedName = t1.getCostumes()[addedIdx - 1].name
+  t('新造型被追加到列表末尾', addedIdx === beforeCount + 1, `${beforeCount} -> ${addedIdx}`)
+
+  r = await rpc('costume', { target: 'Sprite1', action: 'rename', index: addedIdx, newName: 'm3造型B' })
+  t('rename 造型成功（报出原名/新名/序号）',
+    r.ok === true && r.result.to === 'm3造型B' && r.result.from === addedName && r.result.index === addedIdx,
+    r.error + ' / ' + J2(r.result))
+  r = await rpc('costume', { target: 'Sprite1', action: 'rename', index: addedIdx, newName: t1.getCostumes()[0].name })
+  t('改成已有的名字会自动去重（不出现两个同名造型）',
+    r.ok === true && r.result.to !== t1.getCostumes()[0].name && r.result.deduped === true, J2(r.result))
+  r = await rpc('costume', { target: 'Sprite1', action: 'set', index: addedIdx })
+  t('set 切造型（截图前摆姿势用）',
+    r.ok === true && r.result.current === addedIdx && r.result.name === t1.getCostumes()[addedIdx - 1].name, J2(r.result))
+  r = await rpc('costume', { target: 'Sprite1', action: 'delete', index: addedIdx })
+  t('delete 成功并报出还剩哪些', r.ok === true && r.result.remaining.length === beforeCount, J2(r.result))
+  t('删完造型数回到原样（没有多删）', t1.getCostumes().length === beforeCount, `${t1.getCostumes().length}`)
+  r = await rpc('costume', { target: 'Stage', action: 'delete', index: 1 })
+  t('只剩一个造型时拒绝删除（删了角色就没法显示）', r.ok === false && /只剩一个造型/.test(r.error), r.error)
+  r = await rpc('costume', { target: 'Sprite1', action: 'delete', index: 9 })
+  t('越界序号明确报错', r.ok === false && /越界/.test(r.error), r.error)
+  r = await rpc('costume', { target: 'Sprite1', action: 'rename', name: '不存在的造型', newName: 'x' })
+  t('造型名不存在时把实际有哪些列出来', r.ok === false && /没有造型/.test(r.error), r.error)
 
   console.log(`\n===== ops 层单测: ${pass} pass / ${fail} fail =====`)
   process.exit(fail ? 1 : 0)

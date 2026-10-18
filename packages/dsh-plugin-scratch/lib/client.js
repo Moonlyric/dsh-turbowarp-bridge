@@ -21,7 +21,9 @@ window.__ModuleLoader__.load({
     const NS = 'dsh-plugin-scratch'
     const ROW_ID = 'scratch'
 
-    // 表单一行的描述。key 必须与 index.js 的 Config 字段一一对应。
+    // 表单一行的描述。key 必须与 index.js 的 Config 里**那三个 volatile 字段**一一对应。
+    // 刻意只放这三项：端口 / 快照上限 / 浏览器路径 / skill 总开关都属于工程参数，
+    // 放进来只会让人在设置页里纠结（要改就去 profile 的 cordis.patch.yml）。
     const FIELDS = [
       {
         key: 'safety', label: '写操作档位', kind: 'select',
@@ -31,15 +33,8 @@ window.__ModuleLoader__.load({
           ['suggest', 'suggest —— 只给建议，不动项目'],
         ],
       },
-      { key: 'bridgePort', label: '桥监听端口', kind: 'number', help: '浏览器扩展连这个端口。改完约 2 秒自动重绑，不用重启' },
-      { key: 'desktopDebugPort', label: '桌面版调试端口', kind: 'number', help: '与仓库里的「启动TurboWarp(AI可接管).cmd」保持一致（默认 31821）' },
-      { key: 'desktopPath', label: 'TurboWarp Desktop 路径', kind: 'text', help: '留空 = 自动在常见目录里找', wide: true },
-      { key: 'browserPath', label: '浏览器路径（网页版用）', kind: 'text', help: '留空 = 系统默认浏览器；Windows 下也接受 .cmd/.bat 包装脚本', wide: true },
-      { key: 'snapshotsDir', label: '快照目录', kind: 'text', help: '留空 = 系统临时目录。大项目别堆在系统盘', wide: true },
-      { key: 'maxSnapshots', label: '快照份数上限', kind: 'number' },
-      { key: 'maxSnapshotMemMb', label: '快照内存上限（MB）', kind: 'number' },
-      { key: 'maxSnapshotDiskMb', label: '快照落盘上限（MB）', kind: 'number' },
-      { key: 'skillsEnabled', label: 'Skill 经验库', kind: 'boolean', help: '关掉后 scratch_skills 只回 disabled，工具本体不受影响' },
+      { key: 'desktopPath', label: 'TurboWarp Desktop 路径', kind: 'text', help: '留空 = 自动在常见目录里找（一般不用填）', wide: true },
+      { key: 'snapshotsDir', label: '快照目录', kind: 'text', help: '留空 = 系统临时目录。项目大、系统盘又紧时改到这里', wide: true },
     ]
 
     const muted = { color: 'var(--dsw-alias-label-tertiary, #888)', fontSize: 12, lineHeight: '18px', margin: 0 }
@@ -126,8 +121,8 @@ window.__ModuleLoader__.load({
 
       if (view === 'summary') {
         if (!ready) return h('span', { style: muted }, '配置加载中…')
-        return h('span', { style: muted },
-          `${snapshot.value && snapshot.value.safety ? snapshot.value.safety : 'preview'} · :${snapshot.value && snapshot.value.bridgePort ? snapshot.value.bridgePort : '?'}`)
+        const v = (snapshot && snapshot.value) || {}
+        return h('span', { style: muted }, `${v.safety || 'preview'} · ${v.desktopPath ? '桌面版已指定' : '桌面版自动找'}`)
       }
 
       if (!snapshot) {
@@ -171,7 +166,7 @@ window.__ModuleLoader__.load({
 
       const head = h('div', { key: 'head', style: { display: 'flex', flexDirection: 'column', gap: 2 } }, [
         h('p', { key: 't', style: { margin: 0, fontSize: 14, fontWeight: 600, color: 'var(--dsw-alias-label-primary, #111)' } }, 'TurboWarp 桥'),
-        h('p', { key: 'd', style: muted }, '改完点保存即写入当前 profile 的 cordis.patch.yml，并立刻生效（端口除外，约 2 秒自动重绑）。'),
+        h('p', { key: 'd', style: muted }, '改完点保存即写入当前 profile 的 cordis.patch.yml，立刻生效。'),
       ])
 
       const grid = h('div', {
@@ -185,7 +180,7 @@ window.__ModuleLoader__.load({
         onChange: (v) => setDraft((d) => Object.assign({}, d, { [f.key]: v })),
       })))
 
-      const foot = h('div', { key: 'foot', style: { display: 'flex', alignItems: 'center', gap: 10 } }, [
+      const foot = h('div', { key: 'foot', style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' } }, [
         h('button', {
           key: 'save',
           type: 'button',
@@ -199,6 +194,7 @@ window.__ModuleLoader__.load({
         }, busy ? '保存中…' : '保存'),
         note ? h('span', { key: 'n', style: muted }, note) : null,
         !writable ? h('span', { key: 'ro', style: muted }, '当前 profile 只读，不能在此修改') : null,
+        h('span', { key: 'eng', style: muted }, '端口、快照上限这类工程参数不在这里 —— 要改请编辑 profile 的 cordis.patch.yml。'),
       ])
 
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } }, [head, grid, foot])

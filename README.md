@@ -7,7 +7,7 @@ v0.7.0 起它还能**替你点绿旗、点角色、按键、读运行期状态�
 所以"改完到底行不行"不用你自己去点。
 
 ```
-dsh 插件（Node，30 个 scratch_* 工具 + WebSocket 桥 :31820）
+dsh 插件（Node，33 个 scratch_* 工具 + WebSocket 桥 :31820）
 
   路径一 · 扩展桥（你自己浏览器里的编辑器）
       ↕ JSON-RPC over ws（握手 token）
@@ -27,7 +27,7 @@ dsh 插件（Node，30 个 scratch_* 工具 + WebSocket 桥 :31820）
 | CDP 直连 | **主力**（装了 TurboWarp Desktop 就用它） | 只要 TurboWarp Desktop（**零安装、零 token**） | `transport=cdp` | `cd-1` | `cdp-desktop` |
 | 扩展桥 | 备用 | 装 MV3 扩展 + 选项页填 token | `transport=sw` | `tw-1` | `extension-bridge` |
 
-**怎么选**：有 TurboWarp Desktop 就一律走桌面版 —— 零安装零 token、离线可用、30 个工具全通，
+**怎么选**：有 TurboWarp Desktop 就一律走桌面版 —— 零安装零 token、离线可用、33 个工具全通，
 而且**只有它能截图**（`scratch_screenshot`）。扩展桥留着应付三种它做不到的情况：
 ① 这台机器没装桌面版；② 你已经在浏览器标签里编辑某个**在线作品**，不想存盘重开；
 ③ 要同时开好几个作品（多标签，`scratch_list_sessions` 里按 `session` 选）。
@@ -132,9 +132,10 @@ github:Moonlyric/dsh-turbowarp-bridge#path:packages/dsh-plugin-scratch
 
 - **组合包开关** —— 关掉 = 从 `dsh.profile.bundles` 撤掉，插件停止运行；
 - **`scratch` 这一行** —— 单独关掉 = 只停插件、保留安装（写进 profile patch 的 `disabled`）；
-- **配置**（这一行的配置控件）—— `safety` / `bridgePort` / `desktopPath` / `desktopDebugPort` /
-  `snapshotsDir` / 三个快照上限 / `skillsEnabled` / `browserPath`。改完点保存即写回 profile 的
-  `cordis.patch.yml` 并**立即生效**（端口约 2 秒自动重绑，不用重启 dsh）。
+- **配置**（这一行的配置控件）—— 只放三项：**写操作档位**（preview / auto / suggest）、
+  **TurboWarp Desktop 路径**（留空自动找）、**快照目录**。改完点保存即写回 profile 的
+  `cordis.patch.yml` 并**立即生效**。端口、快照上限这些工程参数**不在页面上** ——
+  要改就编辑 profile 的 `cordis.patch.yml`，然后重挂这一行。
 
 为什么不能像以前那样手改 YAML：插件页只列**组合包**（`package.json` 声明了 `dsh.bundle.patch`
 的包）。把手写的 `insert:` 塞进 profile patch 属于「绕过插件管理器的注入」—— 插件能跑，
@@ -260,7 +261,7 @@ TurboWarp 时会 SKIP，不打扰你。
 ## 目录
 
 ```
-packages/dsh-plugin-scratch/   dsh 插件：桥服务端 + 30 个工具 + 经验库 + 背包 + CDP 直连 + 单测
+packages/dsh-plugin-scratch/   dsh 插件：桥服务端 + 33 个工具 + 经验库 + 背包 + CDP 直连 + 单测
                                lib/client.js = 浏览器半侧（插件页里的配置表单，手写不用打包）
                                win32-window.ps1 = 窗口可见性探针（EnumWindows，Windows only）
 packages/tw-bridge-extension/  MV3 扩展：SW 持 socket，内容脚本操作 window.vm

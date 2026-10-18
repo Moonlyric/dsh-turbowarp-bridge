@@ -29,7 +29,7 @@ const t = (name, cond, detail) => {
 }
 const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 // v0.7.0 加了 9 个运行控制/可观测工具（19 → 28），v0.8.0 加了 2 个背包工具（→ 30）
-const TOOL_COUNT = 30
+const TOOL_COUNT = 33
 
 // ---- 桩：把收到的参数追加到一个文件里，冒充「被打开的程序」 ----
 const browserStub = join(STUB_DIR, 'stub-browser.cmd')
@@ -375,12 +375,16 @@ const Config = mod.Config
 t('导出了 Config（dsh 的 settings 服务靠它生成配置表单）', !!Config, typeof Config)
 const configDict = (Config && (Config.dict || (Config.meta && Config.meta.dict))) || {}
 const configKeys = Object.keys(configDict)
-t('Config 有 10 个字段（与配置页表单一一对应）', configKeys.length === 10, configKeys.join(','))
-const nonVolatile = configKeys.filter(k => !(configDict[k] && configDict[k].meta && configDict[k].meta.volatile))
-t('所有字段都是 volatile（否则 settings 报「没有 volatile 字段」，配置页直接不出现）',
-  nonVolatile.length === 0, 'not volatile: ' + nonVolatile.join(','))
+t('Config 有 10 个字段（字段名与 profile YAML / 代码读取处一致）', configKeys.length === 10, configKeys.join(','))
+const volatileKeys = configKeys.filter(k => configDict[k] && configDict[k].meta && configDict[k].meta.volatile).sort()
+t('配置页只暴露三项（写操作档位 / 桌面版路径 / 快照目录），工程参数不进表单',
+  volatileKeys.join(',') === 'desktopPath,safety,snapshotsDir', volatileKeys.join(','))
 
 const clientSrc = readFileSync(join(PKG_DIR, 'lib', 'client.js'), 'utf8')
+t('浏览器半侧的表单与 volatile 字段一一对应（多了 = 页面上出现改了不生效的控件）',
+  volatileKeys.every(k => clientSrc.includes("key: '" + k + "'"))
+  && !/key: '(bridgePort|desktopDebugPort|browserPath|maxSnapshots|maxSnapshotMemMb|maxSnapshotDiskMb|skillsEnabled)'/.test(clientSrc),
+  volatileKeys.join(','))
 t('浏览器半侧是 __ModuleLoader__ 的惰性 bundle（宿主只认这种格式）',
   clientSrc.includes('window.__ModuleLoader__.load(') && clientSrc.includes('factory:'))
 t('浏览器半侧的模块 id 就是包名（写错 = 挂不上 Loader 行）',
@@ -526,6 +530,47 @@ t('注入时会落地变量引用（resolveRefs：有效不动 / 同名改指向
   String(['resolveRefs', 'byName', 'create'].filter(k => !executorSrc.includes(k)).join(',')))
 t('背包片段导出时列表封顶（不然 5000 项的巨型列表又被搬一遍）',
   executorSrc.includes('listCap') && executorSrc.includes('truncated'))
+
+// ==================== 13. M3：精细编辑（断链/接链、变量/列表、造型）====================
+// 这一类操作最容易「看着成功、项目其实坏了」：指针不收拾 = 重复挂载/孤儿块，
+// 变量改名不同步 = 「变量未找到」。所以契约必须写死在描述和执行器里。
+console.log('\n[13] 精细编辑（move_block / variable / costume）')
+t('三个工具都注册了（scratch_move_block / scratch_variable / scratch_costume）',
+  ['scratch_move_block', 'scratch_variable', 'scratch_costume'].every(n => registered.has(n)),
+  [...registered.keys()].filter(k => /move_block|variable|costume/.test(k)).join(','))
+t('move_block 把四种模式写在描述里（detach / after / before / input）',
+  ['detach', 'after', 'before', 'input'].every(m => registered.get('scratch_move_block').description.includes(m)),
+  registered.get('scratch_move_block').description.slice(0, 160))
+t('move_block 明说跨角色要用背包（不让人以为它能跨角色搬）',
+  /背包/.test(registered.get('scratch_move_block').description) &&
+  /同一个角色/.test(registered.get('scratch_move_block').description))
+t('三个工具都受 safety 档位管（preview 档只出 plan，不直写）',
+  ['move_block', 'variable', 'costume'].every(op =>
+    new RegExp(`guardedWrite\\(sid, '${op}'`).test(indexSrc)))
+t('variable 把四个动作写在描述里（set / create / delete / rename），并说明 delete 有引用时的 force',
+  ['set', 'create', 'delete', 'rename'].every(a => registered.get('scratch_variable').description.includes(a)) &&
+  /force/.test(registered.get('scratch_variable').description))
+t('variable 的 value 用 type:"json"（列表要能传数组，用 string 就会被拒）',
+  /value: \{ type: 'json'/.test(indexSrc), paramNames('scratch_variable').join(','))
+t('costume 三个动作（rename / delete / set）都说明白了，且写清「只剩一个造型会拒绝」',
+  ['rename', 'delete', 'set'].every(a => registered.get('scratch_costume').description.includes(a)) &&
+  /只剩一个造型/.test(registered.get('scratch_costume').description),
+  registered.get('scratch_costume').description.slice(0, 140))
+t('执行器里三个 op 都在，且改完都让 GUI 重建工作区（safeEmitWorkspaceUpdate）',
+  ["case 'move_block'", "case 'variable'", "case 'costume'"].every(k => executorSrc.includes(k)) &&
+  (executorSrc.match(/safeEmitWorkspaceUpdate\(vm\)/g) || []).length >= 6,
+  String((executorSrc.match(/safeEmitWorkspaceUpdate\(vm\)/g) || []).length))
+t('断链/接链自己收拾指针（unlinkBlock 补断口 + attachAfter 插中间，不借官方 moveBlock）',
+  executorSrc.includes('function unlinkBlock') && executorSrc.includes('function attachAfter') &&
+  executorSrc.includes('function attachInput'))
+t('接到自己的子孙上会被拒绝（成环会把工作区搞崩）',
+  /成环/.test(executorSrc) && executorSrc.includes('subtreeIds'))
+t('变量改名会把引用它的积木字段一起改（updateBlocksAfterVarRename）',
+  executorSrc.includes('updateBlocksAfterVarRename'))
+t('删变量前数一遍引用块；force 时先补断口再删（不留悬空指针）',
+  executorSrc.includes('function variableRefs') &&
+  /还被 \$\{refs\.length\} 个积木引用/.test(executorSrc) &&
+  /unlinkBlock\(bt\.blocks, r\.blockId\)/.test(executorSrc))
 
 console.log(`\n===== 插件工具单测: ${pass} pass / ${fail} fail =====`)
 try { rmSync(STUB_DIR, { recursive: true, force: true }); rmSync(HOME, { recursive: true, force: true }) } catch {}

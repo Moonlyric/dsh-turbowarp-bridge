@@ -7,7 +7,7 @@
 ## 架构（一句话）
 
 ```
-dsh 插件（Node，30 个 scratch_* 工具 + WebSocket 桥 :31820 + CDP 直连客户端）
+dsh 插件（Node，33 个 scratch_* 工具 + WebSocket 桥 :31820 + CDP 直连客户端）
 
   路一 · 扩展桥（用户自己的浏览器）
         ↕ JSON-RPC over ws（握手 token 认证）
@@ -49,11 +49,11 @@ AI 侧的入口是 `scratch_open_editor`：用户说「打开 TurboWarp」时，
 | **Skill 区** | Scratch 实践经验库（10 篇）+ scratch_skills / scratch_skill_edit + 三层开关 | ✅ 23/23 |
 | **审计 + 修** | 全项目审查：修掉「核心注入在真机上根本不工作」等 7 个真 bug，补断言防回归 | ✅ 2026-10-16 |
 | **LNA 改造** | socket 从页面搬进扩展 service worker + 心跳保活 + `lab` 加 LNA/保活断言 | ✅ 2026-10-17（这次绿才算数） |
-| **M0.5 真机** | 真 Chrome/Edge + 真 turbowarp.org 全链路自动验收（30 工具 + 存/读 sb3） | ✅ **115/115**（2026-10-17 关 VPN 实测，Chrome 与 Edge 各一遍；旧的 98/98 是假绿） |
+| **M0.5 真机** | 真 Chrome/Edge + 真 turbowarp.org 全链路自动验收（33 工具 + 存/读 sb3） | ✅ **115/115**（2026-10-17 关 VPN 实测，Chrome 与 Edge 各一遍；旧的 98/98 是假绿） |
 | **CDP 直连** | TurboWarp Desktop 零安装路径：带调试端口启动 + 注默认上下文 + 接管用户自己开的窗口 | ✅ 2026-10-17（v0.8.0 后 100/100，见下） |
 | **主动唤起** | `scratch_open_editor`：AI 自己开浏览器/桌面版并等会话连上；新增 `path` 装作品 | ✅ 2026-10-16 / 扩展于 2026-10-17 |
 | **文件往返** | `scratch_load_project` / `scratch_save_project`（打开本机 .sb3、存回磁盘、默认不覆盖） | ✅ |
-| **M3** | 断链/接链（moveBlock 的 parent 系）、变量/列表增删、造型删除改名 | 未开始（**Firefox 支持已决定不做**，见下） |
+| **M3** | 断链/接链（`move_block` 四模式）、变量/列表增删改（`variable`）、造型删改（`costume`） | ✅ v0.9.0（替身层 246 + 插件 122 + 桌面真机 122） |
 | **背包** | **AI 自维护的代码块背包**：把做好的可复用积木（pen 文字引擎、弹幕骨架、ECS 骨架…）预存下来，下次直接取用 | ✅ v0.8.0（36+14 条断言，见下） |
 | **M4** | 多标签页路由（SW 已按 tab 记账，还差 UI）、快照 diff 预览 UI、性能（大项目分页读） | 部分（路由已做） |
 | **M5** | 发布：npm 组合包 + `dsh plugin add`（版本锁定） | 未开始 |
@@ -66,7 +66,7 @@ AI 侧的入口是 `scratch_open_editor`：用户说「打开 TurboWarp」时，
 
 **桌面版是主力，扩展桥进维护态（修 bug、不加功能）。**
 
-理由：用户装了 TurboWarp Desktop，那条路零安装零 token、离线可用、30 个工具全通，
+理由：用户装了 TurboWarp Desktop，那条路零安装零 token、离线可用、33 个工具全通，
 而且**是唯一能截图的**（CDP `Page.captureScreenshot`）。扩展桥只在三种它做不到的场景里更好用：
 
 | 场景 | 扩展桥 | 桌面版 |
@@ -149,7 +149,7 @@ fake-IP（198.18.x.x 之类的私网段），Chrome 据此判定"本页也是本
 `node lab/sync-executor.mjs`；`test-tools.mjs` 有一条逐字节一致的断言守着（忘了同步测试会红）。
 只检查：`node lab/sync-executor.mjs --check`。
 
-**验收闭环**：`lab/desktop-cdp-check.mjs`（61 条，本轮实测全绿）真开一个 TurboWarp 窗口、
+**验收闭环**：`lab/desktop-cdp-check.mjs`（122 条，本轮实测全绿）真开一个 TurboWarp 窗口、
 跑完自动关掉；它用**另一条独立的 CDP 连接**直接读 `vm.runtime.targets[].blocks._blocks` 当证据
 （不读插件自己的返回值），还会验"存盘 → 从磁盘装回来"的往返、**接管用户自己开的实例**
 （第 8 节：接管的是那个实例、没新开窗口、没重复注册会话、收尾关干净）、以及
@@ -207,14 +207,14 @@ hint 里说明"没动他的窗口"。
 
 | 套件 | 覆盖 | 结果 |
 |---|---|---|
-| `lab/test-content-ops.js` | 扩展执行器全协议（真实 `content-main.js` 进 Node vm 沙箱 + 真 headless scratch-vm）+ v0.7.0 瘦身体积断言 + v0.8.0 背包（导出/注入/变量落地/**与官方序列化器逐块对拍**） | 200/200 ✅ |
-| `lab/real-machine-check.mjs` | **真 Chrome/Edge + 真 turbowarp.org 全链路**（装扩展 → token 握手 → 30 工具 + 存/读 sb3 + 45s 保活） | **115/115** ✅（Chrome、Edge 各一遍；不传 `SB3_FIXTURE`，传了真实 sb3 会更多） |
-| `lab/desktop-cdp-check.mjs` | **TurboWarp Desktop + CDP 直连**端到端（独立 CDP 连接读真 VM + 存盘往返 + 接管用户实例 + 关掉后会话自动掉线 + v0.7.0 运行控制 + v0.8.0 背包往返） | 100/100 ✅ |
+| `lab/test-content-ops.js` | 扩展执行器全协议（真实 `content-main.js` 进 Node vm 沙箱 + 真 headless scratch-vm）+ v0.7.0 瘦身体积断言 + v0.8.0 背包（导出/注入/变量落地/**与官方序列化器逐块对拍**） | 246/246 ✅ |
+| `lab/real-machine-check.mjs` | **真 Chrome/Edge + 真 turbowarp.org 全链路**（装扩展 → token 握手 → 33 工具 + 存/读 sb3 + 45s 保活） | **115/115** ✅（Chrome、Edge 各一遍；不传 `SB3_FIXTURE`，传了真实 sb3 会更多） |
+| `lab/desktop-cdp-check.mjs` | **TurboWarp Desktop + CDP 直连**端到端（独立 CDP 读真 VM + 存盘往返 + 接管用户实例 + 掉线自检 + 运行控制 + 背包往返 + v0.9.0 接链/变量/造型/高亮的 GUI 断言） | 122/122 ✅ |
 | `lab/sync-executor.mjs` | 把扩展 `content-main.js` 同步成插件包的 `vm-executor.js`（`--check` 只检查） | 工具 ✅ |
 | `lab/test-vm-pipeline.js` | scratch-vm 管线冒烟（无断言，打印型） | 跑通 ✅ |
 | `lab/inspect-sb3.mjs` | 离线读 sb3/project.json：同时报**真块数**和**含影子块数**（引用块数必须写清数法） | 工具 ✅ |
 | `packages/dsh-plugin-scratch/test-skills.mjs` | skill 区 | 23/23 ✅ |
-| `packages/dsh-plugin-scratch/test-tools.mjs` | 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 / CDP 启动参数与诚实报错 / `tagForPage` / 执行器副本一致性 / 打包契约 / v0.7.0 新工具契约 / v0.8.0 背包与归因契约） | 109/109 ✅ |
+| `packages/dsh-plugin-scratch/test-tools.mjs` | 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 / CDP 启动参数与诚实报错 / `tagForPage` / 执行器副本一致性 / 打包契约 / v0.7.0 新工具契约 / v0.8.0 背包与归因契约） | 122/122 ✅ |
 | `packages/dsh-plugin-scratch/test-backpack.mjs` | **背包集成**（假页面连真桥：存 → 落盘 → list/read → 注入（x/y 平移、变量声明、variableValues）→ preview 不落盘 → 删除进 `_trash` → 名字穿越防护） | 36/36 ✅ |
 | `packages/dsh-plugin-scratch/test-bridge-auth.mjs` | 握手认证 + 跨会话伪造防护 + ping/pong 保活 | 21/21 ✅ |
 
@@ -264,6 +264,32 @@ CDP 那条路也有它自己的盲区：`desktop-cdp-check.mjs` 只在装了 Tur
    （只给"哪条脚本的线程活着"）+ 一句"关掉编译器才能看块级"，**不拿 100% 挂在帽子块上冒充热点**。
 4. **执行器源码曾在插件加载时读一次就缓存** → 改完 `sync-executor`、重开编辑器，注进去的仍是旧代码
    （真机白验一轮，还以为是自己写错了）。现在按 mtime 每次注入前重读。
+
+## v0.9.0：精细编辑 + 改完亮一下（2026-10-18）
+
+| 面 | 做成了什么 |
+|---|---|
+| `scratch_move_block` | 断链/接链四模式：`detach`（断口自动接上）、`after`（槽里有块就插中间，后面那段跟着走）、`before`、`input`（塞进输入槽，被换下的块退回顶层不删）。**跨角色搬积木仍走背包** |
+| `scratch_variable` | 变量/列表 `set` / `create` / `delete` / `rename`；删前数引用块（有引用就拒绝并列出，`force` 连块一起删）；改名会把引用它的积木字段一起改 |
+| `scratch_costume` | 造型 `rename`（重名自动加后缀）/ `delete`（只剩一个拒绝）/ `set`（截图前摆姿势） |
+| **「改完亮一下」** | `add_blocks` / `update_block` / `move_block` 改完让受影响的块**发光 1.4 秒** —— 走编辑器自己的 `vm.runtime.glowBlock` → GUI `workspace.glowBlock`（跟积木执行时同一套视觉），不是自己画 |
+| 配置页瘦身 | 插件页只留三项（写操作档位 / 桌面版路径 / 快照目录）；端口、快照上限、skill 总开关等工程参数退回 YAML |
+
+实现要点：断链/接链**不借官方 `Blocks.moveBlock`**（它只负责"挂到新位置"，不 heal 原 next 链、不清输入里的旧指针；
+Blockly 那边是靠多条事件补的），自己写 `unlinkBlock` + `attachAfter` + `attachInput`，改完 `emitWorkspaceUpdate()` 让 GUI
+按 vm 的 XML 重建工作区（TurboWarp 自己的 `onWorkspaceUpdate` → `clearWorkspaceAndLoadFromXml`）。
+
+### 这一轮踩到的两个真坑
+
+1. **SVG 必须按字节存进 asset，不能塞字符串**（`scratch_add_costume` 一直是坏的）。
+   `scratch-storage` 的 `Asset.decodeText()` 无条件 `new TextDecoder().decode(this.data)`，
+   传字符串直接 `TypeError: parameter 1 is not of type 'ArrayBuffer'` → `loadCostume` 进 catch →
+   造型永远没有 skin：编辑器里就是一张 **"?" 占位图**（用户在真机上看到的就是这个）。
+   旧的真机断言只判 `rotationCenter !== 48`，所以一直"绿着坏"。现在改成断言 `skinId` + 有限旋转中心，
+   并且载入失败会**把造型撤掉再报错**，不把 "?" 留在项目里。
+2. **桌面版上加新 SVG 造型会打断 CDP 会话**（页面本身没事，编辑器照样能点；是我们的 `deliver` 打到了失效的
+   执行上下文 → 之后的 op 全部超时）。已确认不是 SVG 的问题（换合法图也一样），也还没修 ——
+   记进 `STATUS.md` 待办：需要"上下文失效 → 重新注入/重连"的自愈。
 
 ## v0.7.0：把「问题记录」清账（2026-10-18）
 
@@ -384,14 +410,14 @@ CDP 那条路也有它自己的盲区：`desktop-cdp-check.mjs` 只在装了 Tur
     端口可配（`desktopDebugPort`），但**改了要同步改 `启动TurboWarp(AI可接管).cmd`** ——
     两边是同一个约定，脱钩了就接管不上。
 13. **桌面版是主力，扩展桥进维护态**（2026-10-18，用户定的）：有 TurboWarp Desktop 就一律
-    `app:'desktop'` —— 零安装零 token、离线可用、30 个工具全通，而且**只有它能截图**。
+    `app:'desktop'` —— 零安装零 token、离线可用、33 个工具全通，而且**只有它能截图**。
     扩展桥继续留着并跑回归（真机 115 条），是因为桌面版做不到三件事：机器上没装桌面版、
     改浏览器里已经开着的在线作品、多标签并行。但**不再为它加新能力**
     （`captureVisibleTab`、Firefox userscript、Safari 全部明确不做）。
 
 ## 给接手 AI 的提示
 
-- 你的 30 个工具：`scratch_open_editor`（主动开编辑器，浏览器/桌面版两条路；`port` 接管任意调试端口，
+- 你的 33 个工具：`scratch_open_editor`（主动开编辑器，浏览器/桌面版两条路；`port` 接管任意调试端口，
   `show:false` 只接管不弹窗）/ `list_sessions` / `selftest`（排障第一步）/
   `snapshot` / `read_script`（`summary` 先看结构，`scriptId`/`opcodes` 再读块体） / `list_scripts` /
   `add_blocks` / `apply` / `locate` / `add_costume` / `rollback` /
