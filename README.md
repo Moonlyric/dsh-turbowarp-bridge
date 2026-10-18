@@ -288,5 +288,5 @@ ROADMAP.md                     里程碑、设计决策、修过的真 bug
 
 MIT（见 [LICENSE](LICENSE)）。TurboWarp / Scratch 是各自所有者的项目，本仓库只是它们的客户端。
 
-> 仓库里的「经验库」（`packages/dsh-plugin-scratch/skills/*.md`）是对社区公开作品**做法**的总结，
+> 仓库里的「经验库」（`packages/dsh-plugin-scratch/skills/*.md`）是对公开作品里常见**做法**的归纳，
 > 只有文字经验，不含任何他人作品文件或资源。

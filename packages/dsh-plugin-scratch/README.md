@@ -231,10 +231,10 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
 
 ## Skill 区（Scratch 实践经验库）
 
-对社区高完成度作品**做法**的总结，13 篇经验文档：
+对公开作品里常见**做法**的归纳，14 篇文档：
 `getting-started` / `code-patterns` / `animation-visual` / `architecture` /
-`performance` / `sb3-json-reference` / `project-planning` / `recipes` /
-`runtime-control`（跑起来再改）/ `backpack`（攒积木）。
+`proven-patterns`（十种能照抄的骨架） / `performance` / `sb3-json-reference` /
+`project-planning` / `recipes` / `runtime-control`（跑起来再改）/ `backpack`（攒积木）。
 
 > 这里**刻意不记**「哪个作品有多少积木」——数字对"怎么写"没有帮助。要量规模自己调
 > `scratch_snapshot` 或 `lab/inspect-sb3.mjs`；文档只留能照着做的经验。

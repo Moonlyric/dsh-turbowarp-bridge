@@ -552,8 +552,9 @@ export function apply(ctx, config) {
   const builtinSkillDir = join(dirname(fileURLToPath(import.meta.url)), 'skills')
   const skillStateFile = join(skillDir, '.enabled.json')
   const builtinVersionFile = join(skillDir, '.builtin-version')
-  const SKILL_BUILTIN_VERSION = '4' // 升级内置 skill 时 bump（4 = 注入语义/平台陷阱/任务路由三篇 +
-                                    //     上升级时覆盖内置文档；3 = 背包那篇；2 = 去掉块数普查）
+  const SKILL_BUILTIN_VERSION = '5' // 升级内置 skill 时 bump（5 = 新增 proven-patterns.md：
+                                    //     从真实高完成度作品里读出来的九种写法，替换掉"注意性能"这类空话；
+                                    //     4 = 注入语义/平台陷阱/任务路由；3 = 背包那篇；2 = 去掉块数普查）
 
   function skillEnabledMap() {
     try { return JSON.parse(readFileSync(skillStateFile, 'utf8')) } catch { return {} }
@@ -1519,7 +1520,7 @@ export function apply(ctx, config) {
 
   ctx.tools.register(defineTool({
     name: 'scratch_skills',
-    description: 'Scratch 实践经验库（基于社区高完成度作品逆向分析）。action=list 列出全部 skill（含摘要和开关状态）；action=read 读取某篇全文；action=toggle 开关某篇（用户表示不想让你用某经验时用它）。经验仅供参考，不是强制要求——但写积木前建议扫 sb3-json-reference。',
+    description: 'Scratch 实践经验库（公开作品里常见做法的归纳）。action=list 列出全部 skill（含摘要和开关状态）；action=read 读取某篇全文；action=toggle 开关某篇（用户表示不想让你用某经验时用它）。经验仅供参考，不是强制要求——但写积木前建议扫 sb3-json-reference。',
     parameters: {
       action: { type: 'string', description: 'list | read | toggle（缺省 list）' },
       name: { type: 'string', description: 'skill 文件名（如 sb3-json-reference.md），read/toggle 必填' }

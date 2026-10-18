@@ -7,28 +7,17 @@
 // 用法：
 //   node inspect-sb3.mjs <文件.sb3|project.json> [--top 30] [--json]
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { basename } from 'node:path'
-import JSZip from 'jszip'
+import { readProject } from './sb3-read.mjs'
 
 const file = process.argv[2]
 if (!file) { console.error('用法: node inspect-sb3.mjs <文件.sb3|project.json>'); process.exit(1) }
 const topN = Number((process.argv.find(a => a.startsWith('--top')) || '--top=25').split('=')[1]) || 25
 const asJson = process.argv.includes('--json')
 
-/** 读 .sb3（zip）或裸 project.json */
-async function readProject (p) {
-  const buf = readFileSync(p)
-  if (buf[0] === 0x7b) return { project: JSON.parse(buf.toString('utf8')), assets: [] }
-  const zip = await JSZip.loadAsync(buf)
-  const pjEntry = zip.file('project.json')
-  if (!pjEntry) throw new Error('这个 zip 里没有 project.json，不是 sb3')
-  const project = JSON.parse(await pjEntry.async('string'))
-  const assets = Object.keys(zip.files).filter(n => n !== 'project.json' && !zip.files[n].dir)
-  return { project, assets }
-}
-
 const { project, assets } = await readProject(file)
+const assetCount = assets.length
 const targets = project.targets || []
 const byId = new Map(targets.map(t => [t.id, t]))
 

@@ -19,11 +19,16 @@ npm install          # scratch-vm + scratch-storage，约 140MB
 # 替身 VM 层（秒级）
 node test-content-ops.js     # 主套件：280 条断言（读/写/改/删/整理/定位/白名单/观察者/运行控制/回传瘦身/背包导出与对拍/输入名校验/自动布局/子树读）
 node test-blank-project.mjs   # 空白作品生成器：13 条（zip/md5 + 真 scratch-vm 装载 + 两个 skin）
+node test-dissect.mjs         # sb3 结构分析：67 条（合成样本，验模块/命名空间/平行列表/伪代码/机制识别）
 node test-vm-pipeline.js     # scratch-vm 管线冒烟：只打日志，没有断言（退出码恒为 0）
 
-# 真机层（分钟级，需要浏览器 + 网络）
-node real-machine-check.mjs
+# 真机层（分钟级，需要浏览器/桌面版 + 网络）
+node real-machine-check.mjs   # 浏览器扩展这条路
+node desktop-cdp-check.mjs    # 桌面版 CDP 这条路：148 条断言，38 个工具全覆盖
 ```
+
+`test-dissect.mjs --dump` 会把合成样本落成 `fixtures/*.sb3`（`fixtures/` 不入库），
+方便用 CLI 手动跑 `dissect.mjs`。
 
 插件自身的单测在插件包里：
 
@@ -31,10 +36,18 @@ node real-machine-check.mjs
 cd ../packages/dsh-plugin-scratch
 npm install
 node test-skills.mjs         # 23 条断言（skill 区）
-node test-tools.mjs          # 103 条断言（唤起编辑器 / 打包契约 / 运行控制 / 背包契约）
+node test-tools.mjs          # 158 条断言（唤起编辑器 / 打包契约 / 运行控制 / 背包契约 / 截断信封 / 载入闸）
 node test-backpack.mjs       # 36 条断言（背包：假页面连真桥，存→读→注入→删）
 node test-bridge-auth.mjs    # 21 条断言（握手认证 + 跨会话伪造防护）
 ```
+
+## dissect.mjs（sb3 结构分析）
+
+`node dissect.mjs <文件.sb3|project.json> [--out 目录] [--json]` → 一份架构报告：
+模块分工 / 每帧节拍（附主循环伪代码）/ 数据布局 / 识别到的机制 / 结构风险。
+
+`sb3-read.mjs` 是它和 `inspect-sb3.mjs` 共用的读取层——各写一套的话，同一个文件会报出两个块数。
+报告只输出统计和结构描述，不含积木 JSON。
 
 ## real-machine-check.mjs（真机验收，全自动）
 

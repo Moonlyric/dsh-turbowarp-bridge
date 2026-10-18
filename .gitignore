@@ -9,10 +9,18 @@ scratch-shots/
 
 # ---- 以下只留在本地，不公开 ----
 # STATUS.md 是给"接手的人/AI"看的交接笔记：含本机桥 token、机器路径、内部待办。
-# research.md 是对社区参考作品的逆向笔记（含作品 ID 与逐项统计）—— 只作内部分析用。
+# research.md 是本地调研笔记，只作内部分析用。
 STATUS.md
 research.md
 
 # 编辑器 / 系统杂物
 .DS_Store
 Thumbs.db
+
+# 本地产物：分析输出、临时文件、顺手放的脚本，都不入库
+analysis/
+lab/works/
+lab/fixtures/
+lab/.local/
+lab/tmp-*
+
