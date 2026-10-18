@@ -112,6 +112,22 @@ t('接不上时不谎报连上，且说清是 CDP 的问题',
 t('桌面版分支不需要 token（那条路没有 token 这回事）', r.setup === undefined, JSON.stringify(Object.keys(r)))
 t('返回值里如实带上调试端口，方便排查', Number.isInteger(r.launched && r.launched.debugPort), JSON.stringify(r.launched))
 
+console.log('\n[4.5] CDP 上下文挑选（子 frame 抢走会话 —— v0.9.1 的根因，纯函数层守着）')
+const { classifyContext } = await import('./cdp.js')
+const MAIN = 'FRAME-MAIN'
+const ctxMain = { id: 1, auxData: { isDefault: true, type: 'default', frameId: MAIN } }
+const ctxChild = { id: 3, auxData: { isDefault: true, type: 'default', frameId: 'FRAME-IFRAME' } }
+const ctxIsolated = { id: 2, auxData: { isDefault: false, type: 'isolated', frameId: MAIN } }
+t('主 frame 的默认上下文 → main（只有它里面有 window.vm）', classifyContext(ctxMain, MAIN) === 'main')
+t('子 frame 的默认上下文 → child-frame（isDefault 也是 true，光看它一定被骗）',
+  classifyContext(ctxChild, MAIN) === 'child-frame')
+t('隔离世界 → isolated（注进去也是白注）', classifyContext(ctxIsolated, MAIN) === 'isolated')
+t('还不知道主 frame 是谁时，先接受默认上下文（getFrameTree 失败的兜底）',
+  classifyContext(ctxMain, null) === 'main')
+t('上下文没带 frameId 时不当成子 frame（宁可接受也别把编辑器的上下文拒了）',
+  classifyContext({ auxData: { isDefault: true, type: 'default' } }, MAIN) === 'main')
+t('没有 auxData 的怪上下文不会让它崩', classifyContext({}, MAIN) === 'isolated' && classifyContext(undefined, MAIN) === 'isolated')
+
 // ==================== 5. 桌面版：已在运行 / 找不到 两条分支 ====================
 // ⚠️ 这一节以前会**在用户桌面上真开一个 TurboWarp 窗口**：它故意不传 desktopPath 来测"自动定位"，
 //    结果在装了 TurboWarp 的机器上，自动定位真的找到了 exe 并把它拉起来了（踩过，被用户抓到）。

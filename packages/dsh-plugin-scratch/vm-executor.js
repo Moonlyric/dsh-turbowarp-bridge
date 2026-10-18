@@ -1458,7 +1458,8 @@
         //    （源码注释自己都写了"data 可能是字符串，但这函数只在字节数组时被调用"），
         //    传字符串 → 抛 `parameter 1 is not of type 'ArrayBuffer'` → loadCostume 进 catch →
         //    造型永远拿不到 skin：编辑器里显示成一张 **"?" 占位图**，
-        //    而且 TurboWarp Desktop 会顺着这条错误把整页搞成白屏（vm 都没了）。
+        //    更麻烦的是：这条错误路径还会把整页搞成白屏（桌面版会挂一个 sandbox iframe，
+        //    旧代码的 CDP 会话会被那个 iframe 的默认上下文抢走 —— 见 cdp.js 顶部那条）
         //    之前浏览器真机那条断言太弱（只判 rotationCenter !== 48），所以一直"绿着坏"。
         const t = findTarget(vm, args && args.target)
         const storage = vm.runtime.storage

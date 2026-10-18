@@ -53,7 +53,7 @@ AI 侧的入口是 `scratch_open_editor`：用户说「打开 TurboWarp」时，
 | **CDP 直连** | TurboWarp Desktop 零安装路径：带调试端口启动 + 注默认上下文 + 接管用户自己开的窗口 | ✅ 2026-10-17（v0.8.0 后 100/100，见下） |
 | **主动唤起** | `scratch_open_editor`：AI 自己开浏览器/桌面版并等会话连上；新增 `path` 装作品 | ✅ 2026-10-16 / 扩展于 2026-10-17 |
 | **文件往返** | `scratch_load_project` / `scratch_save_project`（打开本机 .sb3、存回磁盘、默认不覆盖） | ✅ |
-| **M3** | 断链/接链（`move_block` 四模式）、变量/列表增删改（`variable`）、造型删改（`costume`） | ✅ v0.9.0（替身层 246 + 插件 122 + 桌面真机 122） |
+| **M3** | 断链/接链（`move_block` 四模式）、变量/列表增删改（`variable`）、造型删改（`costume`） | ✅ v0.9.0 / v0.9.1（替身层 246 + 插件 128 + 桌面真机 134） |
 | **背包** | **AI 自维护的代码块背包**：把做好的可复用积木（pen 文字引擎、弹幕骨架、ECS 骨架…）预存下来，下次直接取用 | ✅ v0.8.0（36+14 条断言，见下） |
 | **M4** | 多标签页路由（SW 已按 tab 记账，还差 UI）、快照 diff 预览 UI、性能（大项目分页读） | 部分（路由已做） |
 | **M5** | 发布：npm 组合包 + `dsh plugin add`（版本锁定） | 未开始 |
@@ -149,7 +149,7 @@ fake-IP（198.18.x.x 之类的私网段），Chrome 据此判定"本页也是本
 `node lab/sync-executor.mjs`；`test-tools.mjs` 有一条逐字节一致的断言守着（忘了同步测试会红）。
 只检查：`node lab/sync-executor.mjs --check`。
 
-**验收闭环**：`lab/desktop-cdp-check.mjs`（122 条，本轮实测全绿）真开一个 TurboWarp 窗口、
+**验收闭环**：`lab/desktop-cdp-check.mjs`（134 条，本轮实测全绿）真开一个 TurboWarp 窗口、
 跑完自动关掉；它用**另一条独立的 CDP 连接**直接读 `vm.runtime.targets[].blocks._blocks` 当证据
 （不读插件自己的返回值），还会验"存盘 → 从磁盘装回来"的往返、**接管用户自己开的实例**
 （第 8 节：接管的是那个实例、没新开窗口、没重复注册会话、收尾关干净）、以及
@@ -209,12 +209,12 @@ hint 里说明"没动他的窗口"。
 |---|---|---|
 | `lab/test-content-ops.js` | 扩展执行器全协议（真实 `content-main.js` 进 Node vm 沙箱 + 真 headless scratch-vm）+ v0.7.0 瘦身体积断言 + v0.8.0 背包（导出/注入/变量落地/**与官方序列化器逐块对拍**） | 246/246 ✅ |
 | `lab/real-machine-check.mjs` | **真 Chrome/Edge + 真 turbowarp.org 全链路**（装扩展 → token 握手 → 33 工具 + 存/读 sb3 + 45s 保活） | **115/115** ✅（Chrome、Edge 各一遍；不传 `SB3_FIXTURE`，传了真实 sb3 会更多） |
-| `lab/desktop-cdp-check.mjs` | **TurboWarp Desktop + CDP 直连**端到端（独立 CDP 读真 VM + 存盘往返 + 接管用户实例 + 掉线自检 + 运行控制 + 背包往返 + v0.9.0 接链/变量/造型/高亮的 GUI 断言） | 122/122 ✅ |
+| `lab/desktop-cdp-check.mjs` | **TurboWarp Desktop + CDP 直连**端到端（独立 CDP 读真 VM + 存盘往返 + 接管用户实例 + 掉线自检 + 运行控制 + 背包往返 + v0.9.0 接链/变量/造型/高亮的 GUI 断言 + v0.9.1 真加 SVG 造型/子 frame 抢上下文/执行器自愈） | 134/134 ✅ |
 | `lab/sync-executor.mjs` | 把扩展 `content-main.js` 同步成插件包的 `vm-executor.js`（`--check` 只检查） | 工具 ✅ |
 | `lab/test-vm-pipeline.js` | scratch-vm 管线冒烟（无断言，打印型） | 跑通 ✅ |
 | `lab/inspect-sb3.mjs` | 离线读 sb3/project.json：同时报**真块数**和**含影子块数**（引用块数必须写清数法） | 工具 ✅ |
 | `packages/dsh-plugin-scratch/test-skills.mjs` | skill 区 | 23/23 ✅ |
-| `packages/dsh-plugin-scratch/test-tools.mjs` | 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 / CDP 启动参数与诚实报错 / `tagForPage` / 执行器副本一致性 / 打包契约 / v0.7.0 新工具契约 / v0.8.0 背包与归因契约） | 122/122 ✅ |
+| `packages/dsh-plugin-scratch/test-tools.mjs` | 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 / CDP 启动参数与诚实报错 / `tagForPage` / 执行器副本一致性 / 打包契约 / v0.7.0 新工具契约 / v0.8.0 背包与归因契约 + v0.9.1 上下文挑选） | 128/128 ✅ |
 | `packages/dsh-plugin-scratch/test-backpack.mjs` | **背包集成**（假页面连真桥：存 → 落盘 → list/read → 注入（x/y 平移、变量声明、variableValues）→ preview 不落盘 → 删除进 `_trash` → 名字穿越防护） | 36/36 ✅ |
 | `packages/dsh-plugin-scratch/test-bridge-auth.mjs` | 握手认证 + 跨会话伪造防护 + ping/pong 保活 | 21/21 ✅ |
 
@@ -287,9 +287,39 @@ Blockly 那边是靠多条事件补的），自己写 `unlinkBlock` + `attachAft
    造型永远没有 skin：编辑器里就是一张 **"?" 占位图**（用户在真机上看到的就是这个）。
    旧的真机断言只判 `rotationCenter !== 48`，所以一直"绿着坏"。现在改成断言 `skinId` + 有限旋转中心，
    并且载入失败会**把造型撤掉再报错**，不把 "?" 留在项目里。
-2. **桌面版上加新 SVG 造型会打断 CDP 会话**（页面本身没事，编辑器照样能点；是我们的 `deliver` 打到了失效的
-   执行上下文 → 之后的 op 全部超时）。已确认不是 SVG 的问题（换合法图也一样），也还没修 ——
-   记进 `STATUS.md` 待办：需要"上下文失效 → 重新注入/重连"的自愈。
+2. **桌面版上加新 SVG 造型会打断 CDP 会话** —— 当时只查到"页面本身没事、编辑器照样能点，是我们的
+   `deliver` 打到了失效的执行上下文"，原因没查清、先记进了待办。**v0.9.1 查到底并修了**，见下一节。
+
+## v0.9.1：把「加完造型就全超时」查到底（2026-10-18）
+
+症状：桌面版上给项目加一个新的 SVG 造型之后，**之后每个工具调用都超时**（15s / 120s），
+可编辑器画面完全正常、造型也真的加进去了。看着就像"造型把 CDP 会话搞坏了"。
+
+真相有两层：
+
+1. **触发点**是 `add_costume` 的旧 bug（SVG 按字符串塞 asset → `TypeError`）。这条错误路径会让
+   页面里冒出一个 sandbox iframe（`about:blank`）。
+2. **真正把会话弄死的是那个 iframe**：CDP 的子 frame 也有自己的"默认执行上下文"，`auxData` 里
+   `isDefault: true` / `type: "default"` —— 跟主 frame **长得一模一样**。旧代码见到就切过去，
+   于是此后每条消息都投给了那个空 iframe：`Runtime.evaluate` 不报错、只返回 `undefined`，
+   调用方只能干等到超时。**编辑器一直是好的**，是我们自己把话筒递给了隔壁房间。
+
+修法（`cdp.js`）：
+
+- `Page.enable` 之后先 `Page.getFrameTree` 拿到主 frame id，`Runtime.enable` 开在它后面 ——
+  只认这个 frame 的默认上下文，子 frame 一律忽略并计数（`skippedFrames`）。
+- `Runtime.executionContextDestroyed` 命中我们在用的那个上下文就立刻忘掉它。
+- `deliver()` 返回不是 `ok` 时**自己重新注入再投一次**（`reinjects`）；还不行就抛一条人看得懂的错误
+  （"在窗口里按 Ctrl+R 刷新，或重新 open_editor"），不再让人干等 15 秒。
+- `scratch_list_sessions` 多报一行 `transport`（injected / frame / skippedFrames / reinjects）——
+  "编辑器好好的但每个 op 都超时"这类问题一眼就能定位。
+
+验收（`lab/desktop-cdp-check.mjs`，134 条全绿）：
+
+- 真加一个 64×64 SVG：`skin=true`、旋转中心 32/32（不是硬编码 48/50）、独立通道看到 skin，
+  **加完立刻再调一次工具仍然通**。
+- 确定性回归：往页面里塞一个 sandbox iframe → 会话仍然固在主 frame（修之前这条必然挂）。
+- 自愈回归：把页面上的执行器删掉再调工具 → 自动重注入、`reinjects` 记 1、独立通道确认执行器回来了。
 
 ## v0.7.0：把「问题记录」清账（2026-10-18）
 

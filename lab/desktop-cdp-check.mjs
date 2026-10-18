@@ -68,7 +68,7 @@ function probeWindowWin32() {
 
 // ---------------- 独立 CDP 通道（验证用，不碰插件自己的那条连接） ----------------
 class RawCdp {
-  constructor(ws) { this.ws = ws; this.seq = 0; this.waiters = new Map(); this.ctx = null; this.events = [] }
+  constructor(ws) { this.ws = ws; this.seq = 0; this.waiters = new Map(); this.ctx = null; this.frameId = null; this.events = [] }
   static async connect(port, timeoutMs = 20000) {
     const deadline = Date.now() + timeoutMs
     let target = null
@@ -99,10 +99,24 @@ class RawCdp {
       if (m.method === 'Runtime.executionContextCreated') {
         const c = m.params.context
         const aux = c.auxData || {}
-        if (aux.isDefault && aux.type === 'default') { self.ctx = c.id; self.events.push('default-ctx') }
+        // ⚠️ 子 frame 的默认上下文跟主 frame 长得一模一样（isDefault/type=default）。
+        //    不挑 frameId 的话，页面里冒出个 iframe 就会把这条验证通道也骗走，
+        //    表现是"独立通道突然看到 window.vm === undefined"（真机踩过）。
+        if (aux.isDefault && aux.type === 'default' && (!self.frameId || !aux.frameId || aux.frameId === self.frameId)) {
+          self.ctx = c.id
+          self.events.push('default-ctx')
+        } else if (aux.frameId && self.frameId && aux.frameId !== self.frameId) {
+          self.events.push('skip-child-frame')
+        }
       }
       if (m.method === 'Runtime.bindingCalled') self.events.push('binding:' + m.params.name)
     })
+    // 先问主 frame 是谁，再开 Runtime（同 cdp.js：顺序反了就会被 iframe 抢）
+    await self.send('Page.enable')
+    try {
+      const tree = await self.send('Page.getFrameTree')
+      self.frameId = tree.frameTree && tree.frameTree.frame && tree.frameTree.frame.id
+    } catch { /* 拿不到就退回旧行为 */ }
     await self.send('Runtime.enable')
     const deadline2 = Date.now() + 8000
     while (!self.ctx && Date.now() < deadline2) await sleep(100)
@@ -451,7 +465,7 @@ try {
   t('delete 把它挪进 _trash（没真删）', !existsSync(bpFile) && /_trash/.test(bpDel.movedTo || ''), J(bpDel, 200))
   t('删完 list 里没了', (await call('scratch_backpack', { action: 'list' })).count === 0)
 
-  step('6.7 v0.9.0：精细编辑（断链/接链、变量/列表、造型 —— 桌面版真机 + 独立通道核对）')
+  step('6.7 v0.9.0 / v0.9.1：精细编辑 + 真加 SVG 造型 + 子 frame 抢上下文 + 执行器自愈（桌面版真机 + 独立通道核对）')
   // 为什么非要真机：这三类操作改完都必须让 **GUI 跟着变**（工作区按 vm 的 XML 重建）。
   // 替身层没有 Blockly，看不见「数据改了、工作区还连着」这种失败 —— 用户那边就是"根本没分开"。
   const sayId = applied.idMap.say
@@ -581,12 +595,10 @@ try {
   })()`)
   t('delete：舞台上真没了', v4.gone === true, J(v4, 200))
 
-  // ③ 造型：加一个 → 改名 → 切过去 → 删掉；只剩一个时必须拒绝
-  // ⚠️ 这一段**故意不调 add_costume**：真机实测（2026-10-18）桌面版上给项目加新 SVG 造型
-  //    会把这条 CDP 会话打断（编辑器画面正常、造型也真的进场了，但后续 op 全部超时，
-  //    直到重新 attach）。原因还没查清，已记进 STATUS 待办。
-  //    这里改用"复制现有造型"（不走 renderer 建新 skin）来验 rename / set / delete 三件事，
-  //    另外验一下坏 SVG 会被**干净拒绝**（我们的校验在碰 VM 之前就抛）。
+  // ③ 造型：改名 → 切过去 → 删掉；只剩一个时必须拒绝。
+  //    这一段用"复制现有造型"（不走 renderer 建新 skin）：加新 SVG 造型的事在 ④ 单独验，
+  //    因为那个动作历史上真把会话打断过（根因是 iframe 抢上下文，不是在造型本身）。
+  //    另外验一下坏 SVG 会被**干净拒绝**（校验在碰 VM 之前就抛，不会留 "?" 占位）。
   const costBefore = await raw.evalJson(`window.vm.runtime.targets.find(x => x.getName() === ${JSON.stringify(workTarget)}).getCostumes().length`)
   await raw.evalJson(`(() => {
     const t = window.vm.runtime.targets.find(x => x.getName() === ${JSON.stringify(workTarget)})
@@ -598,8 +610,7 @@ try {
   t('（准备）复制出一个造型当素材', costAfterAdd === costBefore + 1, `${costBefore} → ${costAfterAdd}`)
   let badSvgErr = ''
   const costBeforeBad = costAfterAdd
-  // 空/非 SVG 会被工具的**前置校验**拒掉（在碰 VM 之前就抛）——
-  // 这条能安全验，因为 addCostume 根本不会被调用（它会打断 CDP 会话，见上面那段注释）。
+  // 空/非 SVG 会被工具的**前置校验**拒掉（在碰 VM 之前就抛，addCostume 根本不会被调用）
   const badSvg = await call('scratch_add_costume', { target: workTarget, name: '坏造型', svg: '   ' })
   try { await call('scratch_apply', { planId: badSvg.planId }) } catch (e) { badSvgErr = String(e.message || e) }
   const costAfterBad = await raw.evalJson(`window.vm.runtime.targets.find(x => x.getName() === ${JSON.stringify(workTarget)}).getCostumes().length`)
@@ -626,6 +637,79 @@ try {
   let cGuardErr = ''
   try { await call('scratch_apply', { planId: cGuard.planId }) } catch (e) { cGuardErr = String(e.message || e) }
   t('只剩一个造型时拒绝删除（背景删掉就没得显示）', /只剩一个造型/.test(cGuardErr), cGuardErr)
+
+  // ④ 真加一个 SVG 造型：这一段以前是**不敢跑**的 —— 实测"加完造型之后所有 op 都超时 15s"。
+  //    真正的原因不在造型：那条错误路径会让页面里冒出一个 sandbox iframe，而旧代码会被
+  //    那个 iframe 的**默认执行上下文**抢走（iframe 的上下文和主 frame 长得一模一样）。
+  //    现在 cdp.js 只认主 frame 的上下文 + 投递失败会自愈重注入，所以敢在这里真跑。
+  const svgSrc = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">'
+    + '<rect x="8" y="8" width="48" height="48" fill="#4c97ff"/></svg>'
+  const addSvg = await call('scratch_add_costume', { target: workTarget, name: '验收SVG', svg: svgSrc })
+  const addSvgRes = await call('scratch_apply', { planId: addSvg.planId })
+  t('add_costume：返回 skin=true（SVG 真被渲染器接住了，不是 "?" 占位）',
+    addSvgRes.skin === true, J(addSvgRes, 240))
+  t('add_costume：旋转中心按真实图形算（64×64 方块 → 32,32，不是硬编码的 48/50）',
+    Array.isArray(addSvgRes.rotationCenter) && addSvgRes.rotationCenter[0] === 32 && addSvgRes.rotationCenter[1] === 32,
+    J(addSvgRes.rotationCenter, 60))
+  const svgOnPage = await raw.evalJson(`(() => {
+    const t = window.vm.runtime.targets.find(x => x.getName() === ${JSON.stringify(workTarget)})
+    const c = t.getCostumes().find(x => x.name === '验收SVG')
+    return { found: !!c, skin: !!(c && c.skinId), rc: c ? [c.rotationCenterX, c.rotationCenterY] : null, size: c ? c.size : null }
+  })()`)
+  t('独立通道：这个造型真的有 skin（有 skin 才画得出来）', svgOnPage.found === true && svgOnPage.skin === true, J(svgOnPage, 200))
+  const afterSvg = await call('scratch_state', {})
+  t('**加完造型之后会话还活着**（以前这一下之后，每个 op 都开始超时）', afterSvg.targets >= 2, J(afterSvg, 160))
+
+  // ⑤ 子 frame 抢上下文：确定性回归（不用等哪个错误路径自己触发）
+  //    页面里塞一个 sandbox iframe —— 它会创建一个"同名同姓"的默认上下文。
+  //    修之前：会话立刻被抢走，之后每个 op 都超时 15s，而编辑器画面完全正常。
+  await raw.evalJson(`(() => {
+    const f = document.createElement('iframe')
+    f.id = 'dsh-hijack-test'
+    f.setAttribute('sandbox', '')
+    f.src = 'about:blank'
+    document.body.appendChild(f)
+    return 'iframe-appended'
+  })()`)
+  await sleep(900)
+  t('（诊断）iframe 真的产生了一个默认上下文、被我们忽略了（不是"没测到"）',
+    raw.events.includes('skip-child-frame'), JSON.stringify(raw.events.slice(-4)))
+  const afterIframe = await call('scratch_state', {})
+  t('页面里冒出 iframe 之后会话仍然固在主 frame（子 frame 抢不走执行上下文）',
+    afterIframe.targets >= 2, J(afterIframe, 160))
+  const sWithIframe = await call('scratch_list_sessions', {})
+  const transport = sWithIframe.sessions && sWithIframe.sessions[0] && sWithIframe.sessions[0].transport
+  t('list_sessions 能自报运输层状态（injected / 主 frame / 跳过了几个子 frame）',
+    /injected=true/.test(String(transport)) && /skippedFrames=[1-9]/.test(String(transport)), String(transport))
+  const stillMain = await raw.evalJson(`({ vm: typeof window.vm, bridge: typeof window.__dshBridge, targets: window.vm ? window.vm.runtime.targets.length : -1 })`)
+  t('独立通道也仍然在编辑器页面里（没被带进 iframe）', stillMain.vm === 'object' && stillMain.targets >= 2, J(stillMain, 160))
+  await raw.evalJson(`(() => { const f = document.getElementById('dsh-hijack-test'); if (f) f.remove(); return 'removed' })()`)
+  await sleep(300)
+
+  // 把这个 SVG 造型删掉，保持项目干净（顺带验 delete 对"真 SVG 造型"也成立）
+  const delSvg = await call('scratch_costume', { target: workTarget, action: 'delete', name: '验收SVG' })
+  await call('scratch_apply', { planId: delSvg.planId })
+  const costFinal = await raw.evalJson(`window.vm.runtime.targets.find(x => x.getName() === ${JSON.stringify(workTarget)}).getCostumes().length`)
+  t('删掉之后造型数回到原样', costFinal === costBefore, `${costFinal} vs ${costBefore}`)
+
+  // ⑥ 执行器从页面里消失（= 上下文被换掉 / 页面重载过的那个瞬间）：
+  //    AI 应该自己把执行器注回去，而不是让用户等 15 秒看到"超时"。
+  await raw.evalJson(`(() => {
+    delete window.__dshBridge
+    delete window.__dshCdpDeliver
+    delete window.__dshCdpShimInstalled
+    return typeof window.__dshBridge + '/' + typeof window.__dshCdpDeliver
+  })()`)
+  const healedAt = Date.now()
+  const healed = await call('scratch_state', {})
+  const healMs = Date.now() - healedAt
+  t('执行器没了之后，下一次调用自己重新注入并成功（不是干等超时）',
+    healed.targets >= 2 && healMs < 6000, `${healMs}ms / ${J(healed, 120)}`)
+  const transport2 = (await call('scratch_list_sessions', {})).sessions[0].transport
+  t('自愈次数记在运输层状态里（排查时一眼看出来"它自己接过一次"）',
+    /reinjects=[1-9]/.test(String(transport2)), String(transport2))
+  const healProbe = await raw.evalJson(`({ bridge: typeof window.__dshBridge, targets: window.vm ? window.vm.runtime.targets.length : -1 })`)
+  t('独立通道确认页面上执行器真的回来了', healProbe.bridge === 'object' && healProbe.targets >= 2, J(healProbe, 160))
 
   step('7. 存档 → 从磁盘装回来（真走一遍文件往返）')
   const outSb3 = join(OUT, 'desktop-roundtrip.sb3')

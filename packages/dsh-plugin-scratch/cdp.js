@@ -12,6 +12,11 @@
 //   · 该 target 的**默认上下文**（auxData.isDefault）里 window.vm 就是真 VM：
 //     window.vm.runtime.targets → ["Stage","角色1"]，window.Blockly 也在
 //   · 隔离上下文（Electron Isolated Context）里没有 vm —— 注入必须挑默认上下文（踩过）
+//   · **子 frame 也有"默认上下文"，而且长得一模一样**（auxData.isDefault / type=default）。
+//     编辑器里只要冒出任何一个 iframe（sandbox 的 about:blank 也算），旧代码就会把
+//     会话切到那个 iframe 上：evaluate 不报错、只是返回 undefined → 之后每个 op 都
+//     「超时 15s」，可编辑器画面完全正常（真机踩过一整轮，误判成"加造型把会话搞坏了"）。
+//     现在先问 Page.getFrameTree 拿到主 frame id，只认这个 frame 的默认上下文。
 //   · CDP 的 Runtime.evaluate 不受页面 CSP 限制（DevTools 特权），约 47KB 的执行器能直接灌进去
 //
 // 页面执行器本来就用 window.postMessage 跟"隔离世界那一侧"说话（它自己不含任何 chrome.*），
@@ -121,6 +126,27 @@ export function tagForPage(text) {
 }
 
 /**
+ * 这个执行上下文是不是**主 frame 的默认上下文**？——CDP 里最容易踩的一处。
+ *
+ * 三种情况（都真的遇到过）：
+ *   · `isolated`    隔离世界（Electron Isolated Context）：没有 window.vm，注进去也是白注
+ *   · `child-frame` 子 frame（iframe）的默认上下文：**和主 frame 长得一模一样**
+ *                   （`auxData.isDefault === true` / `type === 'default'`），
+ *                   按 isDefault 选就一定会被它抢走 —— 之后每条消息都投进那个空 iframe，
+ *                   evaluate 不报错只返回 undefined，调用方只能等超时，而编辑器画面完全正常。
+ *   · `main`        主 frame 的默认上下文：只有这个里面才有 window.vm
+ *
+ * @param {{auxData?:object}} context  Runtime.executionContextCreated 里的 context
+ * @param {string|null} mainFrameId    Page.getFrameTree 拿到的主 frame id（不认识就传 null）
+ */
+export function classifyContext(context, mainFrameId) {
+  const aux = (context && context.auxData) || {}
+  if (!(aux.isDefault && aux.type === 'default')) return 'isolated'
+  if (mainFrameId && aux.frameId && aux.frameId !== mainFrameId) return 'child-frame'
+  return 'main'
+}
+
+/**
  * 连上一个编辑器进程的 CDP 端点，注入执行器，之后就能收发桥消息。
  *
  * @param {object} o
@@ -148,7 +174,9 @@ export async function attachCdp({ port, executorSource, onMessage, onReady, onCl
   const waiters = new Map()
   const st = {
     url: target.url, title: target.title || '', injected: false, pongs: 0,
-    contextId: null, closes: 0, closed: false, errors: 0
+    contextId: null, frameId: null, closes: 0, closed: false, errors: 0,
+    // 被子 frame 抢走的执行上下文次数（诊断用；正常应该一直是 0）
+    skippedFrames: 0, reinjects: 0
   }
 
   function send(method, params, timeoutMs = 20000) {
@@ -180,7 +208,7 @@ export async function attachCdp({ port, executorSource, onMessage, onReady, onCl
     //    报 TypeError: (intermediate value)(...) is not a function（真机踩过，注入直接失败）。
     const r = await send('Runtime.evaluate', {
       expression: SHIM + ';\n' + executorSource
-        + ';\n({ shim: window.__dshCdpShimInstalled === true, executor: typeof window.__dshBridge })',
+        + ';\n({ shim: window.__dshCdpShimInstalled === true, executor: typeof window.__dshBridge, href: String(location.href) })',
       contextId: st.contextId || undefined,
       returnByValue: true,
       allowUnsafeEvalBlockedByCSP: true
@@ -209,21 +237,40 @@ export async function attachCdp({ port, executorSource, onMessage, onReady, onCl
       case 'Runtime.executionContextCreated': {
         const c = m.params.context
         const aux = c.auxData || {}
-        // ⚠️ 只有默认上下文里有 window.vm；隔离上下文（Electron Isolated Context）是空的
-        if (aux.isDefault && aux.type === 'default') {
-          st.contextId = c.id
-          st.injected = false
-          inject('默认上下文就绪').catch((e) => { st.errors++; log('注入失败: ' + e.message) })
+        // ⚠️ 只有主 frame 的默认上下文里有 window.vm：
+        //    隔离世界是空的；子 frame（iframe）的默认上下文又跟主 frame 长得一模一样 ——
+        //    光看 isDefault 一定会被抢走（见 classifyContext 的注释，真机踩过一整轮）。
+        const kind = classifyContext(c, st.frameId)
+        if (kind === 'child-frame') {
+          st.skippedFrames++
+          log(`忽略子 frame 的默认上下文（frame=${aux.frameId}，主 frame=${st.frameId}）`)
+          return
         }
+        if (kind !== 'main') return
+        if (!st.frameId && aux.frameId) st.frameId = aux.frameId // getFrameTree 没拿到时的兜底
+        st.contextId = c.id
+        st.injected = false
+        inject('默认上下文就绪').catch((e) => { st.errors++; log('注入失败: ' + e.message) })
         return
       }
+      case 'Runtime.executionContextDestroyed':
+        // 我们正在用的那个上下文没了（页面重载/进程换了）：赶紧忘掉它，
+        // 别拿着一个死 contextId 去 evaluate —— 那种情况只会静默失败。
+        if (m.params.executionContextId === st.contextId) {
+          st.injected = false
+          st.contextId = null
+        }
+        return
       case 'Runtime.executionContextsCleared':
         st.injected = false
         st.contextId = null
         return
       case 'Page.frameNavigated':
+        // 只认主 frame（parentId 为空）。子 frame 的导航跟我们的会话无关 ——
+        // 以前这里没判 parentId，结果一个 iframe 导航就能把 url 改掉。
         if (!m.params.frame.parentId) {
           st.url = m.params.frame.url
+          st.frameId = m.params.frame.id
           st.injected = false
         }
         return
@@ -251,28 +298,72 @@ export async function attachCdp({ port, executorSource, onMessage, onReady, onCl
   })
   ws.addEventListener('error', () => { st.errors++ })
 
-  await send('Runtime.enable')
+  // 顺序很重要：**先拿到主 frame 的 id，再开 Runtime**。
+  // Runtime.enable 会把已存在的上下文一次性报给我们（executionContextCreated），
+  // 那时候必须已经知道"主 frame 是谁"，否则第一个报上来的可能是某个 iframe 的默认上下文。
   await send('Page.enable')
+  try {
+    const tree = await send('Page.getFrameTree')
+    st.frameId = tree && tree.frameTree && tree.frameTree.frame && tree.frameTree.frame.id
+  } catch (e) {
+    log('getFrameTree 失败（退回"见到第一个默认上下文就用"）: ' + e.message)
+  }
+  await send('Runtime.enable')
   // 上下文/导航事件可能已经发生过，补一次显式注入（幂等：垫片和执行器自己都有已注入判断）
   await sleep(200)
   if (!st.injected) await inject('attach 后立即注入')
 
   return {
     target,
-    state: () => `transport=cdp url=${st.url} injected=${st.injected} ctx=${st.contextId} pongs=${st.pongs}`
+    state: () => `transport=cdp url=${st.url} injected=${st.injected} ctx=${st.contextId} frame=${st.frameId} pongs=${st.pongs}`
+      + (st.skippedFrames ? ` skippedFrames=${st.skippedFrames}` : '')
+      + (st.reinjects ? ` reinjects=${st.reinjects}` : '')
       + (st.errors ? ` errors=${st.errors}` : ''),
     raw: st,
     /** 插件 → 页面：投递一条桥消息（JSON 字符串） */
     async deliver(text) {
       if (st.closed) throw new Error('CDP 会话已关闭（编辑器进程没了？）')
-      const r = await send('Runtime.evaluate', {
-        expression: `window.__dshCdpDeliver && window.__dshCdpDeliver(${JSON.stringify(text)})`,
-        contextId: st.contextId || undefined,
-        returnByValue: true
-      })
-      const ex = r.exceptionDetails
-      if (ex) throw new Error('投递失败: ' + (ex.exception && ex.exception.description ? ex.exception.description : ex.text))
-      return r.result && r.result.value
+      let back = null // { ok, value, error }
+      const tryPush = async () => {
+        try {
+          const r = await send('Runtime.evaluate', {
+            expression: `window.__dshCdpDeliver && window.__dshCdpDeliver(${JSON.stringify(text)})`,
+            contextId: st.contextId || undefined,
+            returnByValue: true
+          })
+          const ex = r.exceptionDetails
+          if (ex) {
+            return {
+              ok: false,
+              error: new Error('投递失败: ' + (ex.exception && ex.exception.description ? ex.exception.description : ex.text))
+            }
+          }
+          const value = r.result && r.result.value
+          return { ok: value === 'ok', value }
+        } catch (e) {
+          return { ok: false, error: e }
+        }
+      }
+      back = await tryPush()
+      // 页面里没有执行器（上下文被换掉/页面重载过/被塞进了 iframe）时，
+      // evaluate 不会报错，只会返回 undefined —— 于是调用方干等到 15s 超时。
+      // 真机踩过：用户看到的就是"AI 卡住了"，而编辑器其实好好的。
+      // 这里自己接回去：重注入一次，再投一遍。
+      if (!back.ok) {
+        st.reinjects++
+        log(`投递没被接收（${back.error ? back.error.message : back.value}），重新注入执行器后重试`)
+        try { await inject('投递失败后自愈') } catch (e) { st.errors++; log('自愈注入失败: ' + e.message) }
+        back = await tryPush()
+      }
+      if (!back.ok) {
+        const why = back.error ? back.error.message : String(back.value)
+        throw new Error(
+          `编辑器页面里没有可用的执行器（${why}）：页面可能被重置/重载过，或者已经不再是编辑器页。`
+          + `桌面版：在窗口里按 Ctrl+R 刷新一下，或 scratch_open_editor({ app: "desktop" }) 重新接；`
+          + `网页版：刷新那个标签页。`
+        )
+      }
+      return back.value
     },
     /** 调试/验收用：在页面里求值（返回字符串化的结果） */
     async evaluate(expression) {

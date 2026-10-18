@@ -885,6 +885,9 @@ export function apply(ctx, config) {
       for (const [id, s] of sessions) {
         const meta = await call(id, 'project_meta').catch(() => null)
         const entry = { sessionId: id, meta: s.meta, detail: meta }
+        // CDP 会话自报一句运输层状态（injected / 主 frame / 被忽略的子 frame 数 / 自愈次数）。
+        // 排查"编辑器好好的但每个 op 都超时"时，这一行就是答案 —— 不用再猜。
+        if (s.cdp && typeof s.cdp.state === 'function') entry.transport = s.cdp.state()
         // 连上了 ≠ 用户看得见：桌面版会话顺手查一次窗口可见性（约 0.3-0.6s，只在这条路上查）
         if (s.cdp) {
           const win = desktopWindowInfo({ pid: s.meta && s.meta.pid, show: false })

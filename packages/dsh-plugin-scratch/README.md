@@ -130,7 +130,7 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
 
 | 工具 | 方向 | 说明 |
 |---|---|---|
-| `scratch_list_sessions` | 读 | 已连接的 TW 编辑器标签页；无会话时返回 token + 配置步骤 |
+| `scratch_list_sessions` | 读 | 已连接的 TW 编辑器标签页；无会话时返回 token + 配置步骤。CDP 会话多报一行 `transport`（injected / frame / skippedFrames / reinjects）|
 | `scratch_open_editor` | 启动 | **主动帮用户打开编辑器**（浏览器 / 本地桌面版两条路），可顺手把 `.sb3` 装进去 |
 | `scratch_load_project` | 写 | 打开本机 `.sb3` / `.sb2` / `project.json`（先自动快照） |
 | `scratch_save_project` | 写 | 存成 `.sb3`（默认**不覆盖**已有文件，另存 `-ai-时间戳`） |
@@ -139,7 +139,7 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
 | `scratch_add_blocks` | 写 | 注入块：sb3 dict 进 → 自动转活块形态、ID 换新、扩展自动加载、返回 `idMap` |
 | `scratch_apply` | 写 | preview 档确认后落盘（传 `planId`） |
 | `scratch_locate` | UI | 工作区滚到块并高亮 3 秒（`scrolledBy` 会告诉你实际走的哪条滚动 API） |
-| `scratch_add_costume` | 写 | SVG → 造型（SVG 按**字节**存；载入失败会自己撤掉并报错，不留 "?" 占位造型） |
+| `scratch_add_costume` | 写 | SVG → 造型（SVG 按**字节**存；载入失败会自己撤掉并报错，不留 "?" 占位造型）。桌面版也照常可用 —— 历史上"加完造型会话就死"的根因是 CDP 被 iframe 抢了上下文，v0.9.1 已修 |
 | `scratch_costume` | 写 | 造型 `rename` / `delete` / `set`（只剩一个造型时拒绝删除） |
 | `scratch_rollback` | 写 | 回滚快照（内存 + 磁盘双保险，dsh 重启也能滚） |
 | `scratch_update_block` | 写 | 改 `fields` 下拉 / `inputs` 输入值 / `x,y` 坐标（改完那块会**亮一下**） |
@@ -286,10 +286,10 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
 | `test-skills.mjs` | 23/23 ✅ |
 | `test-bridge-auth.mjs` | 21/21 ✅ |
 | `test-backpack.mjs` | 36/36 ✅ |
-| `test-tools.mjs` | 109/109 ✅（含打包契约：组合包 / volatile 配置 / 浏览器半侧 / 窗口探针 + v0.7.0 运行控制 + v0.8.0 背包与归因契约） |
-| `../lab/test-content-ops.js` | 163/163 ✅（含瘦身体积断言：5000 项列表场景 < 64KB） |
+| `test-tools.mjs` | 128/128 ✅（含打包契约：组合包 / volatile 配置 / 浏览器半侧 / 窗口探针 + v0.7.0 运行控制 + v0.8.0 背包与归因契约） |
+| `../lab/test-content-ops.js` | 246/246 ✅（含瘦身体积断言：5000 项列表场景 < 64KB） |
 | `../lab/real-machine-check.mjs`（真 Chrome / Edge + 真 turbowarp.org；不传 `SB3_FIXTURE`） | 115/115 ✅（Chrome、Edge 各一遍） |
-| `../lab/desktop-cdp-check.mjs`（TurboWarp Desktop + CDP；真开一个窗口、跑完自动关） | 100/100 ✅（含窗口可见性交叉验证 + 绿旗后角色真位移） |
+| `../lab/desktop-cdp-check.mjs`（TurboWarp Desktop + CDP；真开一个窗口、跑完自动关） | 134/134 ✅（含窗口可见性交叉验证 + 绿旗后角色真位移 + 高亮真亮真灭 + 真加 SVG 造型 + 子 frame 抢上下文回归 + 执行器自愈） |
 
 真机那一轮跑的是完整闭环，**28 个工具全覆盖**：唤起编辑器（含"没有会话时给 token 步骤"这条路）
 → 装扩展 → 填 token → 打开 turbowarp.org/editor → 握手认证 → list_sessions → snapshot
@@ -298,7 +298,7 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
 → watch（真定时器轮询）→ user_context（真鼠标点块 + 绿旗）→ save_project（落盘 .sb3）
 → load_project（打开真实作品，14.6MB）→ 大项目往返 + 回滚 → 空闲 45s 连接不许断。
 
-桌面版那一轮走的是 CDP（`../lab/desktop-cdp-check.mjs`，54 条）：启动桌面版 → 注入执行器 →
+桌面版那一轮走的是 CDP（`../lab/desktop-cdp-check.mjs`，134 条）：启动桌面版 → 注入执行器 →
 用**另一条独立 CDP 连接**直接读 `vm.runtime.targets[].blocks._blocks` 当证据（不读插件自己的返回值）
 → 存盘 → 从磁盘装回来验往返 → **接管用户自己开的实例**（验接管的是那个实例、没新开窗口、
 没重复注册会话、收尾关干净）→ 关掉桌面版后会话必须自动掉线（不留僵尸会话）。

@@ -229,10 +229,19 @@ patch 里只留一段**配置覆盖**（按 id 整段替换，所以字段要写
      普通字段只能在 YAML 里改，插件页上根本不出现配置控件（用户以为"设置参数坏了"）。
      浏览器半侧还要注册 `plugins.row.config`（key = `<包名>#<行 id>`）才有「配置」入口。
 
+7. **CDP 里"默认执行上下文"不一定是主 frame 的 —— 子 frame 也有一份，而且长得一模一样。**
+   编辑器页里只要冒出任何一个 iframe（连 `sandbox` 的 `about:blank` 都算），就会新建一个
+   `auxData.isDefault = true` / `type = "default"` 的上下文。按 `isDefault` 选上下文的话会被它抢走：
+   此后每条消息都投进那个空 iframe，`Runtime.evaluate` **不报错、只返回 `undefined`**，
+   于是每个 op 都"超时"，而编辑器画面完全正常（真机被这条骗了一整轮）。
+   现在先 `Page.getFrameTree` 拿主 frame id、`Runtime.enable` 开在它后面，只认这个 frame 的上下文；
+   另外 `deliver()` 收不到 `ok` 会自己重注入重投一次（`reinjects`），还不行就报一条人看得懂的错误。
+   `scratch_list_sessions` 的 `transport` 一行能看到 `injected / frame / skippedFrames / reinjects`。
+
 ## 验靶（能自己复跑的自动化）
 
 ```powershell
-# 替身层：真 content-main.js 进 Node vm + 真 headless scratch-vm（163 条）
+# 替身层：真 content-main.js 进 Node vm + 真 headless scratch-vm（246 条）
 cd lab; node test-content-ops.js
 
 # 真机层 A：真 Chrome / Edge + 真 turbowarp.org + 真扩展（115 条，约 4 分钟）
@@ -240,14 +249,15 @@ cd lab; node test-content-ops.js
 $env:SB3_FIXTURE='<某个 .sb3>'      # 可选：顺带验打开真实作品（断言会更多）
 node real-machine-check.mjs
 
-# 真机层 B：TurboWarp Desktop + CDP 直连（83 条，会真开一个窗口、跑完自动关掉）
+# 真机层 B：TurboWarp Desktop + CDP 直连（134 条，会真开一个窗口、跑完自动关掉）
 node desktop-cdp-check.mjs
 
 # 插件侧
 cd ..\packages\dsh-plugin-scratch
-node test-tools.mjs          # 92 条（含打包契约：组合包 / volatile 配置 / 浏览器半侧）
+node test-tools.mjs          # 128 条（含打包契约：组合包 / volatile 配置 / 浏览器半侧）
 node test-skills.mjs         # 23 条
 node test-bridge-auth.mjs    # 21 条
+node test-backpack.mjs       # 36 条（导出/注入/与官方序列化器逐块对拍）
 
 # 改过扩展的执行器之后必须同步，否则 test-tools 里那条"逐字节一致"的断言会红
 cd ..\..; node lab/sync-executor.mjs
