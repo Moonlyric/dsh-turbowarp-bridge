@@ -19,7 +19,7 @@ npm install          # scratch-vm + scratch-storage，约 140MB
 # 替身 VM 层（秒级）
 node test-content-ops.js     # 主套件：280 条断言（读/写/改/删/整理/定位/白名单/观察者/运行控制/回传瘦身/背包导出与对拍/输入名校验/自动布局/子树读）
 node test-blank-project.mjs   # 空白作品生成器：13 条（zip/md5 + 真 scratch-vm 装载 + 两个 skin）
-node test-dissect.mjs         # sb3 结构分析：67 条（合成样本，验模块/命名空间/平行列表/伪代码/机制识别）
+node test-dissect.mjs         # sb3 结构分析：78 条（合成样本，验模块/命名空间/平行列表/伪代码/机制识别/跨角色复制件）
 node test-vm-pipeline.js     # scratch-vm 管线冒烟：只打日志，没有断言（退出码恒为 0）
 
 # 真机层（分钟级，需要浏览器/桌面版 + 网络）
@@ -48,6 +48,12 @@ node test-bridge-auth.mjs    # 21 条断言（握手认证 + 跨会话伪造防�
 
 `sb3-read.mjs` 是它和 `inspect-sb3.mjs` 共用的读取层——各写一套的话，同一个文件会报出两个块数。
 报告只输出统计和结构描述，不含积木 JSON。
+
+**跨角色复制件**是新加的一项：Scratch 没有跨角色调用，两个角色要同一段逻辑只能复制粘贴，
+复制完就会各自演化。分析器给每个自定义块的定义正文算一个规范化哈希（丢块 id、丢
+`mutation.argumentids`——那两样每次复制都会变），同名过程出现在 ≥2 个角色里就报一组，
+正文哈希不同就标「已走样」。实测 9 个作品共 65 组复制件，其中 32 组（49%）已经不一致 ——
+这类问题肉眼几乎发现不了，只能靠工具主动报。
 
 ## build-font-kit.mjs（把画笔文字引擎做成可复用件）
 

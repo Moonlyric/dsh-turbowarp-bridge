@@ -46,7 +46,8 @@ AI 侧的入口是 `scratch_open_editor`：用户说「打开 TurboWarp」时，
 | **M0** | 核心管线：读（snapshot/read_script）+ 写（add_blocks）+ 回滚 + SVG 造型 + 定位 | ✅ |
 | **M1** | 全编辑能力：update_block + delete_blocks（级联）+ tidy_blocks + opcode 白名单 + 快照持久化 | ✅ |
 | **M2** | 观察者 + 双向联动：watch（变量订阅/轮询）+ user_context（选块/绿旗感知） | ✅ |
-| **Skill 区** | Scratch 实践经验库（10 篇）+ scratch_skills / scratch_skill_edit + 三层开关 | ✅ 23/23 |
+| **Skill 区** | Scratch 实践经验库（**20 篇**，其中 6 篇是整套架构：文字引擎 / 克隆体 UI / 渲染队列 / 3D 管线 / 角色切分 / 启动预热）+ scratch_skills / scratch_skill_edit + 三层开关 | ✅ 32/32 |
+| **结构分析** | `lab/dissect.mjs`：模块分工 / 每帧节拍 / 数据布局 / 机制识别 / 结构风险，含**跨角色复制件检测**（把"改一处要改七处"量出来） | ✅ 78/78 |
 | **审计 + 修** | 全项目审查：修掉「核心注入在真机上根本不工作」等 7 个真 bug，补断言防回归 | ✅ 2026-10-16 |
 | **LNA 改造** | socket 从页面搬进扩展 service worker + 心跳保活 + `lab` 加 LNA/保活断言 | ✅ 2026-10-17（这次绿才算数） |
 | **M0.5 真机** | 真 Chrome/Edge + 真 turbowarp.org 全链路自动验收（33 工具 + 存/读 sb3） | ✅ **115/115**（2026-10-17 关 VPN 实测，Chrome 与 Edge 各一遍；旧的 98/98 是假绿） |

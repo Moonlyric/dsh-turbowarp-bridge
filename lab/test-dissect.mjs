@@ -190,6 +190,45 @@ function buildArch () {
   return { targets: [stage, main, ui, save], extensions: ['pen'], meta: { semver: '3.0.0', agent: '架构样本' } }
 }
 
+// ─────────────── 样本 4：跨角色复制的自定义块 ───────────────
+
+/**
+ * Scratch 没有跨角色调用：两个角色要同一段逻辑只能复制。这里造 3 个角色各定义一份
+ * 「取高度 %s」—— A/B 一模一样，C 多了一块（走样）。
+ */
+function buildCopies () {
+  const stage = mkTarget('Stage', true)
+  const a = mkTarget('A')
+  const b = mkTarget('B')
+  const c = mkTarget('C')
+
+  // ⚠️ 同一个角色内的块 id 必须唯一：builder 的 seq 是每次 new 都从 1 起，
+  // 所以一个角色只能 new 一次 builder（早先每调一次 def 就 new 一遍，块被覆盖成 3 个）。
+  const makers = new Map([[a, builder(a)], [b, builder(b)], [c, builder(c)]])
+  const def = (t, code, extra) => {
+    const { add, chain } = makers.get(t)
+    const proto = add('procedures_prototype', {
+      mutation: { proccode: code, warp: 'true', argumentnames: ['x'], argumentids: '["argX"]' }
+    })
+    const defId = add('procedures_definition', { inputs: { custom_block: ref(proto) }, topLevel: true })
+    const set = add('data_setvariableto', { fields: { VARIABLE: ['高度', 'v'] }, inputs: { VALUE: lit(1) } })
+    if (extra) {
+      const e = add('motion_changexby', { inputs: { DX: lit(1) } })
+      chain(defId, set, e)
+    } else {
+      chain(defId, set)
+    }
+    return defId
+  }
+  def(a, '取高度 %s', false)
+  def(b, '取高度 %s', false)
+  def(c, '取高度 %s', true)
+  // 只有 A 有的另一个块：不该被算成"复制"
+  def(a, '只属于 A %s', false)
+
+  return { targets: [stage, a, b, c], extensions: [] }
+}
+
 // ─────────────── 断言 ───────────────
 
 console.log('sample 1: 无上限建克隆 / 每帧广播 / 状态机 / 列表')
@@ -283,6 +322,34 @@ console.log('sample 3: 架构')
   ok(md.includes('还原成写法'), '报告里给出还原后的伪代码')
   ok(md.includes('平行列表（一行一个实体）'), '报告里点出"一行一个实体"的平行列表')
   ok(md.includes('`[SYS]`'), '报告里的模块表按前缀分组')
+}
+
+console.log('sample 4: 跨角色复制的自定义块')
+{
+  const a = dissect(buildCopies())
+  eq(a.totals.procs, 4, '4 个自定义块定义')
+  eq(a.totals.copiedProcs, 1, '只认出 1 组跨角色复制（只属于 A 的不算）')
+  eq(a.totals.copiedProcDrift, 1, '这一组内容已不一致')
+  const r = a.risks.find(x => /在多个角色里各存了一份/.test(x.text))
+  ok(!!r, '风险里报了"跨角色复制"')
+  ok(/「取高度 %s」出现在 3 个角色里/.test(r.text || ''), '报出复制到的角色数')
+  ok(/已经不一致/.test(r.text || ''), '报出走样')
+  ok(/广播并等待/.test(r.text || ''), '给出替代方案')
+  ok(renderMarkdown(a).includes('跨角色复制的自定义块：1 组'), '报告里也有一行')
+
+  // 全都一样的拷贝：仍然报"复制"，但不说走样
+  const b = buildCopies()
+  const c = b.targets.find(t => t.name === 'C')
+  const defC = Object.values(c.blocks).find(x => x.opcode === 'procedures_definition')
+  // 把 C 多出来的那块从链上摘掉
+  const set = c.blocks[defC.next]
+  const extra = c.blocks[set.next]
+  set.next = null
+  for (const [id, blk] of Object.entries(c.blocks)) if (id === extra.next) blk.parent = null
+  const a2 = dissect(b)
+  eq(a2.totals.copiedProcs, 1, '内容一致时仍然算复制')
+  eq(a2.totals.copiedProcDrift, 0, '内容一致时走样数为 0')
+  ok(/目前内容一致/.test(a2.risks.find(x => /在多个角色里各存了一份/.test(x.text)).text), '措辞改成"内容一致"')
 }
 
 console.log('列表用途判定')

@@ -231,13 +231,19 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
 
 ## Skill 区（Scratch 实践经验库）
 
-对公开作品里常见**做法**的归纳，14 篇文档：
-`getting-started` / `code-patterns` / `animation-visual` / `architecture` /
-`proven-patterns`（十种能照抄的骨架） / `performance` / `sb3-json-reference` /
-`project-planning` / `recipes` / `runtime-control`（跑起来再改）/ `backpack`（攒积木）。
+对公开作品里常见**做法**的归纳，**19 篇文档**（+ `INDEX.md` 路由表）：
+
+| 分组 | 文档 |
+|---|---|
+| 上手 / 契约 | `getting-started` / `injection-semantics`（add_blocks 契约）/ `sb3-json-reference` / `platform-traps`（10 个不报错的坑）/ `runtime-control` / `project-planning` |
+| 写代码 | `code-patterns` / `performance` / `animation-visual` / `recipes` / `backpack`（攒积木） |
+| 整体骨架 | `architecture` / `proven-patterns`（十种能照抄的骨架） |
+| **整套架构**（从商业级完成度作品里读出来的） | `pen-text`（中文文字引擎，背包里有成品）/ `one-sprite-clones-ui`（一个角色做整套界面）/ `render-queue`（有序贴图池）/ `pen-3d`（相机基 → 投影 → 裁剪）/ `sprite-split`（角色怎么切、跨角色共享代码三条路）/ `boot-pipeline`（分批初始化 + 造型预热） |
 
 > 这里**刻意不记**「哪个作品有多少积木」——数字对"怎么写"没有帮助。要量规模自己调
 > `scratch_snapshot` 或 `lab/inspect-sb3.mjs`；文档只留能照着做的经验。
+> （唯一的例外是 `lab/dissect.mjs` 的量产报告：它会把「跨角色复制的自定义块」连同走样数一起报出来，
+> 那是**改代码前必须先知道**的东西，不是规模炫耀。）
 
 - **不强制注入**——工具返回只带一行 skillHint，agent 自主选读
 - **三层开关**——`skillsEnabled` 总闸 → `.enabled.json` 单篇开关 → agent 自主
@@ -268,16 +274,16 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
 
 ## 文件
 
-- `index.js` — 入口：桥 + 握手 + 30 工具 + 快照持久化 + skill 区 + 背包 + 桌面版启动
+- `index.js` — 入口：桥 + 握手 + 38 工具 + 快照持久化 + skill 区 + 背包 + 桌面版启动
 - `cdp.js` — **CDP 直连**：给桌面版带调试端口启动、注入执行器、`tagForPage()` 贴协议标签
 - `vm-executor.js` — 扩展 `content-main.js` 的**逐字节副本**（CDP 注的就是它；
   改完扩展执行器跑 `node ../lab/sync-executor.mjs` 同步，`test-tools.mjs` 有一致性断言守着）
 - `lib/client.js` — **浏览器半侧**（手写的 __ModuleLoader__ bundle：插件页里的配置表单）
 - `win32-window.ps1` — 窗口可见性探针（EnumWindows + ShowWindow，Windows only）
-- `skills/` — 内置 13 篇经验 + `INDEX.md`
+- `skills/` — 内置 19 篇经验 + `INDEX.md`
 - `cordis.patch.yml` — **组合包层**（`dsh.bundle.patch` 指向它，安装时自动插入 `scratch` 行）
-- `test-skills.mjs` — skill 区单测（23 断言）
-- `test-backpack.mjs` — **背包集成**（假页面连真桥：存→落盘→list/read→注入→preview→删除进 `_trash`，36 断言）
+- `test-skills.mjs` — skill 区单测（32 断言）
+- `test-backpack.mjs` — **背包集成**（假页面连真桥：存→落盘→list/read→注入→preview→删除进 `_trash`，39 断言）
 - `test-bridge-auth.mjs` — 桥的握手认证与应答来源校验（21 断言，别删）
 - `test-tools.mjs` — 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 /
   CDP 桌面分支的启动参数与诚实报错 / `tagForPage` 四连 / 执行器副本一致性 / 桥端口被占自愈 /

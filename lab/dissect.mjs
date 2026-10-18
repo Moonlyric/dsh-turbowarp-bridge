@@ -142,9 +142,41 @@ function scanTarget (t, m) {
   }
 }
 
+/**
+ * 自定义块定义的"规范化正文"：丢 id、丢 mutation（argumentids 每次复制都会变），
+ * 只留 opcode / 字段值 / 字面量 / 结构。用来判断"两份拷贝还是不是同一份代码"。
+ */
+function canonProcBody (m, rootId) {
+  const out = []
+  const walk = (id, depth) => {
+    const b = m.get(id)
+    if (!b || depth > 40) return
+    out.push(depth + ':' + b.opcode)
+    for (const k of Object.keys(b.fields || {}).sort()) {
+      out.push(depth + ':F' + k + '=' + String(b.fields[k][0]))
+    }
+    for (const k of Object.keys(b.inputs || {}).sort()) {
+      const inp = b.inputs[k]
+      const lit = inputValue(inp)
+      if (lit !== undefined) out.push(depth + ':I' + k + '=' + JSON.stringify(lit))
+      const rid = inputRef(inp, m)
+      if (rid) walk(rid, depth + 1)
+    }
+    if (b.next) walk(b.next, depth)
+  }
+  walk(rootId, 0)
+  return out.join('\n')
+}
+
+/** FNV-1a 32 位 + 长度（只用来比"是不是同一段代码"，不要密码学强度） */
+function hashStr (s) {
+  let h = 0x811c9dc5
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x01000193) >>> 0
+  return h.toString(16) + ':' + s.length
+}
+
 /** 主分析：纯函数，不碰磁盘、不联网 */
-export function dissect (project, meta = {}) {
-  const targets = (project.targets || []).filter(Boolean)
+export function dissect (project, meta = {}) {  const targets = (project.targets || []).filter(Boolean)
   // 用位置兜底:真实的 sb3 一定有 id,但手工造的/坏文件可能没有,不能让 Map 收敛成一个
   const keyOf = (t, i) => t.id || `#${i}`
   const maps = new Map()
@@ -207,17 +239,49 @@ export function dissect (project, meta = {}) {
   for (let i = 0; i < targets.length; i++) {
     const t = targets[i]
     const m = mapOf(t, i)
+    // prototype 的 parent 正常就是定义块；少数文件 parent 缺失，所以再用
+    // 定义块的 inputs.custom_block 反查一次兜底（否则那一条的正文取不到）。
+    const defOfProto = new Map()
+    for (const [id, b] of m) {
+      if (b.opcode !== 'procedures_definition') continue
+      const pid = b.inputs && b.inputs.custom_block && b.inputs.custom_block[1]
+      if (typeof pid === 'string') defOfProto.set(pid, id)
+    }
     for (const [id, b] of m) {
       if (b.opcode !== 'procedures_prototype') continue
       const mu = b.mutation || {}
+      const parentIsDef = b.parent && m.has(b.parent) && m.get(b.parent).opcode === 'procedures_definition'
+      const defId = parentIsDef ? b.parent : (defOfProto.get(id) || null)
       procs.push({
-        target: titleOf(t), proccode: mu.proccode || '',
+        target: titleOf(t), isStage: !!t.isStage, proccode: mu.proccode || '',
         warp: String(mu.warp) === 'true',
-        args: Array.isArray(mu.argumentnames) ? mu.argumentnames.length : 0
+        args: Array.isArray(mu.argumentnames) ? mu.argumentnames.length : 0,
+        bodyHash: defId ? hashStr(canonProcBody(m, defId)) : null
       })
     }
   }
   const warpCount = procs.filter(p => p.warp).length
+
+  // ---------- 跨角色复制的自定义块 ----------
+  // Scratch 没有跨角色调用：两个角色要同一段逻辑，只能复制粘贴。复制完就会各自演化 ——
+  // 这是"改一处要改七处"的根源，而且肉眼几乎发现不了（同名过程散在不同角色里）。
+  const procGroups = new Map()
+  for (const p of procs) {
+    // 舞台上的自定义块只有舞台自己能用，不算"跨角色复制"；
+    // 取不到正文的（原型挂不上定义块）也不参与比较：既不能说它跟谁一样，也不能说它不一样
+    if (p.isStage || !p.proccode || !p.bodyHash) continue
+    if (!procGroups.has(p.proccode)) procGroups.set(p.proccode, [])
+    procGroups.get(p.proccode).push(p)
+  }
+  const copies = [...procGroups.entries()]
+    .map(([proccode, arr]) => ({
+      proccode,
+      targets: [...new Set(arr.map(p => p.target))],
+      variants: new Set(arr.map(p => p.bodyHash)).size
+    }))
+    .filter(c => c.targets.length >= 2)
+    .sort((a, b) => b.targets.length - a.targets.length)
+  const copiesDrifted = copies.filter(c => c.variants >= 2)
 
   // ---------- 数据 ----------
   const lists = []
@@ -354,6 +418,16 @@ export function dissect (project, meta = {}) {
   const nonStd = opSorted.filter(([op]) => !/^[a-z0-9]+_[a-zA-Z0-9_]+$/.test(op) || /\b(gandi|gandi_|ext_)/i.test(op))
   const risks = []
   if (unbounded.length && !totalDeletes) risks.push({ level: 'high', text: '在 forever 里建克隆且从不删除 —— 跑久了必然掉帧' })
+  if (copies.length) {
+    risks.push({
+      level: copiesDrifted.length ? 'mid' : 'low',
+      text: `${copies.length} 个自定义块在多个角色里各存了一份（最多「${copies[0].proccode}」出现在 ${copies[0].targets.length} 个角色里）` +
+        (copiesDrifted.length
+          ? `，其中 ${copiesDrifted.length} 组的内容**已经不一致**（${copiesDrifted.slice(0, 3).map(c => `「${c.proccode}」${c.variants} 个版本`).join('、')}）—— 改逻辑时很容易只改到其中几个，剩下几个继续跑旧行为`
+          : '，目前内容一致') +
+        '。Scratch 没有跨角色调用，这是它唯一的"共享"代价：要根治只能把这段逻辑并进一个角色，或者用「广播并等待」调库角色（参数走全局变量）。改之前先比一遍这些拷贝，别只改你以为的那一份。'
+    })
+  }
   if (perFrameBroadcast.length) risks.push({ level: 'high', text: `${perFrameBroadcast.length} 个广播每帧发送，接收方的帽子脚本每帧都要重建线程` })
   if (listSearch >= 3 && lists.some(l => l.len > 500)) risks.push({ level: 'mid', text: '对上千项的列表做「包含/编号」查询，O(n)' })
   if (totalPerFrame > 300) risks.push({ level: 'mid', text: `每帧 ${totalPerFrame} 块，离 33ms 的帧预算不远` })
@@ -380,6 +454,8 @@ export function dissect (project, meta = {}) {
     maxDepth,
     procs: procs.length,
     warpProcs: warpCount,
+    copiedProcs: copies.length,
+    copiedProcDrift: copiesDrifted.length,
     clonesCreated: allCreate.length,
     clonesDeleted: totalDeletes,
     cloneScripts: totalCloneScripts,
@@ -1082,6 +1158,10 @@ export function renderMarkdown (a) {
   ]
   for (let i = 0; i < rows.length; i += 2) {
     L.push(`| ${rows[i][0]} | ${rows[i][1]} | ${rows[i + 1] ? rows[i + 1][0] : ''} | ${rows[i + 1] ? rows[i + 1][1] : ''} |`)
+  }
+  if (t.copiedProcs) {
+    L.push('')
+    L.push(`跨角色复制的自定义块：${t.copiedProcs} 组${t.copiedProcDrift ? `，**${t.copiedProcDrift} 组的内容已经不一致**` : '（内容一致）'}。`)
   }
   L.push('')
 
