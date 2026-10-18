@@ -34,7 +34,7 @@ t('scratch_skill_edit 注册', registered.has('scratch_skill_edit'))
 const skillsTool = registered.get('scratch_skills')
 const editTool = registered.get('scratch_skill_edit')
 let r = await skillsTool.execute({ action: 'list' })
-t('list 返回 15 篇（14 正文+INDEX）', r.count === 15, 'count=' + r.count)
+t('list 返回 18 篇（17 正文+INDEX）', r.count === 18, 'count=' + r.count)
 t('list 每篇有标题摘要', r.skills.every(s => s.title && typeof s.on === 'boolean'))
 t('缺省全开', r.skills.every(s => s.on === true))
 const sb3 = r.skills.find(s => s.name === 'sb3-json-reference.md')
@@ -42,6 +42,10 @@ t('sb3-json-reference 在列且标题对', sb3 && /速查/.test(sb3.title))
 const penText = r.skills.find(s => s.name === 'pen-text.md')
 t('pen-text.md 在列（画笔文字引擎）', penText && /文字/.test(penText.title))
 t('pen-text 摘要提到背包取用', /背包|backpack/i.test(JSON.stringify(penText)))
+for (const [name, re] of [['pen-3d.md', /3D|投影/], ['one-sprite-clones-ui.md', /界面|克隆/], ['render-queue.md', /渲染|队列|贴图/]]) {
+  const s = r.skills.find(x => x.name === name)
+  t(`${name} 在列且有标题`, s && re.test(s.title), JSON.stringify(s && s.title))
+}
 
 // ---- read ----
 r = await skillsTool.execute({ action: 'read', name: 'getting-started.md' })

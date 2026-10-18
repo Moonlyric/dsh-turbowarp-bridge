@@ -552,8 +552,8 @@ export function apply(ctx, config) {
   const builtinSkillDir = join(dirname(fileURLToPath(import.meta.url)), 'skills')
   const skillStateFile = join(skillDir, '.enabled.json')
   const builtinVersionFile = join(skillDir, '.builtin-version')
-  const SKILL_BUILTIN_VERSION = '6' // 升级内置 skill 时 bump（6 = 新增 pen-text.md：画笔文字引擎
-                                    //     （字形编码格式 / 用法 / 坑），proven-patterns 第 6 条改为"直接用背包里那条"；
+  const SKILL_BUILTIN_VERSION = '7' // 升级内置 skill 时 bump（7 = 新增 pen-3d / one-sprite-clones-ui /
+                                    //     render-queue 三篇整套架构；6 = 新增 pen-text.md（画笔文字引擎）；
                                     //     5 = 新增 proven-patterns.md：从真实高完成度作品里读出来的十种写法；
                                     //     4 = 注入语义/平台陷阱/任务路由；3 = 背包那篇；2 = 去掉块数普查）
 

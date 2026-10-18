@@ -14,6 +14,9 @@
 | 做游戏循环、克隆、弹幕、网格 | code-patterns.md + performance.md | platform-traps.md §4（warp） |
 | 做 UI / 动画 / 转场 | animation-visual.md | architecture.md |
 | **要画中文文字 / 界面文字 / 打字机效果** | **pen-text.md**（背包里现成的引擎） | backpack.md |
+| **控件很多 / 要做编辑器** | **one-sprite-clones-ui.md**（一个角色 + 克隆体） | architecture.md |
+| **同屏几十个以上会动的东西** | **render-queue.md**（有序贴图池 + 平行列表实体） | performance.md |
+| **伪 3D（走廊 / 赛车 / 俯瞰）** | **pen-3d.md**（相机基 → 投影 → 近平面裁剪） | platform-traps.md §4 |
 | 项目 > 3 个角色或要长期改 | architecture.md | project-planning.md |
 | 要验证"真的生效了" / 点了没反应 | runtime-control.md | platform-traps.md §0 |
 | 用户没说清要什么 | project-planning.md | — |
@@ -77,6 +80,15 @@
 | 8 | 图搜索 | 邻接表 + 队列，出队**只挪头指针，绝不 delete 1** |
 | 9 | 刷新分阶段 | 前置/本体/后置/渲染 四个广播，把"谁先算"变成显式约定 |
 | 10 | 一个关注点一个角色 | `物体管理`/`碰撞箱`/`摄像头`/`触发区` 各管一件事，只通过列表和广播通信 |
+
+补充四篇（都是整套架构，不是单点技巧）：
+
+| 文档 | 一句话 |
+|---|---|
+| pen-text.md | 中文文字用背包里的「文字引擎」，别自己写（字形数据是几 MB 的工程量） |
+| one-sprite-clones-ui.md | 一个角色 + 克隆体做整套界面：造型编号当类型、坐标区间命中、15 块积木的撤销栈 |
+| render-queue.md | 各子系统只往一张有序「贴图池」里登记，最后一趟画完（固定 384 槽） |
+| pen-3d.md | 相机基 9 项表 → 三次内积 → 一行透视 → **近平面裁剪** → 屏幕裁剪 |
 
 ## 6. 维护
 
