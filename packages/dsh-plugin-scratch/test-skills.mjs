@@ -34,7 +34,7 @@ t('scratch_skill_edit 注册', registered.has('scratch_skill_edit'))
 const skillsTool = registered.get('scratch_skills')
 const editTool = registered.get('scratch_skill_edit')
 let r = await skillsTool.execute({ action: 'list' })
-t('list 返回 20 篇（19 正文+INDEX）', r.count === 20, 'count=' + r.count)
+t('list 返回 21 篇（20 正文+INDEX）', r.count === 21, 'count=' + r.count)
 t('list 每篇有标题摘要', r.skills.every(s => s.title && typeof s.on === 'boolean'))
 t('缺省全开', r.skills.every(s => s.on === true))
 const sb3 = r.skills.find(s => s.name === 'sb3-json-reference.md')
@@ -43,10 +43,12 @@ const penText = r.skills.find(s => s.name === 'pen-text.md')
 t('pen-text.md 在列（画笔文字引擎）', penText && /文字/.test(penText.title))
 t('pen-text 摘要提到背包取用', /背包|backpack/i.test(JSON.stringify(penText)))
 for (const [name, re] of [['pen-3d.md', /3D|投影/], ['one-sprite-clones-ui.md', /界面|克隆/], ['render-queue.md', /渲染|队列|贴图/],
-  ['sprite-split.md', /角色/], ['boot-pipeline.md', /启动|预热|载入/]]) {
+  ['sprite-split.md', /角色/], ['boot-pipeline.md', /启动|预热|载入/], ['multi-minigame-shell.md', /小游戏|章节|关卡/]]) {
   const s = r.skills.find(x => x.name === name)
   t(`${name} 在列且有标题`, s && re.test(s.title), JSON.stringify(s && s.title))
 }
+r = await skillsTool.execute({ action: 'read', name: 'multi-minigame-shell.md' })
+t('multi-minigame-shell 有三态门和存档格式', /reset/.test(r.content) && /\^/.test(r.content))
 r = await skillsTool.execute({ action: 'read', name: 'sprite-split.md' })
 t('sprite-split 讲清了「复制走样」的实测数', /49%/.test(r.content) && /资产边界/.test(r.content))
 r = await skillsTool.execute({ action: 'read', name: 'boot-pipeline.md' })

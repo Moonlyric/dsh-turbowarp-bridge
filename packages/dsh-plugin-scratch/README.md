@@ -231,14 +231,14 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
 
 ## Skill 区（Scratch 实践经验库）
 
-对公开作品里常见**做法**的归纳，**19 篇文档**（+ `INDEX.md` 路由表）：
+对公开作品里常见**做法**的归纳，**20 篇文档**（+ `INDEX.md` 路由表）：
 
 | 分组 | 文档 |
 |---|---|
 | 上手 / 契约 | `getting-started` / `injection-semantics`（add_blocks 契约）/ `sb3-json-reference` / `platform-traps`（10 个不报错的坑）/ `runtime-control` / `project-planning` |
 | 写代码 | `code-patterns` / `performance` / `animation-visual` / `recipes` / `backpack`（攒积木） |
 | 整体骨架 | `architecture` / `proven-patterns`（十种能照抄的骨架） |
-| **整套架构**（从商业级完成度作品里读出来的） | `pen-text`（中文文字引擎，背包里有成品）/ `one-sprite-clones-ui`（一个角色做整套界面）/ `render-queue`（有序贴图池）/ `pen-3d`（相机基 → 投影 → 裁剪）/ `sprite-split`（角色怎么切、跨角色共享代码三条路）/ `boot-pipeline`（分批初始化 + 造型预热） |
+| **整套架构**（从商业级完成度作品里读出来的） | `pen-text`（中文文字引擎，背包里有成品）/ `one-sprite-clones-ui`（一个角色做整套界面）/ `render-queue`（有序贴图池）/ `pen-3d`（相机基 → 投影 → 裁剪）/ `sprite-split`（角色怎么切、跨角色共享代码三条路）/ `boot-pipeline`（分批初始化 + 造型预热）/ `multi-minigame-shell`（章节式作品共用一个壳：界面变量 + 字幕队列 + 存档码） |
 
 > 这里**刻意不记**「哪个作品有多少积木」——数字对"怎么写"没有帮助。要量规模自己调
 > `scratch_snapshot` 或 `lab/inspect-sb3.mjs`；文档只留能照着做的经验。
@@ -280,9 +280,9 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
   改完扩展执行器跑 `node ../lab/sync-executor.mjs` 同步，`test-tools.mjs` 有一致性断言守着）
 - `lib/client.js` — **浏览器半侧**（手写的 __ModuleLoader__ bundle：插件页里的配置表单）
 - `win32-window.ps1` — 窗口可见性探针（EnumWindows + ShowWindow，Windows only）
-- `skills/` — 内置 19 篇经验 + `INDEX.md`
+- `skills/` — 内置 20 篇经验 + `INDEX.md`
 - `cordis.patch.yml` — **组合包层**（`dsh.bundle.patch` 指向它，安装时自动插入 `scratch` 行）
-- `test-skills.mjs` — skill 区单测（32 断言）
+- `test-skills.mjs` — skill 区单测（34 断言）
 - `test-backpack.mjs` — **背包集成**（假页面连真桥：存→落盘→list/read→注入→preview→删除进 `_trash`，39 断言）
 - `test-bridge-auth.mjs` — 桥的握手认证与应答来源校验（21 断言，别删）
 - `test-tools.mjs` — 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 /

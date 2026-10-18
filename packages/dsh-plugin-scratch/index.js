@@ -552,7 +552,9 @@ export function apply(ctx, config) {
   const builtinSkillDir = join(dirname(fileURLToPath(import.meta.url)), 'skills')
   const skillStateFile = join(skillDir, '.enabled.json')
   const builtinVersionFile = join(skillDir, '.builtin-version')
-  const SKILL_BUILTIN_VERSION = '12' // 升级内置 skill 时 bump（12 = backpack/injection-semantics 补
+  const SKILL_BUILTIN_VERSION = '13' // 升级内置 skill 时 bump（13 = 新增 multi-minigame-shell.md：
+                                    //     章节式作品的共用壳（界面变量 + 三态门 + 台词队列 + 存档码）；
+                                    //     12 = backpack/injection-semantics 补
                                     //     listLimit、变量 scope、creates 的 (全局) 标记；
                                     //     11 = sb3-json-reference 修 inputs 编码
                                     //     （影子的第 1 位规则 / argumentids 随机键 / 11-13 是报告器三元组）；
