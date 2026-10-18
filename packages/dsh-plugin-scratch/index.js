@@ -552,8 +552,9 @@ export function apply(ctx, config) {
   const builtinSkillDir = join(dirname(fileURLToPath(import.meta.url)), 'skills')
   const skillStateFile = join(skillDir, '.enabled.json')
   const builtinVersionFile = join(skillDir, '.builtin-version')
-  const SKILL_BUILTIN_VERSION = '10' // 升级内置 skill 时 bump（10 = 又一轮旧文档整修：platform-traps 补
-                                    //     广播无参数/画笔状态/作用域，recipes 修掉一个编造的 split 块，
+  const SKILL_BUILTIN_VERSION = '11' // 升级内置 skill 时 bump（11 = sb3-json-reference 修 inputs 编码
+                                    //     （影子的第 1 位规则 / argumentids 随机键 / 11-13 是报告器三元组）；
+                                    //     10 = platform-traps 补广播无参数/画笔状态/作用域，recipes 修掉编造的 split 块，
                                     //     animation-visual 挂上新架构；
                                     //     9 = 重整 architecture/performance/getting-started/code-patterns；
                                     //     8 = 新增 sprite-split / boot-pipeline 两篇；

@@ -24,15 +24,25 @@
 
 ## inputs 数组编码（重点，最容易错）
 
-`"INPUT_NAME": [遮挡标志, 值]`
+`"INPUT_NAME": [影子状态, 值]`，挂了块且下面还有影子时是 `[3, 块id, 影子]`。
 
-**值是普通字面量**（数字/字符串直填）：
+| 第 1 位 | 含义 | 长什么样 |
+|---|---|---|
+| `1` | 槽里**只有影子**：一个字面量，或者一个**影子块的 id** | `"STEPS": [1, [4, "10"]]`、`"STEPS": [1, "影子块id"]` |
+| `2` | 挂了实块，这个槽**本来就没有影子**（SUBSTACK / 布尔六边形） | `"SUBSTACK": [2, "首块id"]`、`"CONDITION": [2, "条件块id"]` |
+| `3` | 挂了实块，块下面还压着一个影子（输入框被报告器占了） | `"STEPS": [3, "块id", [4, "10"]]` |
+
+> **实块用 `2` 或 `3`；`1` 只留给影子**（字面量，或自定义积木原型里那种 argument_reporter 影子）。
+> 把实块写成 `[1, "块id"]`，它就被当字面量了 —— 不报错，表达式恒为 0。
+> 反过来，`3` 的第 2 位也不一定是块 id：变量/列表报告器会直接写成三元组
+> （真实数据：`[3, [12, "*x", "变量id"], [10, ""]]`）。
+
+值是字面量时，第 2 位是 `[类型码, 值]`：
+
 ```json
-"STEPS": [1, [4, "10"]]          // 第1位=遮挡标志(1/2/3)，第2位=[类型码, 值]
-"MESSAGE": [1, [10, "你好"]]
+"STEPS": [1, [4, "10"]]          // 数字
+"MESSAGE": [1, [10, "你好"]]      // 文本
 ```
-
-第 2 位那个类型码（`[类型码, 值]`）的字典 —— **这是最容易记错的地方**：
 
 | 码 | 含义 | 码 | 含义 |
 |---|---|---|---|
@@ -42,20 +52,18 @@
 | 7 | 整数 | 12 | 变量（variable） |
 | 8 | 角度 | 13 | 列表（list） |
 
-第 1 位（遮挡标志）：`1` = 块和影子是同一个（只给了值）、`2` = 只有块没有影子（布尔/C 块子栈）、`3` = 块和影子不同（值和默认值都给了）。
+**11 / 12 / 13 不是字面量，是"报告器"**，它们是三元组 `[码, 名字, id]`，而且**不产生独立的块条目**：
 
-来源：`scratch-vm/src/serialization/sb3.js` 的 `MATH_NUM_PRIMITIVE=4` … `LIST_PRIMITIVE=13`。
-
-**值是块引用**（input 挂了 reporter 块）：`[1, "块id"]`
 ```json
-"STEPS": [1, "abc123"]
+"OPERAND1": [1, [12, "分数", "变量id"]]
+"ITEM":     [1, [13, "我的列表", "列表id"]]
+"BROADCAST_INPUT": [1, [11, "开始", "广播id"]]
 ```
 
-**值是块+影子**（reporter 下面还有个默认值）：`[1, "块id", [4, "10"]]`
+所以"在块表里查不到这个 id"不等于"这里是常量" —— `lab/dissect.mjs` 早年就把内联变量误判成常量，
+一次误报 533 处"两边都写死的比较"。判断"是不是常量"只能用 `isConstant()` 那套（看类型码 4~10）。
 
-**布尔六边形输入**：`[2, "条件块id"]`（没有影子）
-
-**子栈**（C 块的 SUBSTACK）：`[2, "子链首块id"]`
+来源：`scratch-vm/src/serialization/sb3.js` 的 `MATH_NUM_PRIMITIVE=4` … `LIST_PRIMITIVE=13`。
 
 ## fields 编码
 
@@ -101,13 +109,25 @@
 ## 自定义积木三件套（社区作品大量使用）
 
 ```json
-"定义块": { "opcode": "procedures_definition", "customBlock": "proccode字符串", inputs/fields 视 prototype 而定 }
-"原型块": { "opcode": "procedures_prototype", inputs: { 每个参数: [1, [传给argument_reporter的默认label]] }, mutation: { proccode, argumentids, argumentnames, warp, tagName: "procedures_prototype", children: [] } }
-"调用块": { "opcode": "procedures_call", inputs: { arg名: [1, [4, "传入值"]] }, mutation: { proccode, warp, tagName: "procedures_caller", children: [] } }
-"参数块": { "opcode": "argument_reporter_string_number", fields: { VALUE: ["参数名"] } }
+"定义块": { "opcode": "procedures_definition", "inputs": { "custom_block": [1, "原型块id"] }, "next": "正文首块" }
+"原型块": { "opcode": "procedures_prototype",
+           "inputs": { "j*q]7W...": [1, "参数影子块id"] },   // ← 键是 argumentids 里的随机串；值指向 argument_reporter 影子
+           "mutation": { "proccode": "旋转 %s 速率 %s", "argumentids": "[\"j*q]7W...\"]",
+                         "argumentnames": "[\"方向\"]", "argumentdefaults": "[\"\"]",
+                         "warp": "true", "tagName": "procedures_prototype" } }
+"调用块": { "opcode": "procedures_call",
+           "inputs": { "j*q]7W...": [1, [4, "90"]] },        // ← 同样的随机串
+           "mutation": { "proccode": "旋转 %s 速率 %s", "warp": "true", "tagName": "procedures_caller" } }
+"参数块": { "opcode": "argument_reporter_string_number", "fields": { "VALUE": ["方向", null] }, "shadow": true }
 ```
 
-注：procedures_definition 的 `customBlock` 指向 prototype 块 id；mutation.proccode 是带 %s 占位符的签名串如 `旋转 %s 速率 %s`。
+- **参数键没有固定形状**：它是 `argumentids` 里的随机串，每个块都不一样。所以自定义积木**不要手写** ——
+  抄一份现成的，或者从背包加载（`scratch_backpack_load` 会自动换成新 id）。
+  `add_blocks` 对 `procedures_call` / `procedures_prototype` 也**跳过输入名校验**（它们本来就没有固定名字）。
+- `proccode` 在定义、原型、调用三处必须**逐字节一致**（空格、`%s`/`%n`/`%b` 都要一样），否则挂不上。
+- `warp` 在原型和调用块两处都要是 `"true"`，只改一处不生效。
+- 布尔参数用 `argument_reporter_boolean`，数字/文本用 `argument_reporter_string_number`。
+- 定义块的 `custom_block` 指向原型块；正文挂在**定义块的 `next`** 上（不是原型的 next）。
 
 ## 坐标与工作区
 
