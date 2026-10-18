@@ -52,3 +52,18 @@
 同一个判断需要 ≥3 次调用时（典型：切角色 + 定位 + 读状态 + 截图）。它一次往返做完，
 总耗时从「N × 工具往返」降到几百毫秒。**写操作不能进批处理**（白名单挡着），
 那是有意的：写要走 preview/apply 的确认。
+
+## v0.10.0 新增的三件观测工具
+
+1. **帧心跳**（`scratch_selftest`）：连截两张比哈希。真机上出现过"VM 在跑、变量在涨、
+   所有自检全绿，但用户点绿旗/停止毫无反应、舞台冻结"——只有这一项能发现。
+   `ok:false` 的那条 detail 会直接告诉你用 `scratch_restart_window`。
+2. **截图裁剪**：`scratch_screenshot({ region: "stage" })` 只截舞台（整窗里舞台只占 1/4），
+   `"workspace"` 只截积木区。每张都回 `frameHash`，和上一张相同会标 `sameAsPrev` + `frozenHint`。
+3. **列表切片 / 增量**：`scratch_state({ listSlice: { name, from, count } })`（1-based），
+   以及 `pageListDelta`（和上一次 state 比，列表是不是在泄漏不用再靠运气）。
+
+另外 `scratch_run` 默认只回 `running/threads/clones/stepMs`（要全量传 `detail:true`）；
+`scratch_click` 会回 `pick` / `pickMissed` / `started` —— `hatsStarted:0` 但 `threads>0` 时
+它明说"流程可能是已有线程推进的"，别再据此判断点击失败。
+

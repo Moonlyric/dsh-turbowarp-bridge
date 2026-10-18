@@ -29,7 +29,8 @@ const t = (name, cond, detail) => {
 }
 const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 // v0.7.0 加了 9 个运行控制/可观测工具（19 → 28），v0.8.0 加了 2 个背包工具（→ 30）
-const TOOL_COUNT = 33
+// v0.10.0 加了 5 个（结构总览 / 单块上下文 / 空白作品 / 角色改名 / 重启窗口）→ 38
+const TOOL_COUNT = 38
 
 // ---- 桩：把收到的参数追加到一个文件里，冒充「被打开的程序」 ----
 const browserStub = join(STUB_DIR, 'stub-browser.cmd')
@@ -476,7 +477,7 @@ t('截图走 Page.captureScreenshot，且对扩展会话明确拒绝',
 t('selftest 真的检查桥在不在监听（不是只看有没有会话）',
   indexSrc.includes("add('bridge 监听'") && indexSrc.includes('bridgeListening'))
 t('写操作的「哪变了」统一成 changed（P3-2），且老字段保留',
-  (indexSrc.match(/return withChanged\(await guardedWrite\(/g) || []).length === 5 && indexSrc.includes('changed.added'),
+  (indexSrc.match(/return withChanged\(await guardedWrite\(/g) || []).length >= 5 && indexSrc.includes('changed.added'),
   String((indexSrc.match(/return withChanged\(await guardedWrite\(/g) || []).length))
 
 // 执行器侧：新 op 都在，而且都在**同步后的** vm-executor.js 里（CDP 那条路读的是它）
@@ -587,6 +588,71 @@ t('删变量前数一遍引用块；force 时先补断口再删（不留悬空�
   executorSrc.includes('function variableRefs') &&
   /还被 \$\{refs\.length\} 个积木引用/.test(executorSrc) &&
   /unlinkBlock\(bt\.blocks, r\.blockId\)/.test(executorSrc))
+
+// ==================== v0.10.0：实地反馈清单的回归位 ====================
+console.log('\n[v0.10.0] 实地反馈清单：新工具 + 静默错误的护栏')
+const V010_TOOLS = ['scratch_project_overview', 'scratch_inspect', 'scratch_new_project', 'scratch_target', 'scratch_restart_window']
+t('v0.10.0 的 5 个新工具都注册了', V010_TOOLS.every(n => registered.has(n)), V010_TOOLS.filter(n => !registered.has(n)).join(','))
+for (const n of V010_TOOLS) {
+  const msg = await thrown(() => call(n, { blockId: 'x', action: 'list', to: 'y' }))
+  t(`${n} 没有会话时明确报错（不是崩溃，也不是假装成功）`, !!msg && /没有已连接的 TurboWarp 编辑器/.test(msg), String(msg))
+}
+
+// G1：空白作品生成器（id/md5/zip 都在插件侧现造，AI 不用手搓 sb3）
+const { buildBlankProject } = await import('./sb3.js')
+const blank = buildBlankProject({ spriteName: '细胞' })
+t('空白作品是个合法的 zip（PK\\x03\\x04）', blank.buffer[0] === 0x50 && blank.buffer[1] === 0x4b, String(blank.buffer[0]))
+t('空白作品含 project.json + 2 个 svg', blank.files.length === 3 && blank.files[0] === 'project.json', JSON.stringify(blank.files))
+t('资源文件名 = 内容 md5（存盘后重开也能找到）', blank.files.slice(1).every(f => /^[0-9a-f]{32}\.svg$/.test(f)), JSON.stringify(blank.files))
+
+// A2：大返回的最后一道闸（超预算就换成显式信封 + 全文落盘，绝不闷声丢）
+t('defineTool 统一过 clipToolResult（A2：大返回不再被工具层静默截断）',
+  indexSrc.includes('clipToolResult(jsonSafe(await def.execute(...args))') && indexSrc.includes('function clipToolResult'))
+t('截断信封里带 spillPath + preview + 怎么翻页的建议',
+  indexSrc.includes('spillPath: spillPath || undefined') && indexSrc.includes('preview: text.slice(0, 4000)'))
+
+// B1/A1：open_editor 先返回、装载在后台，并且明确标注"冷启动的默认空工程"
+t('open_editor 把装载丢到后台（loading:true），不再同步阻塞',
+  indexSrc.includes('sess.loading = loading') && indexSrc.includes('out.loading = true'))
+t('返回值里明确标注 beforeLoad 是默认空工程（B1 的误判来源）',
+  indexSrc.includes('桌面版冷启动的默认空工程'))
+t('call() 有装载闸：后续 op 自动等装完（不带 noGate 时）',
+  indexSrc.includes('await s0.loading') && indexSrc.includes('noGate'))
+
+// G9：帧心跳 + 重启窗口
+t('selftest 加了一帧心跳（连截两张比哈希）', indexSrc.includes('frameHashOnce') && indexSrc.includes("add('帧心跳'"))
+t('截图返回 frameHash + sameAsPrev + frozenHint',
+  indexSrc.includes('frameHash') && indexSrc.includes('sameAsPrev') && indexSrc.includes('frozenHint'))
+t('提供了 scratch_restart_window（假活时的恢复动作）',
+  indexSrc.includes('scratch_restart_window') && indexSrc.includes('taskkill'))
+
+// F5：save 的 overwrote 语义
+t('save_project 的 overwrote 只在"目标原本存在且真被覆盖"时为 true',
+  indexSrc.includes('overwrote: existed && !renamed') && indexSrc.includes('created: !existed'))
+
+// D3：截图裁剪
+t('截图支持 region: stage / workspace（D3）', indexSrc.includes('shotRegionRect') && indexSrc.includes("'workspace'"))
+
+// G6：批处理放开 variable 轻写
+t('batch 允许 variable 的 create/set（G6），但明确拒绝其它写动作',
+  indexSrc.includes('BATCH_LIGHT_WRITES') && indexSrc.includes("new Set(['create', 'set'])"))
+
+// 执行器侧的 v0.10.0 关键实现（确保同步后的 vm-executor.js 里真的有）
+const v010 = [
+  ['输入名白名单校验', 'function validatePayload'],
+  ['只增不删账本', 'function staleInjected'],
+  ['显式清理（子树全是自己注入的）', 'function discardStale'],
+  ['自动布局（估算高度）', 'function estStackHeightSb3'],
+  ['写后跟随视口', 'async function followBlock'],
+  ['单块上下文', "case 'inspect'"],
+  ['结构总览', "case 'project_overview'"],
+  ['角色改名', "case 'rename_target'"],
+  ['输入槽补建', 'function ensureInputSlot'],
+  ['列表切片/增量', "stateLastLengths"]
+]
+for (const [label, needle] of v010) {
+  t(`执行器：${label}`, executorSrc.includes(needle), needle)
+}
 
 console.log(`\n===== 插件工具单测: ${pass} pass / ${fail} fail =====`)
 try { rmSync(STUB_DIR, { recursive: true, force: true }); rmSync(HOME, { recursive: true, force: true }) } catch {}

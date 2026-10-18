@@ -6,7 +6,7 @@ AI 通过 `scratch_*` 工具读取/修改 Scratch 项目，用户在 TurboWarp �
 架构（两条传输路径，读写的是**同一份**页面执行器）：
 
 ```
-本插件（Node）= WebSocket 服务端（桥 :31820） + CDP 直连客户端 + 33 个 scratch_* 工具 + Skill 经验库 + 积木背包
+本插件（Node）= WebSocket 服务端（桥 :31820） + CDP 直连客户端 + 38 个 scratch_* 工具 + Skill 经验库 + 积木背包
 
   路一 · 扩展桥
         ↕ JSON-RPC over ws（握手 token）
@@ -126,7 +126,7 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
 > **只有浏览器（扩展桥）那条路要 token。** 桌面版走 CDP 直连：不用扩展、不用 token，
 > 因为它连的是"我们自己拉起来、自己注执行器"的进程，没有"本机任意页面都能连进来"这个问题。
 
-## 工具清单（33 个）
+## 工具清单（38 个）
 
 | 工具 | 方向 | 说明 |
 |---|---|---|
@@ -159,8 +159,13 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
 | `scratch_profile` | 读 | 采样 VM 每步耗时 → avg/p50/p95/max + 反推 fps（别信项目里的 `fps` 变量）；**默认带热点归因** `attribution.hot`（哪条脚本/哪些 opcode 在吃帧，空转单列 `waitPct`） |
 | `scratch_screenshot` | 读 | 截编辑器窗口（CDP；180-208ms 量级）落盘给路径 —— 给用户看效果 / 自己核对画面。**只有桌面版那条路能截**，扩展会话会明确拒绝（不打算给扩展加 `captureVisibleTab`） |
 | `scratch_list_scripts` | 读 | 顶层脚本清单（opcode/块数/调用的自定义积木/名字），**区分真脚本与游离块**（判定用 `runtime._hats`） |
-| `scratch_batch` | 读/运行 | 一次往返做多件事（≤12 条，白名单只放只读/运行期 op；写操作不许进来） |
-| `scratch_selftest` | 读 | 全链路自检：桥监听 / 会话 / CDP 注入 / 项目就绪 / Blockly / 窗口可见 |
+| `scratch_batch` | 读/运行 | 一次往返做多件事（≤12 条；白名单 = 只读/运行期 + `variable` 的 create/set 轻写；改结构的写操作不许进来） |
+| `scratch_selftest` | 读 | 全链路自检：桥监听 / 会话 / CDP 注入 / 项目就绪 / Blockly / 窗口可见 / **帧心跳**（连截两张比哈希，抓"界面冻结"） |
+| `scratch_project_overview` | 读 | **一次看清整个项目**：每角色 opcode 直方图 + 自定义积木（参数 / warp / 被调用次数）+ 脚本一行摘要 |
+| `scratch_inspect` | 读 | **单个块**的上下文：parent + 槽位、next、每个输入接了啥、所属脚本、子树块数（F3：不用整段读） |
+| `scratch_new_project` | 写 | **新建空白作品**（舞台 + 一个角色，各带内联 SVG 造型）；插件侧现造标准 sb3，可顺手落盘 |
+| `scratch_target` | 读/写 | 列角色 / **改角色名**（走 `vm.renameSprite`，同步引用角色名的积木） |
+| `scratch_restart_window` | 运行 | **杀掉重开**桌面版并重装上次的作品（窗口"假活"时的恢复动作） |
 | `scratch_backpack` | 读写 | **积木背包**：list/read/save/delete。把做好的脚本子树（连同它引用的变量/列表的值）存进 `$DSH_HOME/scratch-backpack/`，自动维护 `INDEX.md`；删除进 `_trash/` 不真删 |
 | `scratch_backpack_load` | 写 | 把背包里的一条注进项目（坐标整体平移、变量按名字接上或补建、`variableValues` 换内容）；受 `safety` 档位管 |
 
@@ -226,7 +231,7 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
 
 ## Skill 区（Scratch 实践经验库）
 
-对社区高完成度作品**做法**的总结，10 篇经验文档：
+对社区高完成度作品**做法**的总结，13 篇经验文档：
 `getting-started` / `code-patterns` / `animation-visual` / `architecture` /
 `performance` / `sb3-json-reference` / `project-planning` / `recipes` /
 `runtime-control`（跑起来再改）/ `backpack`（攒积木）。
@@ -269,7 +274,7 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
   改完扩展执行器跑 `node ../lab/sync-executor.mjs` 同步，`test-tools.mjs` 有一致性断言守着）
 - `lib/client.js` — **浏览器半侧**（手写的 __ModuleLoader__ bundle：插件页里的配置表单）
 - `win32-window.ps1` — 窗口可见性探针（EnumWindows + ShowWindow，Windows only）
-- `skills/` — 内置 10 篇经验 + `INDEX.md`
+- `skills/` — 内置 13 篇经验 + `INDEX.md`
 - `cordis.patch.yml` — **组合包层**（`dsh.bundle.patch` 指向它，安装时自动插入 `scratch` 行）
 - `test-skills.mjs` — skill 区单测（23 断言）
 - `test-backpack.mjs` — **背包集成**（假页面连真桥：存→落盘→list/read→注入→preview→删除进 `_trash`，36 断言）

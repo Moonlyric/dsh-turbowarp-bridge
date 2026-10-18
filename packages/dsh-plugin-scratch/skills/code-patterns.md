@@ -80,3 +80,26 @@ RPG 巨作（Ent/Draw/SFX/UI 四精灵分工）的广播名直接当架构文档
 - 传引用是**值拷贝**（数字/字符串），要传「引用」就传列表+下标（社区硬通货）
 - 自定义积木不重入：递归可以（尾递归 150 层会栈溢），并发调用同一个会排队
 - 参数用字符串数字（string_number）最通用，社区作品里绝大多数 reporter 都是它
+
+## 循环必须 warp（否则一帧只走一次）
+
+普通脚本里 `重复 520 次` = 520 帧 ≈ 17 秒。症状是"stepMs 一直 33.3、计数器半天走一格"。
+重循环一律塞进**自定义积木**并勾"运行时不刷新屏幕"：
+
+```json
+"mutation": { "proccode": "步进 %s", "argumentids": "[\"arg1\"]", "argumentnames": "[\"n\"]",
+              "argumentdefaults": "[\"\"]", "warp": "true" }
+```
+
+**调用块（`procedures_call`）的 mutation 也要带 `warp: "true"`**，否则只有定义侧生效、调用侧照样刷新。
+验证：`scratch_run` 后 200ms 内计数器应该已经走完；没走完就是 warp 没生效。
+
+## 列表做网格时：下标 1-based
+
+```
+索引 = (y - 1) * 宽 + x        // 1-based！
+第 (索引) 项
+```
+越界读静默返回 `""`（算成 0），越界写静默不生效。用 `scratch_variable({ action:"get", kind:"list", index })`
+核对时它会对越界直接报错，别用整份列表肉眼数。
+

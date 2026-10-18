@@ -39,3 +39,21 @@
 - [ ] 克隆体里有 `删除此克隆体`（control_delete_this_clone）——TW 虽无 300 硬限（原版 sc 有），但泄漏的克隆照样拖死内存和帧率
 - [ ] 广播名有语义（`Start Drawing` ✅，`消息1` ❌）
 - [ ] 大段逻辑包成了自定义积木，主脚本一眼看懂
+
+## 现在的最短路径（v0.10.0 的工具版）
+
+以前"先 snapshot 摸清项目"是唯一办法，现在有更省的两步：
+
+```
+scratch_project_overview()                       // 一次看清：每角色块数/opcode 直方图/自定义积木/脚本一行摘要
+scratch_read_script({ summary: true })           // 要看某个角色：脚本清单（script / definition / loose 三档）
+scratch_read_script({ scriptId })                // 只读要改的那段
+```
+
+写之前查形状：`scratch_get_opcodes({ opcode: "operator_add" })` → 直接给输入名/字段名。
+写完验结构：`scratch_inspect({ blockId })`（parent / next / 每个输入接了啥 / 属于哪条脚本），
+别整段重读 —— 354 块的脚本 ≈ 100KB，还会分页。
+
+从零开始：`scratch_open_editor({ app: "desktop", blank: true })` 或 `scratch_new_project()`
+（插件现造一份标准 sb3：舞台 + 一个角色，各带造型）。改角色名用 `scratch_target({ action:"rename" })`。
+

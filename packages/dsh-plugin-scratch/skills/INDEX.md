@@ -1,38 +1,66 @@
 # skill 区使用说明（agent 请先读这个）
 
-> 本目录是「Scratch 实践经验库」——对社区高完成度作品**做法**的总结（2026-10）。
-> **这里没有作品目录，也不记谁有多少积木**：数字对"怎么写"没有帮助，
-> 所以只留能直接照着做的经验。要量某个项目的规模，用 `scratch_snapshot` 或 `lab/inspect-sb3.mjs` 自己量。
-> **没有强制要求**，全部是经验参考。你按需选读，判断责任在你。
+> 本目录是「Scratch 实践经验库」：社区高完成度作品的**做法** + 这批工具（scratch_*）的**契约** + 平台**陷阱**。
+> 刻意不记"哪个作品多少块"这类数字 —— 对"怎么写"没有帮助。
+> **没有强制要求**，全是参考；判断责任在你。但下面第 2 节的 8 条是**真实翻车记录**，读它们比读十篇教程省时间。
 
-## skill 文件一览
+## 1. 按任务选读（别整目录乱翻）
 
-| 文件 | 什么时候读 | 一句话 |
+| 你现在要做什么 | 先读 | 再查 |
 |---|---|---|
-| getting-started.md | 第一次在项目上干活前 | Scratch 思维方式 + AI 五大常见错误 |
-| code-patterns.md | 写游戏/交互逻辑时 | 社区惯用法：缓动/列表结构体/数据驱动弹幕/广播总线 |
-| animation-visual.md | 做 UI/动画/转场时 | 造型帧纪律 + pen 技法 + 「不幼儿化」自查表 |
-| architecture.md | 项目 > 3 角色或要长期改时 | 按规模选架构 + 反面教材清单 |
-| performance.md | 有克隆/弹幕/pen 时必读 | 宿主差异（TW 无克隆上限 vs 原版 sc 300 硬限）+ 性能七律 |
-| sb3-json-reference.md | 写 add_blocks/update_block 前查 | inputs 数组编码字典 + 高频 opcode 表 |
-| project-planning.md | 用户没说清要什么时 | 体裁谱 + 5 问 + 起手模板 |
-| recipes.md | 不确定「正确姿势」时 | 8 个可直接抄的完整脚本 |
-| runtime-control.md | 要验证改动真的生效 / 点了没反应 / 量性能时 | 绿旗→状态→截图闭环 + 读积木的省上下文姿势 |
-| backpack.md | 刚啃下一件有难度的事、或要复用它时 | 把做好的积木攒进背包（存前提问用户）+ 取用时变量怎么落地 |
+| 第一次接手这个项目 / 不知道从哪下手 | **本篇第 3 节「30 秒套路」** | `scratch_project_overview` |
+| 要写/改积木 | **injection-semantics.md**（add_blocks 契约） | sb3-json-reference.md |
+| 要把表达式、条件、列表拼对 | **platform-traps.md**（输入名/1-based/空串） | code-patterns.md |
+| 做游戏循环、克隆、弹幕、网格 | code-patterns.md + performance.md | platform-traps.md §4（warp） |
+| 做 UI / 动画 / 转场 | animation-visual.md | architecture.md |
+| 项目 > 3 个角色或要长期改 | architecture.md | project-planning.md |
+| 要验证"真的生效了" / 点了没反应 | runtime-control.md | platform-traps.md §0 |
+| 用户没说清要什么 | project-planning.md | — |
+| 刚啃下一件有难度的事 | backpack.md | — |
 
-> **skill 区存「怎么做」，背包存「做好的东西」** —— 背包是工具（`scratch_backpack`），
-> 目录在 `$DSH_HOME/scratch-backpack/`，不在本目录里。见 backpack.md。
+## 2. 先别犯这 8 个错（都是真机上白干过的）
 
-## 使用纪律（仅有的三条软约束）
+1. **把 `OPERAND1` 塞进 `operator_add`**。算术是 `NUM1/NUM2`，比较/逻辑才是 `OPERAND1/OPERAND2`。写错**不报错**，整个算式恒为 0 —— 曾把人带偏 8~10 轮。现在 `add_blocks` 会拦，但你自己先查更省事：`scratch_get_opcodes({ opcode })`。
+2. **用 0-based 下标读列表**。Scratch 从 1 开始；越界静默返回 `""`。用 `variable get` / `state listSlice`（都按 1 起，越界会报错）。
+3. **拿 `snapshot` 里的块 id 去操作**。那是 sb3 短 uid，和活块 id 完全不是一套。操作只用 `read_script` / `list_scripts` / `idMap` 的 id。
+4. **以为 `add_blocks` 会帮你清理上次注入的块**。它不会（以前"会"的那版把作者积木一起删了）。游离块会一直留着，要清显式 `discardStale:true`。
+5. **把 `procedures_definition` 当"游离垃圾"**。那是自定义积木定义，`calledBy` 是被调用次数；实测 32 个"游离块"其实是 141 处调用的引擎主干。
+6. **在普通脚本里写 520 次循环**。一帧一次 ≈ 17 秒。重循环要进自定义积木 + `warp`。
+7. **看到 `running:true` 就认为界面正常**。VM 在跑不代表界面没冻结（真机遇到过：绿旗点了没反应、截图两张字节相同，而所有自检全绿）。判断界面用 `scratch_selftest` 的**帧心跳**。
+8. **读整段脚本来确认"我改对了"**。用 `scratch_inspect({ blockId })` 看上下文，用 `read_script({ blockId, branch, depth })` 只看一个分支。整段读 354 块 ≈ 100KB，还会被分页。
 
-1. **写积木前**扫一眼 sb3-json-reference.md 的 inputs 编码（[1,[4,"10"]] 这种格式最容易翻车）
-2. **不确定 opcode 存不存在**：调 scratch_get_opcodes 查实时白名单，别猜
-3. **这些是社区经验不是真理**：学生作品里也有坏味道（architecture.md 的反面教材节专门标了哪些别学）。你自己的判断优先
-4. **样本身份不重要，做法重要**：想复核某条经验的出处，就自己去看真实项目——别在文档里找"哪个作品多少块"，那类数字本目录刻意不记
+## 3. 30 秒套路（读 → 改 → 验，固定三拍）
 
-## 维护
+```
+① 读结构：scratch_project_overview()                     # 每个角色多少块、有哪些自定义积木、谁调谁
+② 读细节：scratch_read_script({ summary:true })           # 脚本清单（script/definition/loose 三档）
+          scratch_read_script({ scriptId })               # 只读要改的那段
+③ 改：    scratch_add_blocks / update_block / move_block # 写完看返回的 idMap / warnings / lost
+④ 验结构：scratch_inspect({ blockId })                    # 位置对不对（parent/next/inputs/所属脚本）
+⑤ 验运行：scratch_run({ action:"greenflag" }) → scratch_state({ listSlice })
+          scratch_screenshot({ region:"stage" })           # 只看舞台
+```
 
-- 你（agent）可以新建/修改/删除本目录的 md 文件（scratch_skill_edit 工具）
-- 学到新经验（比如用户纠正了你的做法）→ 写进对应文件或开新文件
-- 文件开头保持「适用场景 + 一句话」的格式，方便后来的 agent 选读
-- 用户可以整体开关 skill 功能（不影响 scratch_* 工具本身）
+**每一步都别跳过 ④⑤**。这批工具最容易骗人的地方不是报错，而是"看起来改好了"。
+
+## 4. 工具速查（38 个里最常用的 16 个）
+
+| 目的 | 工具 |
+|---|---|
+| 开窗口 + 装作品 / 新建空白作品 | `open_editor({ app:"desktop", path })` / `new_project()` |
+| 全项目结构 | `project_overview` |
+| 脚本清单 / 读脚本 | `list_scripts` / `read_script` |
+| 单块上下文 | `inspect` |
+| 写 / 改 / 挪 / 删 | `add_blocks` / `update_block` / `move_block` / `delete_blocks` |
+| 变量列表 | `variable`（get/set/create/delete/rename，1-based） |
+| 运行 + 观测 | `run` / `state` / `profile` / `watch` |
+| 输入 | `click`（带 pick 结果） / `press_key` |
+| 画面 | `screenshot({ region })` / `selftest`（帧心跳） |
+| 出问题 | `selftest` → `rollback` / `restart_window` |
+| 查 opcode 与形状 | `get_opcodes({ opcode })` |
+
+## 5. 维护
+
+- 你可以新建/修改/删除本目录的 md 文件（`scratch_skill_edit`）。学到新经验（尤其"被用户纠正的做法"）就写进来。
+- 文件开头保持「# 标题 + > 适用场景」，方便后来的 agent 选读。
+- 插件升级时内置文档会**覆盖**同名文件；旧版本会备份到 `.backup-v<旧版本>/`，你自己加的（不同名的）文件不受影响。

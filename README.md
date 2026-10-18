@@ -7,7 +7,7 @@ v0.7.0 起它还能**替你点绿旗、点角色、按键、读运行期状态�
 所以"改完到底行不行"不用你自己去点。
 
 ```
-dsh 插件（Node，33 个 scratch_* 工具 + WebSocket 桥 :31820）
+dsh 插件（Node，38 个 scratch_* 工具 + WebSocket 桥 :31820）
 
   路径一 · 扩展桥（你自己浏览器里的编辑器）
       ↕ JSON-RPC over ws（握手 token）
@@ -27,7 +27,7 @@ dsh 插件（Node，33 个 scratch_* 工具 + WebSocket 桥 :31820）
 | CDP 直连 | **主力**（装了 TurboWarp Desktop 就用它） | 只要 TurboWarp Desktop（**零安装、零 token**） | `transport=cdp` | `cd-1` | `cdp-desktop` |
 | 扩展桥 | 备用 | 装 MV3 扩展 + 选项页填 token | `transport=sw` | `tw-1` | `extension-bridge` |
 
-**怎么选**：有 TurboWarp Desktop 就一律走桌面版 —— 零安装零 token、离线可用、33 个工具全通，
+**怎么选**：有 TurboWarp Desktop 就一律走桌面版 —— 零安装零 token、离线可用、38 个工具全通，
 而且**只有它能截图**（`scratch_screenshot`）。扩展桥留着应付三种它做不到的情况：
 ① 这台机器没装桌面版；② 你已经在浏览器标签里编辑某个**在线作品**，不想存盘重开；
 ③ 要同时开好几个作品（多标签，`scratch_list_sessions` 里按 `session` 选）。
@@ -241,7 +241,7 @@ patch 里只留一段**配置覆盖**（按 id 整段替换，所以字段要写
 ## 验靶（能自己复跑的自动化）
 
 ```powershell
-# 替身层：真 content-main.js 进 Node vm + 真 headless scratch-vm（246 条）
+# 替身层：真 content-main.js 进 Node vm + 真 headless scratch-vm（280 条）
 cd lab; node test-content-ops.js
 
 # 真机层 A：真 Chrome / Edge + 真 turbowarp.org + 真扩展（115 条，约 4 分钟）
@@ -249,15 +249,16 @@ cd lab; node test-content-ops.js
 $env:SB3_FIXTURE='<某个 .sb3>'      # 可选：顺带验打开真实作品（断言会更多）
 node real-machine-check.mjs
 
-# 真机层 B：TurboWarp Desktop + CDP 直连（134 条，会真开一个窗口、跑完自动关掉）
+# 真机层 B：TurboWarp Desktop + CDP 直连（148 条，会真开一个窗口、跑完自动关掉）
 node desktop-cdp-check.mjs
 
 # 插件侧
 cd ..\packages\dsh-plugin-scratch
-node test-tools.mjs          # 128 条（含打包契约：组合包 / volatile 配置 / 浏览器半侧）
+node test-tools.mjs          # 158 条（含打包契约：组合包 / volatile 配置 / 浏览器半侧）
 node test-skills.mjs         # 23 条
 node test-bridge-auth.mjs    # 21 条
 node test-backpack.mjs       # 36 条（导出/注入/与官方序列化器逐块对拍）
+node test-blank-project.mjs  # 13 条（空白作品生成器：zip/md5 + 真 scratch-vm 装载）
 
 # 改过扩展的执行器之后必须同步，否则 test-tools 里那条"逐字节一致"的断言会红
 cd ..\..; node lab/sync-executor.mjs

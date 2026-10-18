@@ -14,6 +14,9 @@ import { randomBytes } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { spawn, execFileSync } from 'node:child_process'
 import { basename } from 'node:path'
+import { createHash } from 'node:crypto'
+// 空白作品生成器（G1）：手写最小 sb3 太劝退，插件直接造一份给你（md5 命名 / zip / 两个内联 SVG）
+import { buildBlankProject } from './sb3.js'
 // CDP 直连（不需要浏览器扩展）—— 见 cdp.js 顶部注释。TurboWarp Desktop 走的就是这条路。
 import { attachCdp, findFreePort, tagForPage, probeCdp } from './cdp.js'
 
@@ -52,6 +55,8 @@ export const Config = z.object({
 
 /** 读 volatile 引用（`{ get() }`）或普通值；每次读都取最新，UI 保存后立即生效 */
 const readLive = (value) => (value !== null && typeof value === 'object' && typeof value.get === 'function' ? value.get() : value)
+/** dsh 家目录（DSH_HOME 已经是 ~/.dsh，别再拼一层） */
+const homeDir = () => process.env.DSH_HOME || join(homedir(), '.dsh')
 
 // ---------------- 返回值清洗：必须是「无损 JSON」----------------
 // 真实的 harness 会校验工具返回值（`value is not lossless JSON`），而 `undefined`
@@ -88,8 +93,43 @@ function jsonSafe(v, seen) {
 }
 /** 包一层：所有工具返回值先清洗再交给 harness */
 const defineTool = (def) => rawDefineTool(
-  Object.assign({}, def, { execute: async (...args) => jsonSafe(await def.execute(...args)) })
+  Object.assign({}, def, {
+    execute: async (...args) => clipToolResult(jsonSafe(await def.execute(...args)), def.name)
+  })
 )
+
+// ---------------- 大返回的最后一道闸（A2） ----------------
+// 问题清单 A2：`scratch_snapshot` 回 1.8MB、`batch` 回 65KB，到工具层被**静默**截成
+// "Omitted … spill 文件" —— ok:true 依旧成立，AI 以为拿到了、其实没有。
+// 各 op 自己已经按块/字节分页了；这里是兜底：超过预算就**显式**换成
+// {truncated, bytes, spillPath, preview}，全文落到盘上，绝不闷声丢。
+const MAX_RESULT_JSON = 60000 // 渲染后（pretty JSON）字符数上限，留足余量给模型上下文
+function clipToolResult(value, toolName) {
+  if (value === null || value === undefined) return value
+  let text = ''
+  try { text = JSON.stringify(value, null, 2) } catch { return value }
+  if (text.length <= MAX_RESULT_JSON) return value
+  let spillPath = null
+  try {
+    const dir = join(homeDir(), 'scratch-payloads')
+    mkdirSync(dir, { recursive: true })
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+    spillPath = join(dir, `${toolName || 'result'}-${ts}.json`)
+    writeFileSync(spillPath, text)
+  } catch { spillPath = null }
+  return {
+    truncated: true,
+    tool: toolName,
+    bytes: text.length,
+    limit: MAX_RESULT_JSON,
+    spillPath: spillPath || undefined,
+    preview: text.slice(0, 4000),
+    hint: `这个返回值太大（${Math.round(text.length / 1024)}KB > ${Math.round(MAX_RESULT_JSON / 1024)}KB），已换成"截断信封"：`
+      + (spillPath ? `全文在 ${spillPath}（可以直接 grep/read）。` : '全文没落盘（写盘失败）。')
+      + ' 更省的做法：用分页/收窄参数重调（read_script 的 limit/offset/scriptId/blockId/depth，snapshot 的 target/maxBytes），'
+      + '或 scratch_project_overview 先看结构。'
+  }
+}
 
 // defineTool 公共 output 规格：M0 一律返回 JSON（TA 决策：全程 JSON）
 const jsonOut = {
@@ -344,9 +384,17 @@ export function apply(ctx, config) {
     load_project: 300000, // 解压 + 装载整个 sb3
     save_project: 300000  // 大项目打包成 sb3（含全部资源）
   }
-  // 给指定会话发指令，等结果
-  function call(sessionId, op, args, timeoutMs = OP_TIMEOUTS[op] || 15000) {
-    return new Promise((resolve, reject) => {
+  // 给指定会话发指令，等结果。
+  // opts.noGate：跳过「装载闸」（装载流程自己要用，否则会等自己）
+  async function call(sessionId, op, args, timeoutMs = OP_TIMEOUTS[op] || 15000, opts) {
+    // 装载闸（A1）：scratch_open_editor 现在窗口一出来就先返回，文件在后台装。
+    // 后续任何 op 到这儿都会先等装载完 —— 于是调用方拿到的永远是"装好的项目"，
+    // 不会读到桌面版冷启动那个空白默认工程（B1 的根因就是没这道闸）。
+    const s0 = sessions.get(sessionId)
+    if (!(opts && opts.noGate) && s0 && s0.loading) {
+      try { await s0.loading } catch { /* 装载失败：让这条 op 自己如实报错 */ }
+    }
+    return await new Promise((resolve, reject) => {
       const s = sessions.get(sessionId)
       if (!s) {
         // 会话失效最常见的原因是「那个窗口/标签页已经关了」，不是「用户没装扩展」——
@@ -391,8 +439,13 @@ export function apply(ctx, config) {
   const MAX_SNAP_MEM_MB = Number(cfg.maxSnapshotMemMb) || 64 // 内存里最多留多少 MB 的快照
   const MAX_SNAP_DISK_MB = Number(cfg.maxSnapshotDiskMb) || 256 // 盘上最多留多少 MB
   const snapBytesOf = (pj) => { try { return JSON.stringify(pj).length } catch { return 0 } }
-  async function takeSnapshot(sessionId, label) {
-    const pj = await call(sessionId, 'snapshot')
+  async function takeSnapshot(sessionId, label, opts) {
+    // 快照要的是**完整** project.json（回滚靠它）：maxBytes 放到最大，且跳过装载闸
+    // （装载流程自己也要先快照，不能等自己）。
+    const pj = await call(sessionId, 'snapshot', { maxBytes: 4000000 }, OP_TIMEOUTS.snapshot, opts || {})
+    if (pj && pj.truncated) {
+      log.warn('快照被截断（%d 字节 > 上限），这份快照不能用来回滚', pj.bytes || 0)
+    }
     const bytes = snapBytesOf(pj)
     const snap = { at: new Date().toISOString(), sessionId, label, projectJson: pj, bytes }
     snapshots.unshift(snap)
@@ -499,7 +552,8 @@ export function apply(ctx, config) {
   const builtinSkillDir = join(dirname(fileURLToPath(import.meta.url)), 'skills')
   const skillStateFile = join(skillDir, '.enabled.json')
   const builtinVersionFile = join(skillDir, '.builtin-version')
-  const SKILL_BUILTIN_VERSION = '3' // 升级内置 skill 时 bump（3 = 加背包那篇；2 = 去掉块数普查、只留做法）
+  const SKILL_BUILTIN_VERSION = '4' // 升级内置 skill 时 bump（4 = 注入语义/平台陷阱/任务路由三篇 +
+                                    //     上升级时覆盖内置文档；3 = 背包那篇；2 = 去掉块数普查）
 
   function skillEnabledMap() {
     try { return JSON.parse(readFileSync(skillStateFile, 'utf8')) } catch { return {} }
@@ -520,15 +574,32 @@ export function apply(ctx, config) {
       const force = existsSync(resetMark)
       if ((ver !== SKILL_BUILTIN_VERSION || force) && existsSync(builtinSkillDir)) {
         let copied = 0
+        let backedUp = 0
+        // 升级时**覆盖**内置文档：它们是 AI 的操作手册，过期版本比没有更糟
+        // （用户反馈原话："那个内置 skill 真的太简陋了，这 ai 仍旧疯狂试错"）。
+        // 但不丢用户改过的东西 —— 覆盖前把旧文件整份备份到 .backup-v<旧版本>-<时间>/。
+        // 用户自己新增的（不同名的）文件不受影响；强刷（.reset）不备份。
+        const backupDir = join(skillDir, `.backup-v${ver || '0'}-${Date.now().toString(36)}`)
         for (const f of readdirSync(builtinSkillDir)) {
           if (!f.endsWith('.md')) continue
           const dst = join(skillDir, f)
-          if (force || !existsSync(dst)) { copyFileSync(join(builtinSkillDir, f), dst); copied++ }
+          const existed = existsSync(dst)
+          if (existed && !force) {
+            try {
+              mkdirSync(backupDir, { recursive: true })
+              copyFileSync(dst, join(backupDir, f))
+              backedUp++
+            } catch { /* 备份失败也要继续升级：文档旧了更糟 */ }
+          }
+          copyFileSync(join(builtinSkillDir, f), dst)
+          copied++
         }
         writeFileSync(builtinVersionFile, SKILL_BUILTIN_VERSION)
         if (force) {
           try { unlinkSync(resetMark) } catch {}
           log.info('skill 区已按 .reset 标记重置（覆盖 %d 篇内置文档）', copied)
+        } else if (backedUp) {
+          log.info('skill 区从 v%s 升到 v%s：覆盖 %d 篇，旧版备份在 %s', ver || '0', SKILL_BUILTIN_VERSION, copied, backupDir)
         }
       }
     } catch (e) {
@@ -764,7 +835,7 @@ export function apply(ctx, config) {
    * 连上一个 CDP 端点 → 注册成会话 → 等编辑器就绪 →（可选）装入作品 → 组装返回值。
    * 「AI 自己开的桌面版」和「用户自己开的可接管实例」两条路共用这一段。
    */
-  async function cdpAttachAndReport({ port, launched, wantPath, waitMs = 20000, show = true }) {
+  async function cdpAttachAndReport({ port, launched, wantPath, wantBuf, wantName, waitMs = 20000, show = true }) {
     // 等 CDP 的时间用 waitMs 兜住（桌面版冷启动实测 2-6s；waitMs=0 表示"别等"，
     // 但还是给 3s —— 完全不试就下结论没有意义）
     const cdpTimeoutMs = waitMs === 0 ? 3000 : Math.max(waitMs, 5000)
@@ -793,25 +864,30 @@ export function apply(ctx, config) {
       // ⚠️ 桌面版冷启动是"GUI 先出来、项目后加载"：刚接上时 vm 里可能**一个角色都没有**。
       //    这时候回报"就绪"会误导 AI 往不存在的角色里塞积木（真机踩过）。所以等 vm 里
       //    真有角色了再回报 ready（上限也用 waitMs 兜住）。
-      let meta = null
-      const readyDeadline = Date.now() + Math.max(cdpTimeoutMs, 8000)
-      while (Date.now() < readyDeadline) {
-        meta = await call(sid, 'project_meta').catch((e) => ({ error: e.message }))
-        if (meta && Array.isArray(meta.targets) && meta.targets.length) break
-        await sleep(500)
+      // 先确认页面醒了（能回答 project_meta），但**不等项目装载**：窗口一出来就先返回（A1）。
+      // 冷启动时页面可能还没挂好 vm，所以这里给一个短重试（只为了拿到"现在是什么"，
+      // 有文件要装的话不等 —— 装载本身在后台，后续 op 有装载闸）。
+      const metaDeadline = Date.now() + (wantPath || wantBuf ? 1500 : Math.min(Math.max(cdpTimeoutMs, 3000), 15000))
+      let metaBeforeLoad = { error: 'not tried' }
+      while (true) {
+        metaBeforeLoad = await call(sid, 'project_meta', {}, 15000, { noGate: true }).catch((e) => ({ error: e.message }))
+        const okNow = !!(metaBeforeLoad && Array.isArray(metaBeforeLoad.targets) && metaBeforeLoad.targets.length > 0)
+        if (okNow || Date.now() >= metaDeadline) break
+        await sleep(250)
       }
-      const ready = !!(meta && Array.isArray(meta.targets) && meta.targets.length)
+      const pageOk = !!(metaBeforeLoad && Array.isArray(metaBeforeLoad.targets) && metaBeforeLoad.targets.length > 0)
       const out = {
         launched,
         connected: true,
         transport: 'cdp-desktop', // 零安装那套：没有扩展、没有 token
         sessionId: sid,
-        pageResponded: !!(sess && sess.pageResponded),
-        ready,
-        targets: meta && meta.targets,
-        editingTarget: meta && (meta.editingTarget || meta.target),
+        pageResponded: pageOk,
+        // B1：桌面版冷启动会先挂一个**自己的空白默认工程**（Stage + 角色1）。
+        // 以前把这个当成"文件已打开"报出去，AI 会对着不存在的角色干活。现在明确标注它是什么。
+        beforeLoad: pageOk
+          ? { targets: metaBeforeLoad.targets.map(t => t.name), note: '桌面版冷启动的默认空工程，不是用户的作品；真正的装载在后台进行' }
+          : undefined,
         target: handle.target && handle.target.url,
-        meta,
         path: wantPath || undefined
       }
       // 窗口可见性：连上了 ≠ 用户看得见。隐藏态会自动 ShowWindow 救回来，
@@ -838,16 +914,41 @@ export function apply(ctx, config) {
           out.windowHint = '按你的要求没有把窗口显示出来（show:false）。想让它出现：scratch_open_editor({ app: "desktop" }) 不带 show，或 scratch_selftest 看窗口状态'
         }
       }
-      if (wantPath) {
-        try { out.loaded = await loadFileIntoSess(sid, wantPath) } catch (e) { out.loadError = e.message }
+      if (wantPath || wantBuf) {
+        // A1：装载丢到后台，工具立刻返回。后续任何工具调用都会经过 call() 的装载闸，
+        // 自动等它装完 —— 所以这里不 await，也不需要调用方轮询。
+        const loading = (async () => {
+          try {
+            const r = wantBuf
+              ? await loadBytesIntoSess(sid, wantBuf, wantName || 'new-project.sb3', 'pre-new_project')
+              : await loadFileIntoSess(sid, wantPath)
+            sess.loaded = r
+            return r
+          } catch (e) {
+            sess.loadError = e.message
+            return null
+          } finally {
+            sess.loading = null
+          }
+        })()
+        sess.loading = loading
+        out.loading = true
+        out.hint = '窗口已经打开了，文件正在后台装载（大作品十几秒是常态）。'
+          + '**下一条工具调用会自动等它装完**，不用手动轮询；想显式确认就 scratch_list_sessions 看 loaded。'
+      } else {
+        // 不带文件：把"现在编辑器里是什么"一起回（和以前一样，别让调用方多跑一次）
+        const hasTargets = pageOk && metaBeforeLoad.targets.length > 0
+        out.ready = hasTargets
+        out.targets = pageOk ? metaBeforeLoad.targets : undefined
+        out.editingTarget = pageOk ? metaBeforeLoad.editingTarget : undefined
+        out.meta = pageOk ? metaBeforeLoad : undefined
+        out.hint = hasTargets
+          ? (launched.attached
+              ? '已经接上**用户自己开的**那份桌面版（CDP 直连，没动他的窗口）：可以直接 scratch_snapshot / scratch_read_script / scratch_add_blocks 干活。'
+              : '桌面版已经接上了（CDP 直连）：可以直接 scratch_snapshot / scratch_read_script / scratch_add_blocks 干活。')
+            + '改完用 scratch_save_project 存盘（默认不覆盖原文件）。'
+          : '桌面版接上了，但项目还没就绪（冷启动中 / 空项目）。等一秒再 scratch_list_sessions。'
       }
-      out.hint = ready
-        ? (launched.attached
-            ? '已经接上**用户自己开的**那份桌面版（CDP 直连，没动他的窗口）：可以直接 scratch_snapshot / scratch_read_script / scratch_add_blocks 干活。'
-            : '桌面版已经接上了（CDP 直连）：可以直接 scratch_snapshot / scratch_read_script / scratch_add_blocks 干活，')
-          + '改完用 scratch_save_project 存盘（默认不覆盖原文件）。'
-        : '桌面版接上了，但编辑器里**还没有项目/角色**（冷启动时 GUI 先出来、项目后加载）。'
-          + '等一下再调 scratch_list_sessions 看，或者让用户在桌面版里新建一个作品。'
       return out
     } catch (e) {
       // 接不上就把 CDP 通道关掉，别留一条半死的连接（桌面版窗口本身不动，那是用户的窗口）
@@ -883,8 +984,21 @@ export function apply(ctx, config) {
       }
       const list = []
       for (const [id, s] of sessions) {
-        const meta = await call(id, 'project_meta').catch(() => null)
+        // noGate：装载中也要能查（否则 list_sessions 会卡到装完，就看不到 loading 状态了）
+        const meta = await call(id, 'project_meta', {}, undefined, { noGate: true }).catch(() => null)
         const entry = { sessionId: id, meta: s.meta, detail: meta }
+        // 装载状态（A1）：open_editor 现在先返回、文件后台装 —— 这里就是看它装完没的地方
+        if (s.loading) entry.loading = true
+        if (s.loaded) {
+          entry.loaded = {
+            from: s.loaded.loadedFrom || s.loaded.filename || '(空白作品)',
+            targets: s.loaded.targets,
+            blockCount: s.loaded.blockCount,
+            bytes: s.loaded.bytes,
+            at: s.lastProjectAt
+          }
+        }
+        if (s.loadError) entry.loadError = s.loadError
         // CDP 会话自报一句运输层状态（injected / 主 frame / 被忽略的子 frame 数 / 自愈次数）。
         // 排查"编辑器好好的但每个 op 都超时"时，这一行就是答案 —— 不用再猜。
         if (s.cdp && typeof s.cdp.state === 'function') entry.transport = s.cdp.state()
@@ -910,6 +1024,25 @@ export function apply(ctx, config) {
     }
   }))
 
+  /**
+   * 把一段 sb3/json 字节装进会话（本机文件、以及 new_project 现造的空白作品都走这里）。
+   * noGate：装载流程自己不能被"装载闸"挡住（否则等自己，死锁）。
+   */
+  async function loadBytesIntoSess(sid, buf, filename, label) {
+    const head = buf.subarray(0, 1).toString('utf8')
+    const isJson = /\.json$/i.test(filename) || head === '{'
+    const snap = await takeSnapshot(sid, label || 'pre-load_project', { noGate: true })
+    let r
+    if (isJson) {
+      let parsed
+      try { parsed = JSON.parse(buf.toString('utf8')) } catch (e) { throw new Error(`project.json 解析失败：${e.message}`) }
+      r = await call(sid, 'load_project', { projectJson: parsed, filename }, 60000, { noGate: true })
+    } else {
+      r = await call(sid, 'load_project', { sb3Base64: buf.toString('base64'), filename }, 120000, { noGate: true })
+    }
+    return Object.assign({ bytes: buf.length, format: isJson ? 'json' : 'sb3', snapshotAt: snap.at }, r)
+  }
+
   /** 把一个本机作品文件装进指定会话（scratch_open_editor(path) 与 scratch_load_project 共用） */
   async function loadFileIntoSess(sid, filePath) {
     const p = resolve(String(filePath))
@@ -919,24 +1052,10 @@ export function apply(ctx, config) {
     const MAX_MB = 200
     if (st.size > MAX_MB * 1024 * 1024) throw new Error(`文件太大（${(st.size / 1048576).toFixed(1)}MB > ${MAX_MB}MB），浏览器端解压会卡死`)
     const buf = readFileSync(p)
-    const head = buf.subarray(0, 1).toString('utf8')
-    const isJson = /\.json$/i.test(p) || head === '{'
-    // 先快照：开文件是破坏性操作（顶掉当前项目），后悔药必须有
-    const snap = await takeSnapshot(sid, 'pre-load_project')
-    let r
-    if (isJson) {
-      let parsed
-      try { parsed = JSON.parse(buf.toString('utf8')) } catch (e) { throw new Error(`project.json 解析失败：${e.message}`) }
-      r = await call(sid, 'load_project', { projectJson: parsed, filename: basename(p) }, 60000)
-    } else {
-      r = await call(sid, 'load_project', { sb3Base64: buf.toString('base64'), filename: basename(p) }, 120000)
-    }
-    return Object.assign({
-      loadedFrom: p,
-      bytes: st.size,
-      format: isJson ? 'json' : 'sb3',
-      snapshotAt: snap.at
-    }, r)
+    const r = await loadBytesIntoSess(sid, buf, basename(p), 'pre-load_project')
+    const sess = sessions.get(sid)
+    if (sess) { sess.lastProjectPath = p; sess.lastProjectAt = new Date().toISOString() }
+    return Object.assign({ loadedFrom: p }, r)
   }
 
   ctx.tools.register(defineTool({
@@ -949,12 +1068,16 @@ export function apply(ctx, config) {
       + '已经有会话时不重复开，直接把文件装进那个会话。'
       + 'port：接一个**已经带调试端口在跑**的实例（比如用户手动 TurboWarp.exe --remote-debugging-port=9222）；'
       + 'show:false 则只接管、不把窗口显示出来。'
-      + '不传 path 只开编辑器也行。返回值里的 connected / transport 是结论，别自己猜。',
+      + '不传 path 只开编辑器也行；**blank:true 直接开一个空白作品**（舞台 + 一个角色，各带造型，不用自己手搓 sb3）。'
+      + '返回值里的 connected / transport 是结论，别自己猜。带 path（或 blank）时**窗口一出来就返回**（loading:true），'
+      + '文件在后台装，下一条工具调用会自动等它装完。',
     parameters: {
       app: { type: 'string', description: 'desktop（CDP 直连，零安装零 token，**装了桌面版就用这个**）| browser（扩展那条路，参数默认值；要装扩展 + token，不能截图）' },
       path: { type: 'string', description: '要打开的作品文件绝对路径（.sb3/.sb2/project.json），可选' },
+      blank: { type: 'boolean', description: 'true = 新建一个空白作品（舞台 + 一个角色）再打开。和 path 二选一' },
+      sprite: { type: 'string', description: 'blank 时角色的名字（缺省「角色1」）' },
       url: { type: 'string', description: 'app=browser 时要打开的地址（默认 https://turbowarp.org/editor，也可以传具体作品链接）' },
-      waitMs: { type: 'number', description: '打开后等多久看会话连上，默认 20000，上限 60000' },
+      waitMs: { type: 'number', description: '等 CDP 接上的上限，默认 20000，上限 60000（装载不等，后面自动会等）' },
       force: { type: 'boolean', description: '已经有会话 / 桌面版已在运行时，照样再开一个' },
       port: { type: 'number', description: 'CDP 调试端口：接这个已存在的实例（不传就探 desktopDebugPort，再不行自己开一个）' },
       show: { type: 'boolean', description: '是否把桌面版窗口显示出来，缺省 true' }
@@ -964,11 +1087,15 @@ export function apply(ctx, config) {
       const app = String(args?.app || 'browser').toLowerCase()
       const wantPath = args?.path ? resolve(String(args.path)) : null
       if (wantPath && !existsSync(wantPath)) throw new Error(`文件不存在：${wantPath}`)
+      const blank = args?.blank === true && !wantPath
+      // G1：空白作品在插件侧现造（md5 命名 + zip + 两个内联 SVG），不用 AI 手写 sb3
+      const blankBuf = blank ? buildBlankProject({ spriteName: args?.sprite }).buffer : null
+      const blankName = 'blank-project.sb3'
 
       // 已经有会话：不重复开窗口，直接把文件装进现有会话（这才是用户要的效果）
       if (sessions.size && !args?.force) {
         const sid = activeSession()
-        const out = { alreadyConnected: true, sessionId: sid, sessions: [...sessions.keys()], path: wantPath || undefined }
+        const out = { alreadyConnected: true, sessionId: sid, sessions: [...sessions.keys()], path: wantPath || undefined, blank: blank || undefined }
         // 顺带确认一下"用户到底看得到窗口吗"（桌面版会话才有；隐藏态直接救回来）
         const sess = sessions.get(sid)
         if (sess && sess.cdp) {
@@ -979,10 +1106,14 @@ export function apply(ctx, config) {
             if (!win.visible) out.windowHint = '窗口在屏幕上不可见，ShowWindow 也没救回来 —— 让用户看任务栏 / Alt+Tab 找「TurboWarp Desktop」'
           }
         }
-        if (wantPath) {
-          try { out.loaded = await loadFileIntoSess(sid, wantPath) } catch (e) { out.loadError = e.message }
+        if (wantPath || blank) {
+          try {
+            out.loaded = blank
+              ? await loadBytesIntoSess(sid, blankBuf, blankName, 'pre-new_project')
+              : await loadFileIntoSess(sid, wantPath)
+          } catch (e) { out.loadError = e.message }
         }
-        out.hint = wantPath
+        out.hint = (wantPath || blank)
           ? (out.loaded ? '已经装进现有编辑器了（想开新窗口就传 force: true）' : '装文件失败，看 loadError（想开新窗口就传 force: true）')
           : '已经有连着的编辑器了，直接干活就行（想再开一个就传 force: true）'
         return out
@@ -1005,6 +1136,8 @@ export function apply(ctx, config) {
             port: probePort,
             launched: { app, attached: true, via: 'existing-debug-port', debugPort: probePort, browser: existing.browser },
             wantPath,
+            wantBuf: blankBuf,
+            wantName: blankName,
             waitMs,
             show: args?.show !== false
           })
@@ -1064,7 +1197,7 @@ export function apply(ctx, config) {
         const port = await findFreePort()
         const launched = { app, path: found.path, via: found.via, debugPort: port }
         try { launched.pid = spawnDetached(found.path, [`--remote-debugging-port=${port}`]) } catch (e) { launched.error = e.message }
-        return await cdpAttachAndReport({ port, launched, wantPath, waitMs, show: args?.show !== false })
+        return await cdpAttachAndReport({ port, launched, wantPath, wantBuf: blankBuf, wantName: blankName, waitMs, show: args?.show !== false })
       }
 
       // ============ 浏览器版：扩展那条路 ============
@@ -1096,8 +1229,12 @@ export function apply(ctx, config) {
               + '把 setup 里的步骤念给用户（token 一定要原样给出），填完不用刷新页面，几秒内会自己连上——可以再调一次 scratch_list_sessions 确认。'
               + '（不想装扩展就走 setup.easierAlternative：桌面版 + CDP 直连）'
           })
-      if (connected && wantPath) {
-        try { out.loaded = await loadFileIntoSess(activeSession(), wantPath) } catch (e) { out.loadError = e.message }
+      if (connected && (wantPath || blank)) {
+        try {
+          out.loaded = blank
+            ? await loadBytesIntoSess(activeSession(), blankBuf, blankName, 'pre-new_project')
+            : await loadFileIntoSess(activeSession(), wantPath)
+        } catch (e) { out.loadError = e.message }
       }
       return out
     }
@@ -1144,7 +1281,10 @@ export function apply(ctx, config) {
       const buf = Buffer.from(r.sb3Base64, 'base64')
       let finalPath = target
       let renamed = false
-      if (existsSync(target) && !args.overwrite) {
+      // F5：以前 `overwrote: !renamed` —— 存到**不存在**的新路径也报 overwrote:true。
+      // 语义必须是"目标原本就存在、而且真被覆盖了"。
+      const existed = existsSync(target)
+      if (existed && !args.overwrite) {
         // 默认不覆盖：用户的作品文件比什么都重要，AI 不该悄悄盖掉
         const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
         finalPath = target.replace(/\.sb3$/i, '') + `-ai-${stamp}.sb3`
@@ -1155,27 +1295,31 @@ export function apply(ctx, config) {
       return {
         savedTo: finalPath,
         bytes: buf.length,
-        overwrote: !renamed,
+        overwrote: existed && !renamed,
+        created: !existed,
         renamedFrom: renamed ? target : undefined,
         title: r.title,
         hint: renamed
           ? '目标文件已存在，为安全起见另存为新文件了（要覆盖原文件下次传 overwrite: true）'
-          : '已写入原路径'
+          : (existed ? '已覆盖原文件' : '目标是个新文件，已创建')
       }
     }
   }))
 
   ctx.tools.register(defineTool({
     name: 'scratch_snapshot',
-    description: '读取当前 TurboWarp 项目的完整 sb3 JSON（project.json 格式，含 targets/blocks/variables/monitors）。',
+    description: '读取当前 TurboWarp 项目的完整 sb3 JSON（project.json 格式，含 targets/blocks/variables/monitors）。'
+      + '**大项目一定要收窄**：不带 target 读 25MB 工程会回 1.8MB，虽然现在会明确标 truncated + 给续读办法（A2），'
+      + '但那是浪费。读代码优先用 scratch_read_script / scratch_project_overview（它们按块/字节分页）。',
     parameters: {
       session: { type: 'string', description: '会话 ID，缺省用第一个' },
-      target: { type: 'string', description: '精灵名过滤，缺省全部' }
+      target: { type: 'string', description: '精灵名过滤，缺省全部' },
+      maxBytes: { type: 'number', description: '字节上限（缺省 240000，最大 4000000）。超了会返回 truncated 索引而不是闷声截断' }
     },
     output: jsonOut,
     async execute(args) {
       const sid = needSession(args?.session)
-      const pj = await call(sid, 'snapshot', { target: args?.target })
+      const pj = await call(sid, 'snapshot', { target: args?.target, maxBytes: args?.maxBytes })
       return { project: pj, note: 'blocks 为 sb3 dict 格式；每个 top-level 块的 x/y 是工作区坐标', skillHint: '写积木前建议 scratch_skills read sb3-json-reference（输入编码字典）' }
     }
   }))
@@ -1185,15 +1329,23 @@ export function apply(ctx, config) {
     description: '读取某个精灵/角色的积木 JSON（懒加载省 token）。target 缺省为当前编辑中的角色。'
       + '**默认不回变量**（曾经因为连带回列表，一个 26 块的角色回了 7.5MB）——要看变量显式 includeVariables:true。'
       + '想先看结构（有哪些脚本、各是什么 opcode、多少块）就用 summary:true，那次回传很小。'
-      + '读单个脚本用 scriptId（从 summary/scripts 里拿）；按 opcode 过滤用 opcodes；块太多会自动分页（hasMore + offset）。',
+      + '读单个脚本用 scriptId（从 summary/scripts 里拿）；按 opcode 过滤用 opcodes。'
+      + '**按子树读（D2）**：scriptId/blockId 可以是任意块，branch:"SUBSTACK" 只看那个分支，depth:2 只看前两层 —— '
+      + '1669 块的脚不用再整段吞。'
+      + '块数和字节**双上限**分页（hasMore/nextOffset/bytes），超过会说 truncated，不会静默丢数据。',
     parameters: {
       session: { type: 'string' },
       target: { type: 'string', description: '精灵名，如 "Sprite1"' },
       summary: { type: 'boolean', description: 'true = 只回结构（opcode 直方图 + 顶层脚本清单），不回块体' },
-      scriptId: { type: 'string', description: '只读这一段脚本（顶层块 id）；与 summary/opcodes 互斥' },
+      scriptId: { type: 'string', description: '读这段脚本（顶层块 id）；与 summary/opcodes 互斥' },
+      blockId: { type: 'string', description: '从任意块开始读它这一棵（不必是顶层；配合 branch/depth 用）' },
+      branch: { type: 'string', description: '只往这个输入里走，如 "SUBSTACK"（"只给我这个 if 的 true 分支"）' },
+      depth: { type: 'number', description: '只下钻 N 层（0 = 只要起点块自己）' },
       opcodes: { type: 'array', description: '只回这些 opcode 的块，如 ["event_whenflagclicked"]' },
       limit: { type: 'number', description: '最多回多少块（缺省 1500；summary 时是脚本条数，缺省 200）' },
-      offset: { type: 'number', description: '分页偏移（配合 hasMore 用）' },
+      offset: { type: 'number', description: '分页偏移（配合 hasMore/nextOffset 用）' },
+      maxBytes: { type: 'number', description: '这次返回的字节上限（缺省 40000，最大 400000）' },
+      meta: { type: 'boolean', description: 'false = 不重复回 target/块数/脚本索引（翻页时省 token）' },
       includeVariables: { type: 'boolean', description: 'true = 连变量一起回（危险：长列表会炸）' },
       includeLists: { type: 'boolean', description: '配合 includeVariables：连列表内容一起回' }
     },
@@ -1204,9 +1356,14 @@ export function apply(ctx, config) {
         target: args?.target,
         summary: args?.summary === true ? true : undefined,
         scriptId: args?.scriptId,
+        blockId: args?.blockId,
+        branch: args?.branch,
+        depth: args?.depth,
         opcodes: Array.isArray(args?.opcodes) ? args.opcodes : (args?.opcodes ? [args.opcodes] : undefined),
         limit: args?.limit,
         offset: args?.offset,
+        maxBytes: args?.maxBytes,
+        meta: args?.meta === false ? false : undefined,
         includeVariables: args?.includeVariables === true ? true : undefined,
         includeLists: args?.includeLists === true ? true : undefined
       }, args?.summary ? 60000 : 30000)
@@ -1215,18 +1372,38 @@ export function apply(ctx, config) {
 
   ctx.tools.register(defineTool({
     name: 'scratch_add_blocks',
-    description: '向角色注入积木（sb3 blocks dict 格式，带临时 id + parent/next 链 + x/y 坐标）。注入走 shareBlocksToTarget 官方管线：ID 自动换新、所需扩展自动加载、inline 字面量自动展开成影子块。返回 idMap（旧 ID → 新 ID）——后续引用新块必须用新 ID。preview 档下不会立刻落盘，会返回 planId 等 scratch_apply。',
+    description: '向角色注入积木（sb3 blocks dict 格式，带临时 id + parent/next 链 + 可选 x/y）。'
+      + '走 shareBlocksToTarget 官方管线：ID 自动换新、所需扩展自动加载、inline 字面量自动展开成影子块；'
+      + '缺的变量/列表会**自动补建**（refs.created 里有真实 id；同名已存在则复用 refs.kept）。'
+      + '**注入前会校验输入名/字段名**：把 OPERAND1 塞进 operator_add 这种拼错会直接报错（这类错不会报错、只让算式恒为 0），'
+      + '确需强行注入传 lenient:true。形状不确定就先 scratch_get_opcodes({ opcode:"operator_add" })。'
+      + '**只增不删**：绝不清理你上次注入的游离块（返回里 staleInjected 只是提醒）；真要清传 discardStale:true（只清整棵子树都是 AI 注入的）。'
+      + '没给坐标时按估算高度自动排到现有内容右边（不会叠在一起）；改完会把视口带过去（follow:false 可关）。'
+      + '返回 idMap（旧 ID → 新 ID）——后续引用新块必须用新 ID。preview 档下不会立刻落盘，会返回 planId 等 scratch_apply。',
     parameters: {
       session: { type: 'string' },
       target: { type: 'string', description: '目标精灵名' },
-      blocks: { type: 'object', additionalProperties: true, description: 'sb3 blocks dict（同 project.json 里 targets[].blocks 的格式）' }
+      blocks: { type: 'object', additionalProperties: true, description: 'sb3 blocks dict（同 project.json 里 targets[].blocks 的格式）' },
+      variables: { type: 'array', description: '可选：要一起建的变量/列表声明 [{name, type:"variable"|"list"|"broadcast", value}]（不传则按块里的名字自动建、值为空）' },
+      lenient: { type: 'boolean', description: 'true = 输入名/字段名写错也只警告、照样注入（缺省是直接报错拦下来）' },
+      layout: { type: 'string', description: 'auto（缺省，自动排到现有内容右边）| given（尊重你给的 x/y）' },
+      follow: { type: 'boolean', description: 'false = 改完不把视口滚过去（缺省会滚）' },
+      discardStale: { type: 'boolean', description: 'true = 顺手清掉上次注入且仍游离的块（只清整棵子树都是 AI 注入的，碰到作者积木会跳过）' }
     },
     output: jsonOut,
     async execute(args) {
       const sid = needSession(args?.session)
       if (!args?.blocks) throw new Error('blocks 必填')
-      return withChanged(await guardedWrite(sid, 'add_blocks', { target: args.target, blocks: args.blocks },
-        'pre-add_blocks', { target: args.target, blocks: args.blocks }))
+      return withChanged(await guardedWrite(sid, 'add_blocks', {
+        target: args.target,
+        blocks: args.blocks,
+        variables: Array.isArray(args.variables) ? args.variables : undefined,
+        lenient: args.lenient === true ? true : undefined,
+        layout: args.layout === 'given' ? 'given' : undefined,
+        follow: args.follow === false ? false : undefined,
+        discardStale: args.discardStale === true ? true : undefined
+      },
+      'pre-add_blocks', { target: args.target, blocks: args.blocks }))
     }
   }))
 
@@ -1712,7 +1889,8 @@ export function apply(ctx, config) {
       fields: { type: 'object', additionalProperties: true, description: '要改的字段，如 {"STOP_OPTION": "all"}' },
       inputs: { type: 'object', additionalProperties: true, description: '要改的输入，sb3 数组格式，如 {"STEPS": [1, [4, "10"]]}' },
       x: { type: 'number', description: '新工作区坐标 x' },
-      y: { type: 'number', description: '新工作区坐标 y' }
+      y: { type: 'number', description: '新工作区坐标 y' },
+      follow: { type: 'boolean', description: 'false = 改完不把视口滚到这个块（缺省会滚，用户看得见改了哪儿）' }
     },
     output: jsonOut,
     async execute(args) {
@@ -1724,7 +1902,7 @@ export function apply(ctx, config) {
       if (args.y !== undefined) changes.y = args.y
       if (!Object.keys(changes).length) throw new Error('changes 为空：至少要给 fields / inputs / x / y 之一')
       return withChanged(await guardedWrite(sid, 'update_block',
-        { target: args.target, blockId: args.blockId, changes },
+        { target: args.target, blockId: args.blockId, changes, follow: args.follow === false ? false : undefined },
         'pre-update_block',
         { blockId: args.blockId, changes }))
     }
@@ -1732,20 +1910,24 @@ export function apply(ctx, config) {
 
   ctx.tools.register(defineTool({
     name: 'scratch_variable',
-    description: '变量 / 列表的增删改与赋值（写操作，受 safety 档位管）。'
-      + 'action=set 赋值（kind=list 时 value 给数组 = 整体替换）/ create 新建 / delete 删除 / rename 改名。'
+    description: '变量 / 列表的增删改查（写操作，受 safety 档位管）。'
+      + 'action=get 读（列表可给 index 或 from+count，**下标从 1 开始**，越界会直接报错而不是静默返回空串）/ '
+      + 'set 赋值（kind=list 时 value 给数组 = 整体替换）/ create 新建 / delete 删除 / rename 改名。'
       + 'scope=global 挂舞台、local 挂当前角色；不传则先角色后舞台地找。'
       + 'delete 时如果还有积木在引用它会被拒绝，并列出是哪几个块；确认要连积木一起删就传 force:true。'
       + 'rename 会把引用它的积木字段一起改（不改就会变成「变量未找到」）。',
     parameters: {
       session: { type: 'string' },
-      action: { type: 'string', required: true, description: 'set | create | delete | rename' },
+      action: { type: 'string', required: true, description: 'get | set | create | delete | rename' },
       kind: { type: 'string', description: 'variable（缺省）| list' },
       name: { type: 'string', description: '变量名（create 必填；其它动作按名字找）' },
       id: { type: 'string', description: '变量 id（比名字更准，可选）' },
       scope: { type: 'string', description: 'global（舞台）| local（当前角色）；不传则两个都找' },
       target: { type: 'string', description: '局部变量所属角色，缺省当前编辑目标' },
       value: { type: 'json', description: 'set 的值；create 时可带初始值（列表给数组）' },
+      index: { type: 'number', description: 'get + list：只读第几项（从 1 开始）' },
+      from: { type: 'number', description: 'get + list：从第几项开始（从 1 开始，缺省 1）' },
+      count: { type: 'number', description: 'get + list：读几项（缺省 50）' },
       newName: { type: 'string', description: 'rename 的新名字' },
       force: { type: 'boolean', description: 'delete 时连引用它的积木一起删' }
     },
@@ -1753,8 +1935,15 @@ export function apply(ctx, config) {
     async execute(args) {
       const sid = needSession(args?.session)
       const action = String(args?.action || '')
-      if (!action) throw new Error('action 必填：set / create / delete / rename')
+      if (!action) throw new Error('action 必填：get / set / create / delete / rename')
       if (action === 'create' && !args?.name) throw new Error('create 需要 name')
+      // get 是只读：直接调，不进 preview/快照那套（读个列表还等确认会很烦）
+      if (action === 'get') {
+        return await call(sid, 'variable', {
+          target: args.target, action, kind: args.kind, name: args.name, id: args.id, scope: args.scope,
+          index: args.index, from: args.from, count: args.count
+        })
+      }
       const valueMeta = Array.isArray(args?.value)
         ? `[${args.value.length} 项]`
         : (typeof args?.value === 'string' && args.value.length > 60 ? args.value.slice(0, 57) + '…' : args?.value)
@@ -1800,7 +1989,8 @@ export function apply(ctx, config) {
       blockId: { type: 'string', required: true, description: '要移动的块 id' },
       mode: { type: 'string', description: 'detach | after | before | input（缺省 after）' },
       toBlockId: { type: 'string', description: '目标块 id（after / before / input 必填）' },
-      inputName: { type: 'string', description: 'input 模式必填：目标输入槽名，如 CONDITION / SUBSTACK / OPERAND1' }
+      inputName: { type: 'string', description: 'input 模式必填：目标输入槽名，如 CONDITION / SUBSTACK / OPERAND1' },
+      follow: { type: 'boolean', description: 'false = 挪完不把视口滚过去（缺省会滚）' }
     },
     output: jsonOut,
     async execute(args) {
@@ -1808,7 +1998,8 @@ export function apply(ctx, config) {
       if (!args?.blockId) throw new Error('blockId 必填')
       return await guardedWrite(sid, 'move_block', {
         target: args.target, blockId: args.blockId, mode: args.mode,
-        toBlockId: args.toBlockId, inputName: args.inputName
+        toBlockId: args.toBlockId, inputName: args.inputName,
+        follow: args.follow === false ? false : undefined
       }, 'pre-move_block', {
         target: args.target, blockId: args.blockId, mode: args.mode || 'after',
         toBlockId: args.toBlockId, inputName: args.inputName
@@ -1833,15 +2024,23 @@ export function apply(ctx, config) {
 
   ctx.tools.register(defineTool({
     name: 'scratch_get_opcodes',
-    description: '获取当前宿主全部可用积木的 opcode 白名单（内置 + 已加载扩展）。AI 生成 add_blocks/update 前建议先查这个，避免编造不存在的 opcode。',
+    description: '两个用途：① 不传 opcode —— 列当前宿主全部可用 opcode（内置 + 已加载扩展），避免编造不存在的块；'
+      + '② 传 opcode（或 opcodes 数组）—— 查这个块的**形状**：输入名、字段名。'
+      + '写 add_blocks 之前查一次，就不会把 OPERAND1 塞进 operator_add（那种拼错不会报错，只会让算式恒为 0）。',
     parameters: {
       session: { type: 'string' },
-      target: { type: 'string', description: '精灵名（不同目标扩展加载可能不同），缺省当前编辑目标' }
+      target: { type: 'string', description: '精灵名（不同目标扩展加载可能不同），缺省当前编辑目标' },
+      opcode: { type: 'string', description: '查这个 opcode 的输入/字段名，如 "operator_add"' },
+      opcodes: { type: 'array', description: '一次查多个（最多 20 个）' }
     },
     output: jsonOut,
     async execute(args) {
       const sid = needSession(args?.session)
-      return await call(sid, 'get_opcodes', { target: args?.target })
+      return await call(sid, 'get_opcodes', {
+        target: args?.target,
+        opcode: args?.opcode,
+        opcodes: Array.isArray(args?.opcodes) ? args.opcodes : undefined
+      })
     }
   }))
 
@@ -1904,6 +2103,35 @@ export function apply(ctx, config) {
   }
 
   /** 截一张编辑器窗口。只有 CDP 会话能截（扩展那条路在浏览器里没有截图权限） */
+  // ---------------- 截图（D3 裁剪 + G9 帧心跳） ----------------
+  // 两个真机教训：
+  //   D3：整窗 1899×1145，舞台只占约 1/4，想确认画面细节只能靠肉眼放大 → 支持 region: stage / workspace。
+  //   G9：窗口"假活"时（VM 在跑、界面已冻结）连续两张截图**字节完全相同**。
+  //       所以每张都回 frameHash，并和上一张比：一样就明确说"可能是旧帧"。
+  const shotHashOf = (buf) => createHash('sha1').update(buf).digest('hex').slice(0, 16)
+
+  async function shotRegionRect(s, region) {
+    if (!s || !s.cdp || typeof s.cdp.evaluate !== 'function') return null
+    const expr = region === 'stage'
+      ? `(() => {
+          const el = document.querySelector('[class*="stage_stage"] canvas') || document.querySelector('[class*="stage_stage"]') || document.querySelector('canvas');
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return (r.width > 10 && r.height > 10) ? { x: r.x, y: r.y, width: r.width, height: r.height } : null;
+        })()`
+      : `(() => {
+          const el = document.querySelector('.blocklySvg') || document.querySelector('[class*="blocks_blocks"]');
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return (r.width > 10 && r.height > 10) ? { x: r.x, y: r.y, width: r.width, height: r.height } : null;
+        })()`
+    try {
+      const r = await s.cdp.evaluate(expr)
+      if (!r || !Number.isFinite(r.width) || r.width < 10) return null
+      return r
+    } catch { return null }
+  }
+
   async function captureShot(sid, args) {
     const s = sessions.get(sid)
     if (!s || !s.cdp || typeof s.cdp.cdpSend !== 'function') {
@@ -1913,66 +2141,113 @@ export function apply(ctx, config) {
     const format = String(args?.format || 'png').toLowerCase() === 'jpeg' ? 'jpeg' : 'png'
     const params = { format }
     if (format === 'jpeg') params.quality = Math.min(Math.max(Number(args?.quality) || 80, 1), 100)
+    // D3：region=stage / workspace 只截那块（默认 full 整窗）
+    const region = ['stage', 'workspace'].includes(String(args?.region || '')) ? String(args.region) : 'full'
+    let rect = null
+    let regionFallback = null
+    if (region !== 'full') {
+      rect = await shotRegionRect(s, region)
+      if (!rect) regionFallback = `拿不到 ${region} 的矩形（GUI 还没挂载 / 选择器变了），这次退回整窗截图`
+      else params.clip = { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height), scale: 1 }
+    }
     const r = await s.cdp.cdpSend('Page.captureScreenshot', params, 20000)
     const b64 = r && r.data
     if (!b64) throw new Error('CDP 没回截图数据')
     const buf = Buffer.from(b64, 'base64')
+    // G9：和上一张比。窗口冻结时连续截图字节相同 —— 这是唯一能自动发现的信号。
+    const frameHash = shotHashOf(buf)
+    const prev = s.lastShot
+    const sameAsPrev = !!(prev && prev.hash === frameHash)
+    const capturedAt = new Date().toISOString()
+    s.lastShot = { hash: frameHash, at: capturedAt, region }
+    let out
     const want = args?.path ? resolve(String(args.path)) : null
     if (want) {
       mkdirSync(dirname(want), { recursive: true })
       writeFileSync(want, buf)
-      return { path: want, bytes: buf.length, format }
+      out = { path: want, bytes: buf.length, format, region }
+    } else {
+      const dir = shotsDir()
+      mkdirSync(dir, { recursive: true })
+      const ts = capturedAt.replace(/[:.]/g, '-').slice(0, 19)
+      const file = join(dir, `shot-${ts}${region !== 'full' ? '-' + region : ''}.${format === 'jpeg' ? 'jpg' : 'png'}`)
+      writeFileSync(file, buf)
+      out = {
+        path: file,
+        bytes: buf.length,
+        format,
+        region,
+        hint: '把 path 用 markdown 图片给用户看（![截图](绝对路径)），或者自己 read_image 核对画面'
+      }
     }
-    const dir = shotsDir()
-    mkdirSync(dir, { recursive: true })
-    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
-    const file = join(dir, `shot-${ts}.${format === 'jpeg' ? 'jpg' : 'png'}`)
-    writeFileSync(file, buf)
-    return {
-      path: file,
-      bytes: buf.length,
-      format,
-      hint: '把 path 用 markdown 图片给用户看（![截图](绝对路径)），或者自己 read_image 核对画面'
+    out.capturedAt = capturedAt
+    out.frameHash = frameHash
+    out.sameAsPrev = sameAsPrev || undefined
+    out.size = rect ? { width: params.clip.width, height: params.clip.height } : undefined
+    out.regionFallback = regionFallback || undefined
+    if (sameAsPrev) {
+      out.frozenHint = '这张和上一张**字节完全相同**（frameHash 一样）。如果 VM 同时在跑，多半是界面冻结了'
+        + '（G9：VM 在跑、舞台/画面不动，绿旗和停止按钮也没反应）→ 用 scratch_selftest 看"帧心跳"，'
+        + '或 scratch_restart_window 杀掉重开（会顺手把当前作品重新装上）。'
     }
+    return out
+  }
+
+  /** 只取一个帧哈希（帧心跳用，不落盘） */
+  async function frameHashOnce(s) {
+    const r = await s.cdp.cdpSend('Page.captureScreenshot', { format: 'png' }, 20000)
+    if (!r || !r.data) return null
+    return shotHashOf(Buffer.from(r.data, 'base64'))
   }
 
   ctx.tools.register(defineTool({
     name: 'scratch_run',
     description: '控制项目运行：greenflag 点绿旗（顺手确保 VM 在跑）、stopall 停止全部线程（红灯）、start/stoploop 起停 VM 循环。'
-      + '返回动作前后的线程数/克隆数/页面变量 —— 点完立刻能看出"到底跑起来没有"。',
+      + '默认**只回** running/threads/clones/stepMs 这几个数（D5：以前每次都回完整 before/after 状态转储，30+ 变量 + 38 个列表长度）。'
+      + '要看全量变量/线程就传 detail:true。running:true **只代表 VM 有活线程**，不代表界面在响应（窗口假活看 scratch_selftest 的帧心跳）。',
     parameters: {
       session: { type: 'string' },
       action: { type: 'string', description: 'greenflag | stopall | start | stoploop（缺省 greenflag）' },
-      waitMs: { type: 'number', description: '动作后等多久再读数（缺省 300ms，给脚本跑几帧）' }
+      waitMs: { type: 'number', description: '动作后等多久再读数（缺省 300ms，给脚本跑几帧）' },
+      detail: { type: 'boolean', description: 'true = 连完整状态（页面变量、克隆体分布、线程清单）一起回' }
     },
     output: jsonOut,
     async execute(args) {
       const sid = needSession(args?.session)
-      return await call(sid, 'run', { action: args?.action || 'greenflag', waitMs: args?.waitMs }, 30000)
+      return await call(sid, 'run', { action: args?.action || 'greenflag', waitMs: args?.waitMs, detail: args?.detail === true }, 30000)
     }
   }))
 
   ctx.tools.register(defineTool({
     name: 'scratch_state',
     description: '读运行时状态（只读）：running（有没有线程在跑）、threads、targets、克隆体分布、stepMs/fps、舞台标量变量。'
-      + '列表只报长度。「点了没反应」「到底跑没跑」这类问题先看这个，比看截图片段可靠。',
+      + '列表默认只报长度，但会给 pageListDelta（和上一次 state 比，C2：列表是不是在泄漏不用再靠运气发现）。'
+      + '想看某几项就传 listSlice:{name, from, count}（**下标从 1 开始**）。'
+      + '「点了没反应」「到底跑没跑」这类问题先看这个；但 running:true 只代表 VM 在跑，界面是否冻结看 scratch_selftest。',
     parameters: {
       session: { type: 'string' },
       target: { type: 'string', description: '顺带报这个角色的坐标/大小/可见/局部变量' },
-      includeLists: { type: 'boolean', description: '把列表内容也回传（长列表会很大，缺省只看长度）' }
+      includeLists: { type: 'boolean', description: '把列表内容也回传（长列表会很大，缺省只看长度）' },
+      listSlice: { type: 'object', additionalProperties: true, description: '只读某个列表的一段：{name:"列表名", from:1, count:20}（from 从 1 开始）' }
     },
     output: jsonOut,
     async execute(args) {
       const sid = needSession(args?.session)
-      return await call(sid, 'state', { target: args?.target, includeLists: args?.includeLists === true })
+      return await call(sid, 'state', {
+        target: args?.target,
+        includeLists: args?.includeLists === true,
+        listSlice: args?.listSlice
+      })
     }
   }))
 
   ctx.tools.register(defineTool({
     name: 'scratch_click',
     description: '点舞台上的东西：给 target（按名字找角色/克隆体，用造型包围盒中心）或给 x/y（舞台坐标 -240..240 / -180..180）。'
-      + '先发真实鼠标事件（renderer.pick 命中就是真点击），没命中会退化成直接启动该角色的「当角色被点击」帽子。'
-      + '返回值里的 via 说明走的哪条路，hatsStarted 是这次点的效果。',
+      + '先发真实鼠标事件，再用 renderer.pick 确认**这个坐标上到底有没有东西**（F4：以前 hatsStarted:0 但流程确实推进了，'
+      + '分不清是"没命中"还是"命中了但没点击帽子"）。'
+      + '返回：pick（命中谁）/ pickMissed / started（这次新起了哪些线程）/ hatsStarted / via。'
+      + 'hatsStarted:0 且 threads>0 时会明确说"流程可能是已有线程推进的，别据此判断点击失败"。',
     parameters: {
       session: { type: 'string' },
       target: { type: 'string', description: '要点的角色名（有克隆体时优先可见的那个）' },
@@ -2032,13 +2307,16 @@ export function apply(ctx, config) {
 
   ctx.tools.register(defineTool({
     name: 'scratch_list_scripts',
-    description: '列出一个角色的顶层脚本清单（id / opcode / 块数 / 调用的自定义积木 / 自定义积木名），并**区分真脚本和游离块**'
-      + '（作者调试拖出来的孤立块 —— 实测某角色 185 个顶层块里约 150 个是游离块，不区分的话块数排名全是噪音）。'
+    description: '列出一个角色的顶层脚本清单（id / opcode / 块数 / 调用的自定义积木 / 自定义积木名），并且**分三档**：'
+      + 'kind=script（帽子块打头的真脚本）、kind=definition（**自定义积木定义** —— 带 calledBy/warp/params，'
+      + '这是引擎主干、不是垃圾；C1 那次把 32 个定义当成"游离块"差点删掉作者的核心函数）、'
+      + 'kind=loose（作者调试拖出来的真·游离块）。kind=called 只看"被调用过的定义"。'
+      + '块数是**展开视图**（含物化影子块），blockCountRaw 才是 project.json 里的真块数（B2：以前三个 API 三个口径）。'
       + '要读某段脚本的块体就把它 blockId 传给 scratch_read_script({ scriptId })。',
     parameters: {
       session: { type: 'string' },
       target: { type: 'string', description: '角色名，缺省当前编辑角色' },
-      kind: { type: 'string', description: 'all | script | loose（缺省 all）' },
+      kind: { type: 'string', description: 'all | script | definition | loose | called（缺省 all）' },
       minBlocks: { type: 'number', description: '只看块数 >= N 的' },
       limit: { type: 'number', description: '最多回几条（缺省 100）' }
     },
@@ -2054,13 +2332,15 @@ export function apply(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'scratch_screenshot',
     description: '截当前编辑器窗口（CDP Page.captureScreenshot，实测 180-208ms），返回落盘路径 + 字节数。'
-      + '改完积木给用户看效果、或自己核对画面时用。只有桌面版 CDP 会话能用'
-      + '（浏览器扩展那条路没有这个能力，也不打算加 —— 要截图就用 open_editor({app:"desktop"}) 开桌面版）。',
+      + 'region:"stage" 只截舞台、"workspace" 只截积木区（D3：整窗里舞台只占 1/4，看不清细节）。'
+      + '每次都回 frameHash；和上一张**完全相同**会标 sameAsPrev + frozenHint（界面冻结的信号，见 scratch_selftest 的"帧心跳"）。'
+      + '只有桌面版 CDP 会话能用（浏览器扩展那条路没有这个能力，也不打算加 —— 要截图就用 open_editor({app:"desktop"}) 开桌面版）。',
     parameters: {
       session: { type: 'string' },
       path: { type: 'string', description: '存到哪（缺省 <快照目录同级>/scratch-shots/时间戳.png）' },
       format: { type: 'string', description: 'png | jpeg（缺省 png）' },
-      quality: { type: 'number', description: 'jpeg 质量 1-100（缺省 80）' }
+      quality: { type: 'number', description: 'jpeg 质量 1-100（缺省 80）' },
+      region: { type: 'string', description: 'full（缺省）| stage（只截舞台）| workspace（只截积木区）' }
     },
     output: jsonOut,
     async execute(args) {
@@ -2069,21 +2349,27 @@ export function apply(ctx, config) {
     }
   }))
 
-  // 批处理白名单：只读 + 运行期动作。写操作（add/update/delete/tidy/restore/load/save）
-  // 故意不许进批处理 —— 那样会绕过 preview/apply 那套确认，出事没人拦。
+  // 批处理白名单：只读 + 运行期动作 + **轻量写**。
+  // 为什么加 variable：从零建工程要 8 个变量 + 3 个列表，不许进批处理就是 11 次串行往返（G6）。
+  // 但只放开 variable 的 create/set —— 它们只动变量表，不碰积木结构，风险远低于 add/update/delete；
+  // 而且仍然会先快照（批处理这条路上不走 preview，所以只给"最不可能出事"的那几个动作）。
   const BATCH_OPS = new Set([
     'project_meta', 'snapshot', 'read_script', 'list_scripts', 'get_opcodes',
-    'watch', 'user_context', 'state', 'profile', 'locate', 'run', 'click', 'press_key'
+    'watch', 'user_context', 'state', 'profile', 'locate', 'run', 'click', 'press_key',
+    'inspect', 'project_overview'
   ])
+  const BATCH_LIGHT_WRITES = { variable: new Set(['create', 'set']) }
 
   ctx.tools.register(defineTool({
     name: 'scratch_batch',
     description: '一次往返做多件事（把 N 次工具调用压成 1 次；真机实测把 7 条命令合并后总耗时从 N×等待降到几百毫秒）。'
       + 'calls 是 [{op, args}] 数组，顺序执行，逐条返回 ok/result 或 error，单条失败不影响后面。'
-      + `只允许只读/运行期 op：${[...BATCH_OPS].join(', ')}，外加 screenshot（截图，特殊处理）。写操作请单独调。`,
+      + `只允许只读/运行期 op：${[...BATCH_OPS].join(', ')}，外加 screenshot（截图，特殊处理）、`
+      + 'variable 的 create/set（轻量写，只动变量表不碰积木；批处理里不走 preview，只给这两个动作）。'
+      + 'add/update/delete/tidy/load/save 这些**改结构的**写操作必须单独调（要过 preview/apply 确认）。',
     parameters: {
       session: { type: 'string' },
-      calls: { type: 'array', description: '形如 [{ op: "state" }, { op: "locate", args: { blockId: "abc" } }]' }
+      calls: { type: 'array', description: '形如 [{ op: "state" }, { op: "variable", args: { action:"create", name:"x", kind:"variable" } }]' }
     },
     output: jsonOut,
     async execute(args) {
@@ -2104,8 +2390,23 @@ export function apply(ctx, config) {
           }
           continue
         }
+        const lightAction = BATCH_LIGHT_WRITES[op]
+        if (lightAction) {
+          const act = String(c?.args?.action || '')
+          if (!lightAction.has(act)) {
+            results.push({ op, ok: false, error: `批处理里只允许 variable 的 ${[...lightAction].join('/')}（收到 action:"${act}"）；其它动作请单独调` })
+            continue
+          }
+          try {
+            const r = await call(sid, op, c?.args || {})
+            results.push({ op, ok: true, ms: Date.now() - t1, result: r })
+          } catch (e) {
+            results.push({ op, ok: false, ms: Date.now() - t1, error: e.message })
+          }
+          continue
+        }
         if (!BATCH_OPS.has(op)) {
-          results.push({ op, ok: false, error: `op "${op}" 不在批处理白名单里（只读/运行期）：${[...BATCH_OPS].join(', ')}` })
+          results.push({ op, ok: false, error: `op "${op}" 不在批处理白名单里（只读/运行期 + variable 轻写）：${[...BATCH_OPS].join(', ')}` })
           continue
         }
         try {
@@ -2125,10 +2426,12 @@ export function apply(ctx, config) {
 
   ctx.tools.register(defineTool({
     name: 'scratch_selftest',
-    description: '自检一遍整条链路：桥还在监听吗、有没有会话、CDP 注入活着吗、项目/角色就绪吗、Blockly 工作区在不在、桌面版窗口可见吗。'
-      + '用户说"连不上/没反应/看不到"时先跑这个，别猜。',
+    description: '自检一遍整条链路：桥还在监听吗、有没有会话、CDP 注入活着吗、项目/角色就绪吗、Blockly 工作区在不在、桌面版窗口可见吗，'
+      + '以及**帧心跳**（连截两张比哈希 —— G9 那种"VM 在跑、界面已冻结、但所有自检全绿"的情况只有这一项能发现）。'
+      + '用户说"连不上/没反应/看不到/点了没反应"时先跑这个，别猜。',
     parameters: {
-      session: { type: 'string' }
+      session: { type: 'string' },
+      heartbeat: { type: 'boolean', description: '是否做帧心跳（缺省 true；会多花约 0.5s 截两张图）' }
     },
     output: jsonOut,
     async execute(args) {
@@ -2147,6 +2450,7 @@ export function apply(ctx, config) {
       }
       const s = sessions.get(sid)
       const isCdp = !!(s && s.cdp)
+      if (s && s.loading) add('装载中', null, '文件正在后台装载（下一条工具调用会自动等它装完）')
       add('CDP 注入', !isCdp ? null : !!(s.cdp.raw && s.cdp.raw.injected), isCdp
         ? (s.cdp.state ? s.cdp.state() : (s.cdp.raw && s.cdp.raw.injected ? '已注入' : '执行器没注进去'))
         : '这条会话走扩展，不经 CDP')
@@ -2166,6 +2470,24 @@ export function apply(ctx, config) {
         } else {
           add('窗口可见', null, '查不到（powershell 起不来或不是 Windows）')
         }
+        // G9：帧心跳。这一项比上面所有项都值钱 —— 真机上那 7 项全绿的时候，
+        // 用户点了绿旗/停止毫无反应、舞台画面冻结，而 VM 线程还在跑（变量还在涨）。
+        // 唯一能自动发现的信号就是"连截两张，字节完全相同"。
+        if (args?.heartbeat !== false && typeof s.cdp.cdpSend === 'function') {
+          try {
+            const running = !!(await call(sid, 'state').then(x => x && x.running).catch(() => false))
+            const h1 = await frameHashOnce(s)
+            await sleep(400)
+            const h2 = await frameHashOnce(s)
+            const same = !!(h1 && h2 && h1 === h2)
+            add('帧心跳', same && running ? false : true, same && running
+              ? `连截两张**字节完全相同**（${h1}），但 VM 有线程在跑 → **界面很可能已冻结**：用户点绿旗/停止没反应就是这个。`
+                + '用 scratch_restart_window 杀掉重开（会顺手把当前作品装回来）'
+              : (same ? `两张相同（${h1}），但 VM 没在跑 —— 静态画面，正常` : `画面在动（${h1} → ${h2}）`))
+          } catch (e) {
+            add('帧心跳', null, '截图失败：' + e.message)
+          }
+        }
       }
       const failed = checks.filter(c => c.ok === false).length
       return {
@@ -2173,9 +2495,167 @@ export function apply(ctx, config) {
         failed,
         checks,
         hint: failed
-          ? '看 ok:false 的那几条；detail 里就是原因。窗口不可见 → open_editor 会救；Blockly 拿不到 → locate 用不了但读写照常。'
-          : '全绿：桥、会话、注入、项目、工作区、窗口都在位，可以直接干活'
+          ? '看 ok:false 的那几条；detail 里就是原因。帧心跳 false → 窗口假活，scratch_restart_window；'
+            + '窗口不可见 → open_editor 会救；Blockly 拿不到 → locate 用不了但读写照常。'
+          : '全绿：桥、会话、注入、项目、工作区、窗口、画面都在位，可以直接干活'
       }
+    }
+  }))
+
+  // ==================== v0.10.0：结构总览 / 单块上下文 / 空白作品 / 角色改名 / 重启窗口 ====================
+
+  ctx.tools.register(defineTool({
+    name: 'scratch_project_overview',
+    description: '一次看清整个项目结构（D1）：每个角色/舞台的 opcode 直方图、自定义积木清单（参数原型 / 是否 warp / 被调用几次）、'
+      + '调用关系、每段脚本一行摘要。**读代码前先跑这个**，比 N 次 list_scripts/read_script 拼便宜得多，也不会被截断。'
+      + '块数是**展开视图**（含物化影子块）；blockCountRaw 才是 project.json 里的真块数（两个都给了，别再对不上账）。',
+    parameters: {
+      session: { type: 'string' },
+      target: { type: 'string', description: '只看这个角色（缺省全部）' },
+      topOpcodes: { type: 'number', description: '每个角色列前 N 个 opcode（缺省 12，上限 40）' },
+      scriptsPerTarget: { type: 'number', description: '每个角色列前 N 段脚本（缺省 12）' }
+    },
+    output: jsonOut,
+    async execute(args) {
+      const sid = needSession(args?.session)
+      return await call(sid, 'project_overview', {
+        target: args?.target, topOpcodes: args?.topOpcodes, scriptsPerTarget: args?.scriptsPerTarget
+      })
+    }
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'scratch_inspect',
+    description: '看**一个块**的上下文（F3）：它挂在谁下面（parent + 是哪个输入槽）、next 是谁、每个输入接了什么/字面量值多少、'
+      + '它属于哪条脚本（帽子块 + 嵌套深度）、子树多少块。'
+      + '插完/改完想确认"位置对不对"就查这个 —— 不用整段读（354 块 ≈ 100KB）也不用整份 snapshot（1.8MB）。',
+    parameters: {
+      session: { type: 'string' },
+      blockId: { type: 'string', required: true, description: '要看的块 id' },
+      target: { type: 'string', description: '块所在角色（缺省当前编辑角色）' }
+    },
+    output: jsonOut,
+    async execute(args) {
+      const sid = needSession(args?.session)
+      if (!args?.blockId) throw new Error('blockId 必填')
+      return await call(sid, 'inspect', { blockId: args.blockId, target: args.target })
+    }
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'scratch_new_project',
+    description: '新建一个**空白作品**（G1：以前只能自己手写最小 sb3、md5 命名资源、拼 targets 结构）。'
+      + '插件现场生成一份标准 sb3（舞台 + 一个角色，各带一个内联 SVG 造型）并装进编辑器；'
+      + '传 savePath 还会顺手落盘一份给你（等价于"新建并保存"）。'
+      + '⚠️ 会顶掉编辑器里当前项目 —— 已经自动快照（scratch_rollback 可回）。',
+    parameters: {
+      session: { type: 'string' },
+      sprite: { type: 'string', description: '角色名（缺省「角色1」）' },
+      backdrop: { type: 'string', description: '背景名（缺省「背景1」）' },
+      costume: { type: 'string', description: '角色造型名（缺省「造型1」）' },
+      spriteColor: { type: 'string', description: '角色颜色（CSS 颜色，缺省 #4c97ff）' },
+      savePath: { type: 'string', description: '顺便存到这个 .sb3 路径（可选）' }
+    },
+    output: jsonOut,
+    async execute(args) {
+      const sid = needSession(args?.session)
+      const built = buildBlankProject({
+        spriteName: args?.sprite,
+        backdropName: args?.backdrop,
+        costumeName: args?.costume,
+        spriteColor: args?.spriteColor
+      })
+      const r = await loadBytesIntoSess(sid, built.buffer, 'new-project.sb3', 'pre-new_project')
+      const out = Object.assign({ created: true, files: built.files }, r)
+      if (args?.savePath) {
+        const p = resolve(String(args.savePath))
+        mkdirSync(dirname(p), { recursive: true })
+        writeFileSync(p, built.buffer)
+        out.savedTo = p
+      }
+      out.hint = '空白作品已经装好了：可以直接 scratch_add_blocks 往里写；'
+        + '想改角色名用 scratch_target({ action: "rename", to: "新名字" })'
+      return out
+    }
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'scratch_target',
+    description: '角色级的操作：action:"list" 列角色（名字 / 是否舞台 / 块数 / 造型数），'
+      + 'action:"rename" 给角色改名（G2：以前改不了，只能手改 project.json；会同步引用角色名的积木，重名会自动去重）。',
+    parameters: {
+      session: { type: 'string' },
+      action: { type: 'string', description: 'list（缺省）| rename' },
+      target: { type: 'string', description: 'rename 时的目标角色名' },
+      to: { type: 'string', description: 'rename 的新名字' }
+    },
+    output: jsonOut,
+    async execute(args) {
+      const sid = needSession(args?.session)
+      const action = String(args?.action || 'list')
+      if (action === 'list') {
+        const meta = await call(sid, 'project_meta')
+        return {
+          editingTarget: meta.editingTarget,
+          targets: (meta.targets || []).map(t => ({
+            name: t.name, isStage: t.isStage, blockCount: t.blockCount, costumes: (t.costumes || []).length
+          }))
+        }
+      }
+      if (action === 'rename') {
+        if (!args?.to) throw new Error('rename 需要 to（新名字）')
+        return withChanged(await guardedWrite(sid, 'rename_target', { target: args.target, to: args.to },
+          `pre-rename-${args.target || ''}`, { target: args.target, to: args.to }))
+      }
+      throw new Error(`未知 action "${action}"（list / rename）`)
+    }
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'scratch_restart_window',
+    description: '把桌面版窗口**杀掉重开**（G9 的恢复动作）：窗口"假活"时（VM 在跑、界面冻结、绿旗停止按钮没反应、自检全绿）用这个。'
+      + '会按当前 pid 结束进程，再用调试端口重新拉起，并把**上次打开的作品文件**重新装回去（reload:false 则不装）。'
+      + '⚠️ 是破坏性动作：没存盘的改动会丢（所以重开前先 scratch_save_project）。',
+    parameters: {
+      session: { type: 'string' },
+      reload: { type: 'boolean', description: '重开后把上次打开的 sb3 再装回去（缺省 true）' },
+      show: { type: 'boolean', description: '是否显示窗口（缺省 true）' }
+    },
+    output: jsonOut,
+    async execute(args) {
+      const sid = needSession(args?.session)
+      const s = sessions.get(sid)
+      if (!s || !s.cdp) throw new Error('只有桌面版 CDP 会话能重启窗口（网页版：让用户自己刷新那个标签页）')
+      const pid = Number(s.meta && s.meta.pid) || 0
+      if (!pid) throw new Error('不知道这个窗口的 pid（可能接的是别人的实例），不敢乱杀')
+      const port = Number(s.meta && s.meta.debugPort) || 0
+      const filePath = s.lastProjectPath || null
+      const found = findDesktopApp()
+      if (!found.path) throw new Error('找不到 TurboWarp Desktop 可执行文件，重启不了')
+      const alive = (p) => {
+        try {
+          const o = execFileSync('tasklist', ['/FI', `PID eq ${p}`, '/NH', '/FO', 'CSV'], { encoding: 'utf8', windowsHide: true, timeout: 5000 })
+          return o.includes(String(p))
+        } catch { return false }
+      }
+      dropSession(sid, '重启窗口（用户/AI 要求）')
+      try { execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }) } catch { /* 可能已经退了 */ }
+      for (let i = 0; i < 40 && alive(pid); i++) await sleep(250)
+      const newPort = port || await findFreePort()
+      const launched = { app: 'desktop', path: found.path, via: found.via, debugPort: newPort, restartedFrom: pid }
+      try { launched.pid = spawnDetached(found.path, [`--remote-debugging-port=${newPort}`]) } catch (e) { launched.error = e.message }
+      const out = await cdpAttachAndReport({
+        port: newPort,
+        launched,
+        wantPath: args?.reload === false ? null : filePath,
+        waitMs: 30000,
+        show: args?.show !== false
+      })
+      return Object.assign({
+        restarted: true,
+        killedPid: pid,
+        reloadedFrom: args?.reload === false ? undefined : (filePath || undefined)
+      }, out)
     }
   }))
 

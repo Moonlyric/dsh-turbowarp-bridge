@@ -17,7 +17,8 @@ npm install          # scratch-vm + scratch-storage，约 140MB
 
 ```sh
 # 替身 VM 层（秒级）
-node test-content-ops.js     # 主套件：187 条断言（读/写/改/删/整理/定位/白名单/观察者/运行控制/回传瘦身/背包导出与对拍）
+node test-content-ops.js     # 主套件：280 条断言（读/写/改/删/整理/定位/白名单/观察者/运行控制/回传瘦身/背包导出与对拍/输入名校验/自动布局/子树读）
+node test-blank-project.mjs   # 空白作品生成器：13 条（zip/md5 + 真 scratch-vm 装载 + 两个 skin）
 node test-vm-pipeline.js     # scratch-vm 管线冒烟：只打日志，没有断言（退出码恒为 0）
 
 # 真机层（分钟级，需要浏览器 + 网络）

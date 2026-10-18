@@ -62,6 +62,8 @@
   // （问题记录 P1-5）。要看列表就显式 includeLists: true，且只回长度/首个变化位/样本。
   const watchState = { timer: null, targetName: null, values: {}, queue: [], includeLists: false, maxQueue: 400 }
   const userEvents = [] // {type, blockId, opcode, at} 最近 20 条
+  // 上一次 state 的列表长度：用来给 pageListDelta（C2：列表是不是在泄漏，不该靠运气发现）
+  let stateLastLengths = null
 
   function watchTick() {
     // 轮询变量变化，推帧给插件侧。合并两层：Stage 全局变量 + 目标角色局部变量
@@ -389,6 +391,57 @@
   }
 
   /**
+   * 块数三种口径一次说清（B2）。真机踩过：同一个角色 plugin 报 2364、list_scripts 报 5657，
+   * AI 直接按 5657 判断体量、按它找热点，全错 —— 因为 5657 是 **Blockly 展开视图**
+   * （inline 字面量被物化成带合成 id 的影子块），2364 才是 project.json 里的真块数。
+   */
+  function blockCounts(blocks) {
+    let total = 0
+    let shadows = 0
+    for (const b of Object.values(blocks || {})) {
+      if (!b || typeof b !== 'object') continue
+      total++
+      if (b.shadow) shadows++
+    }
+    return { total, shadows, raw: total - shadows }
+  }
+
+  /**
+   * 从任意块出发收子树。和 collectIds 的区别：
+   *   - branchOnly：只往这几个输入里走（"只给我这个 if 的 true 分支"）
+   *   - maxDepth：只下钻 N 层（深脚本不想一次吞 1600 块）
+   * next 链**不算一层深度**（同一层顺序执行），影子块默认带上（不然字面量值都看不见）。
+   */
+  function collectIds2(blocks, rootId, opts) {
+    const o = opts || {}
+    const out = []
+    const seen = new Set()
+    const walk = (id, depth) => {
+      if (!id || seen.has(id)) return
+      const b = blocks[id]
+      if (!b) return
+      if (o.maxDepth !== null && o.maxDepth !== undefined && depth > o.maxDepth) return
+      seen.add(id)
+      out.push(id)
+      const inputs = b.inputs || {}
+      const names = o.branchOnly && o.branchOnly.length
+        ? Object.keys(inputs).filter(n => o.branchOnly.includes(n))
+        : Object.keys(inputs)
+      for (const name of names) {
+        const inp = inputs[name]
+        if (!inp) continue
+        if (inp.block) walk(inp.block, depth + 1)
+        if (inp.shadow && inp.shadow !== inp.block) walk(inp.shadow, depth + 1)
+      }
+      // next 链不算一层深度（同一层顺序执行）；但 depth:0 的含义是"只要这一个块"，
+      // 所以那种情况下连 next 也不跟（否则"只回 1 块"永远不成立）。
+      if (!o.branchOnly && b.next && o.maxDepth !== 0) walk(b.next, depth)
+    }
+    walk(rootId, 0)
+    return out
+  }
+
+  /**
    * 脚本索引：顶层块清单。
    * ⚠️ 关键区分：真脚本（帽子块打头）vs **游离块**（作者调试拖出来的孤立块）。
    * 真机实测某角色 185 个顶层块里约 150 个是游离块 —— 不区分的话"按块数排名"全是噪音。
@@ -397,6 +450,15 @@
   function scriptIndex(vm, t) {
     const blocks = t.blocks._blocks
     const hats = (vm.runtime && vm.runtime._hats) || {}
+    // 先数一遍 proccode → 被调用次数。C1 的教训：实测 38 个"游离块"里 32 个是
+    // procedures_definition（被 141 处 procedures_call 调用，是引擎主干）——
+    // 把它们标成"作者调试拖出来的垃圾"会让 AI 直接删掉作者的函数。
+    const callCount = Object.create(null)
+    for (const b of Object.values(blocks)) {
+      if (b && b.opcode === 'procedures_call' && b.mutation && b.mutation.proccode) {
+        callCount[b.mutation.proccode] = (callCount[b.mutation.proccode] || 0) + 1
+      }
+    }
     const out = []
     for (const id of topLevelIds(blocks)) {
       const b = blocks[id]
@@ -408,18 +470,35 @@
           if (!calls.includes(bb.mutation.proccode)) calls.push(bb.mutation.proccode)
         }
       }
-      out.push({
+      let kind = hats[b.opcode] ? 'script' : 'loose'
+      const entry = {
         blockId: id,
         opcode: b.opcode,
-        kind: hats[b.opcode] ? 'script' : 'loose',
+        kind,
         blockCount: ids.length,
         x: b.x, y: b.y,
         calls: calls.length ? calls : undefined
-      })
+      }
+      if (b.opcode === 'procedures_definition') {
+        // 自定义积木定义：单列一档，并报"被调用几次" + 参数原型 + 是否 warp
+        kind = 'definition'
+        entry.kind = kind
+        const protoRef = b.inputs && b.inputs.custom_block && b.inputs.custom_block.block
+        const proto = protoRef ? blocks[protoRef] : null
+        const mut = proto && proto.mutation
+        if (mut) {
+          entry.proccode = mut.proccode
+          try { entry.params = JSON.parse(mut.argumentnames || '[]') } catch { entry.params = undefined }
+          entry.warp = mut.warp === true || mut.warp === 'true' || undefined
+          entry.calledBy = callCount[mut.proccode] || 0
+        }
+      }
+      out.push(entry)
     }
-    // 真脚本在前（块数降序），游离块垫底（块数降序）
+    // 真脚本/定义在前（块数降序），游离块垫底（块数降序）
     out.sort((a, b2) => {
-      if (a.kind !== b2.kind) return a.kind === 'script' ? -1 : 1
+      const real = (s) => s.kind !== 'loose'
+      if (real(a) !== real(b2)) return real(a) ? -1 : 1
       return b2.blockCount - a.blockCount
     })
     return out
@@ -433,6 +512,409 @@
       if (proto && proto.mutation && proto.mutation.proccode) return proto.mutation.proccode
     }
     return undefined
+  }
+
+  // ==================== opcode 形状表（G3：拼错的输入名会被**静默**丢掉） ====================
+  // 为什么非要有这张表：注入走的是块模型（Blocks.createBlock），不经过 Blockly 的校验，
+  // 所以给 operator_add 塞一个 OPERAND1 **不会报任何错** —— 工作区里甚至显示正常，
+  // 但运行时那个输入恒为空，算术按 0 算。实测这一条把人带偏了 8~10 轮
+  // （先怀疑变量、再怀疑编译器、再怀疑存盘，最后才发现是 input 名写错）。
+  // 表里没有的 opcode（扩展 / 冷门块）依次用 Blockly 块定义、项目里已有的同类块兜底；
+  // 都兜不到就标 unverified，**不冤枉**。
+  // 值输入（NUM1/OPERAND1/MESSAGE…）都在这里；SUBSTACK 是语句输入，也一起列进去。
+  const INPUTS_BY_OPCODE = {
+    // 运动
+    motion_movesteps: ['STEPS'], motion_turnright: ['DEGREES'], motion_turnleft: ['DEGREES'],
+    motion_goto: ['TO'], motion_gotoxy: ['X', 'Y'], motion_glideto: ['SECS', 'TO'],
+    motion_glidesecstoxy: ['SECS', 'X', 'Y'], motion_pointindirection: ['DIRECTION'],
+    motion_pointtowards: ['TOWARDS'], motion_changexby: ['DX'], motion_setx: ['X'],
+    motion_changeyby: ['DY'], motion_sety: ['Y'],
+    // 外观
+    looks_say: ['MESSAGE'], looks_think: ['MESSAGE'], looks_sayforsecs: ['MESSAGE', 'SECS'],
+    looks_thinkforsecs: ['MESSAGE', 'SECS'], looks_switchcostumeto: ['COSTUME'],
+    looks_switchbackdropto: ['BACKDROP'], looks_switchbackdroptoandwait: ['BACKDROP'],
+    looks_changeeffectby: ['VALUE'], looks_seteffectto: ['VALUE'],
+    looks_changesizeby: ['CHANGE'], looks_setsizeto: ['SIZE'],
+    looks_goforwardbackward: ['NUM'],
+    // 声音
+    sound_playuntildone: ['SOUND_MENU'], sound_play: ['SOUND_MENU'],
+    sound_changeeffectby: ['VALUE'], sound_seteffectto: ['VALUE'],
+    sound_changevolumeby: ['VOLUME'], sound_setvolumeto: ['VOLUME'],
+    // 事件
+    event_whengreaterthan: ['VALUE'], event_broadcast: ['BROADCAST_INPUT'],
+    event_broadcastandwait: ['BROADCAST_INPUT'],
+    // 控制
+    control_wait: ['DURATION'], control_repeat: ['TIMES', 'SUBSTACK'],
+    control_forever: ['SUBSTACK'], control_if: ['CONDITION', 'SUBSTACK'],
+    control_if_else: ['CONDITION', 'SUBSTACK', 'SUBSTACK2'], control_wait_until: ['CONDITION'],
+    control_repeat_until: ['CONDITION', 'SUBSTACK'], control_while: ['CONDITION', 'SUBSTACK'],
+    control_for_each: ['VALUE', 'SUBSTACK'], control_create_clone_of: ['CLONE_OPTION'],
+    control_all_at_once: ['SUBSTACK'],
+    // 侦测
+    sensing_touchingobject: ['TOUCHINGOBJECTMENU'], sensing_touchingcolor: ['COLOR'],
+    sensing_coloristouchingcolor: ['COLOR', 'COLOR2'], sensing_distanceto: ['DISTANCETOMENU'],
+    sensing_askandwait: ['QUESTION'], sensing_keypressed: ['KEY_OPTION'],
+    sensing_of: ['OBJECT', 'PROPERTY'],
+    // 运算（G3 的重灾区：同一族三种命名）
+    operator_add: ['NUM1', 'NUM2'], operator_subtract: ['NUM1', 'NUM2'],
+    operator_multiply: ['NUM1', 'NUM2'], operator_divide: ['NUM1', 'NUM2'],
+    operator_mod: ['NUM1', 'NUM2'], operator_random: ['FROM', 'TO'],
+    operator_gt: ['OPERAND1', 'OPERAND2'], operator_lt: ['OPERAND1', 'OPERAND2'],
+    operator_equals: ['OPERAND1', 'OPERAND2'], operator_and: ['OPERAND1', 'OPERAND2'],
+    operator_or: ['OPERAND1', 'OPERAND2'], operator_not: ['OPERAND'],
+    operator_join: ['STRING1', 'STRING2'], operator_letter_of: ['LETTER', 'STRING'],
+    operator_length: ['STRING'], operator_contains: ['STRING1', 'STRING2'],
+    operator_round: ['NUM'], operator_mathop: ['NUM'],
+    // 数据
+    data_setvariableto: ['VALUE'], data_changevariableby: ['VALUE'],
+    data_addtolist: ['ITEM'], data_deleteoflist: ['INDEX'],
+    data_insertatlist: ['ITEM', 'INDEX'], data_replaceitemoflist: ['INDEX', 'ITEM'],
+    data_itemoflist: ['INDEX'], data_itemnumoflist: ['ITEM'],
+    data_listcontainsitem: ['ITEM'],
+    // 画笔（扩展）
+    pen_setPenColorToColor: ['COLOR'], pen_changePenColorParamBy: ['VALUE'],
+    pen_setPenColorParamTo: ['VALUE'], pen_setPenSizeTo: ['SIZE'], pen_changePenSizeBy: ['SIZE'],
+    // 音乐（扩展）
+    music_playDrumForBeats: ['DRUM', 'BEATS'], music_restForBeats: ['BEATS'],
+    music_playNoteForBeats: ['NOTE', 'BEATS'], music_setInstrument: ['INSTRUMENT'],
+    music_setTempo: ['TEMPO'], music_changeTempo: ['TEMPO'],
+    // 自制积木
+    argument_reporter_string_number: [], argument_reporter_boolean: [],
+    procedures_definition: ['custom_block']
+  }
+  // 只有这些 opcode 的字段名校验是可靠的（表里写了才校验；写漏了就不校验，宁可不报）
+  const FIELDS_BY_OPCODE = {
+    event_whenkeypressed: ['KEY_OPTION'], event_whenbroadcastreceived: ['BROADCAST_OPTION'],
+    event_whenbackdropswitchesto: ['BACKDROP'], event_whengreaterthan: ['WHENGREATERTHANMENU'],
+    looks_changeeffectby: ['EFFECT'], looks_seteffectto: ['EFFECT'],
+    looks_setrotationstyle: ['STYLE'], looks_gotofrontback: ['FRONT_BACK'],
+    looks_goforwardbackward: ['FORWARD_BACKWARD'], looks_costumenumbername: ['NUMBER_NAME'],
+    looks_backdropnumbername: ['NUMBER_NAME'],
+    sound_changeeffectby: ['EFFECT'], sound_seteffectto: ['EFFECT'],
+    data_setvariableto: ['VARIABLE'], data_changevariableby: ['VARIABLE'],
+    data_addtolist: ['LIST'], data_deleteoflist: ['LIST'], data_deletealloflist: ['LIST'],
+    data_insertatlist: ['LIST'], data_replaceitemoflist: ['LIST'], data_itemoflist: ['LIST'],
+    data_itemnumoflist: ['LIST'], data_lengthoflist: ['LIST'], data_listcontainsitem: ['LIST'],
+    control_for_each: ['VARIABLE'], operator_mathop: ['OPERATOR'],
+    sensing_current: ['CURRENTMENU'], sensing_setdragmode: ['DRAG_MODE'],
+    pen_changePenColorParamBy: ['COLOR_PARAM'], pen_setPenColorParamTo: ['COLOR_PARAM'],
+    argument_reporter_string_number: ['VALUE'], argument_reporter_boolean: ['VALUE']
+  }
+  // 同一族命名对照：拼错时直接把正确答案摆出来（AI 一次就能改对）
+  const INPUT_FAMILY_HINT = '算术 operator_add/subtract/multiply/divide/mod 用 NUM1/NUM2；'
+    + '比较 operator_gt/lt/equals 和逻辑 and/or 用 OPERAND1/OPERAND2；'
+    + '字符串 join/contains 用 STRING1/STRING2，letter_of 用 LETTER/STRING，random 用 FROM/TO'
+
+  const opcodeSpecCache = new Map()
+  /** 从 GUI 的 Blockly 块定义里现推输入名（扩展/冷门块的正路；拿不到就 null） */
+  function specFromBlockly(opcode) {
+    const B = window.ScratchBlocks || window.Blockly
+    if (!B || !B.Blocks || !B.Blocks[opcode] || typeof B.Workspace !== 'function') return null
+    let ws = null
+    try {
+      ws = new B.Workspace()
+      const b = ws.newBlock(opcode)
+      const inputs = []
+      for (const inp of (b.inputList || [])) {
+        // 值输入和语句输入都有 connection；只剩字段的行没有（那部分不是输入名）
+        if (inp && inp.name && inp.connection) inputs.push(inp.name)
+      }
+      return { inputs, fields: [], source: 'blockly' }
+    } catch {
+      return null
+    } finally {
+      try { if (ws) ws.dispose() } catch { /* headless workspace 释放失败无所谓 */ }
+    }
+  }
+  /** 项目里已经有一模一样的 opcode？直接看它的输入名（最贴近这个项目的方言） */
+  function specFromProject(vm, opcode) {
+    const seen = new Set()
+    for (const t of (vm.runtime.targets || [])) {
+      for (const b of Object.values(t.blocks._blocks)) {
+        if (!b || b.opcode !== opcode) continue
+        for (const name of Object.keys(b.inputs || {})) seen.add(name)
+      }
+      if (seen.size) return { inputs: [...seen], fields: [], source: 'project' }
+    }
+    return null
+  }
+  /** opcode → {inputs, fields, source}；procedures_call 的输入名是参数 id，静态推不出来，返回 null */
+  function opcodeSpec(vm, opcode) {
+    if (opcode === 'procedures_call') return null
+    if (opcodeSpecCache.has(opcode)) return opcodeSpecCache.get(opcode) || null
+    let spec = null
+    if (INPUTS_BY_OPCODE[opcode]) {
+      spec = { inputs: INPUTS_BY_OPCODE[opcode], fields: FIELDS_BY_OPCODE[opcode] || [], source: 'table' }
+    } else {
+      spec = specFromBlockly(opcode) || specFromProject(vm, opcode)
+      // 只有 Blockly 给的那份才把字段名也收进来（项目/表里字段信息不全，宁可不说）
+    }
+    opcodeSpecCache.set(opcode, spec || false)
+    return spec
+  }
+
+  /**
+   * 注入前校验输入/字段名。**默认硬失败**（lenient:true 才降级成警告）：
+   * 这条错误静默得太彻底，宁可让 AI 当场改，也不要它半小时后才发现算式全是 0。
+   * @returns {{errors: string[], warnings: string[], checked: number, unverified: number}}
+   */
+  function validatePayload(vm, dict, opts) {
+    const o = opts || {}
+    const errors = []
+    const warnings = []
+    let checked = 0
+    let unverified = 0
+    for (const [id, b] of Object.entries(dict || {})) {
+      if (Array.isArray(b) || !b || typeof b !== 'object' || typeof b.opcode !== 'string') continue
+      const spec = opcodeSpec(vm, b.opcode)
+      if (!spec) { unverified++; continue }
+      checked++
+      const inputs = b.inputs || {}
+      for (const name of Object.keys(inputs)) {
+        if (spec.inputs.includes(name)) continue
+        errors.push(`块 ${id}（${b.opcode}）没有输入 "${name}" —— 它的输入是 ${spec.inputs.join('、') || '（无）'}。`
+          + '拼错**不会报错**，运行时那个输入恒为空（算术按 0 算），症状就是「脚本在跑但结果一直是 0」')
+      }
+      const fields = b.fields || {}
+      for (const name of Object.keys(fields)) {
+        if (!spec.fields.length || spec.fields.includes(name)) continue
+        errors.push(`块 ${id}（${b.opcode}）没有字段 "${name}" —— 它是 ${spec.fields.join('、')}`
+          + '（字段是下拉框/变量选择，不是输入槽；写错同样静默无效）')
+      }
+      if (!o.skipMissingWarn) {
+        for (const name of spec.inputs) {
+          if (name in inputs) continue
+          if (/^SUBSTACK/.test(name)) continue // 空 C 块本来就允许没有 SUBSTACK
+          if (b.shadow) continue
+          warnings.push(`块 ${id}（${b.opcode}）少了输入 ${name} —— 会当空值/0 算`)
+        }
+      }
+    }
+    if (errors.length && o.lenient !== true) {
+      const head = errors.slice(0, 4).join('；')
+      throw new Error(
+        `${errors.length} 处输入/字段名写错了（这类错误不会报错，先在注入前拦下来）：${head}`
+        + (errors.length > 4 ? `；还有 ${errors.length - 4} 处` : '')
+        + `。\n提示：${INPUT_FAMILY_HINT}。\n`
+        + '确认写法是刻意试验（或扩展块拿不到形状表）就传 lenient:true 强行注入。'
+      )
+    }
+    return { errors, warnings, checked, unverified }
+  }
+
+  // ---------------- 布局：给新积木找个不叠的位置（G4） ----------------
+  // 实测坑：AI 按 240px 间距给了 (40,380)/(40,620)/(40,900)，但脚本真实渲染高度 600~1600px，
+  // 三者完全叠在一起；用户想把它们拖开时块黏在鼠标上，最后连带帽子丢了 41 块。
+  // 所以：没给坐标 → 按估算高度自己往下排；给了坐标但算下来会叠 → 也重排（layout:"given" 可关）。
+  const LAYOUT_COL_W = 480
+  const LAYOUT_ROW_GAP = 80
+  const LAYOUT_PAGE_H = 1400
+  const BLOCK_PX = 48
+
+  /** 估算一段 sb3 形态脚本的高度（注入前只有 sb3 dict，拿不到活块） */
+  function estStackHeightSb3(dict, rootId) {
+    let rows = 0
+    const seen = new Set()
+    const walk = (id) => {
+      const b = dict[id]
+      if (!b || Array.isArray(b) || seen.has(id) || rows > 400) return
+      seen.add(id)
+      rows++
+      for (const desc of Object.values(b.inputs || {})) {
+        if (!Array.isArray(desc)) continue
+        // [1, 字面量] 是内联值，不占行；[2, 块id] / [3, 块id, 默认值] 的第一个才是积木
+        const child = desc[0] === 1 ? null : desc[1]
+        if (typeof child === 'string' && dict[child]) walk(child)
+      }
+      if (typeof b.next === 'string') walk(b.next)
+    }
+    walk(rootId)
+    return Math.max(rows * BLOCK_PX + 40, 120)
+  }
+
+  /** 估算一段活块脚本（顶层块 + 它下面全部嵌套/next）渲染出来多高（像素） */
+  function estStackHeight(blocks, rootId) {
+    let rows = 0
+    const seen = new Set()
+    const walk = (bid) => {
+      const b = blocks[bid]
+      if (!b || seen.has(bid) || rows > 400) return
+      seen.add(bid)
+      rows++
+      for (const inp of Object.values(b.inputs || {})) {
+        if (inp && inp.block && inp.block !== inp.shadow) walk(inp.block)
+      }
+      if (b.next) walk(b.next)
+    }
+    walk(rootId)
+    return Math.max(rows * BLOCK_PX + 40, 120)
+  }
+
+  /** 当前角色里已占用的最右 / 最下边界（用来把新脚本放到它们右边，不压住作者的东西） */
+  function workspaceExtent(blocks) {
+    let maxRight = 0
+    let minTop = 48
+    let any = false
+    for (const id of topLevelIds(blocks)) {
+      const b = blocks[id]
+      if (!Number.isFinite(b.x) || !Number.isFinite(b.y)) continue
+      any = true
+      maxRight = Math.max(maxRight, b.x)
+      minTop = Math.min(minTop, b.y)
+    }
+    return any ? { maxRight, minTop } : null
+  }
+
+  /**
+   * 给「这次要注入的顶层块」算坐标。
+   * @param {object} dict  sb3 blocks dict（AI 给的）
+   * @param {string[]} rootIds 顶层块 id（旧 id）
+   * @param {object} blocks 目标角色现有块（算占用边界用）
+   * @param {'smart'|'auto'|'given'} mode
+   *   smart（缺省）：坐标**都给全了**就尊重（背包 load 给 40,40 就落 40,40），
+   *                  缺一个就整批自动排（别一半叠一半不叠）
+   *   auto：一律自动排（无视给的坐标）
+   *   given：一律尊重（只报告重叠）
+   */
+  function planLayout(dict, rootIds, blocks, mode) {
+    const extent = workspaceExtent(blocks)
+    const given = rootIds.filter(id => {
+      const b = dict[id]
+      return Number.isFinite(b && b.x) && Number.isFinite(b && b.y)
+    })
+    const allGiven = rootIds.length > 0 && given.length === rootIds.length
+    const effective = mode === 'given' ? 'given' : (mode === 'auto' ? 'auto' : (allGiven ? 'given' : 'auto'))
+    if (effective === 'given') {
+      // 就算尊重坐标，也检查一下"按估算高度会不会叠"—— 叠了就报出来，让调用方知道
+      const sorted = given.slice().sort((a, b2) => (dict[a].x - dict[b2].x) || (dict[a].y - dict[b2].y))
+      const overlap = []
+      for (let i = 0; i < sorted.length; i++) {
+        for (let j = i + 1; j < sorted.length; j++) {
+          const a = dict[sorted[i]]
+          const b2 = dict[sorted[j]]
+          if (Math.abs(a.x - b2.x) > LAYOUT_COL_W) continue
+          const ha = estStackHeightSb3(dict, sorted[i])
+          if (b2.y < a.y + ha) overlap.push([sorted[i], sorted[j]])
+        }
+      }
+      return { positions: null, overlap, mode: 'given' }
+    }
+    // auto：从现有内容的右边起一列，按估算高度往下排，超过一页高就换列
+    const x0 = extent ? extent.maxRight + LAYOUT_COL_W : 48
+    const y0 = 48
+    let x = x0
+    let y = y0
+    const positions = {}
+    const placed = []
+    for (const id of rootIds) {
+      const h = estStackHeightSb3(dict, id)
+      if (y + h > y0 + LAYOUT_PAGE_H && y > y0) { x += LAYOUT_COL_W; y = y0 }
+      positions[id] = { x, y }
+      placed.push({ id, x, y, estHeight: h })
+      y += h + LAYOUT_ROW_GAP
+    }
+    // auto 下也要检查 AI 显式给的坐标有没有叠（给了也照排，但要如实报）
+    const overlap = []
+    for (let i = 0; i < placed.length; i++) {
+      for (let j = i + 1; j < placed.length; j++) {
+        const a = placed[i]
+        const b2 = placed[j]
+        if (a.x === b2.x && b2.y < a.y + a.estHeight) overlap.push([a.id, b2.id])
+      }
+    }
+    return { positions, overlap, mode: 'auto', placed }
+  }
+
+  /** 滚到某个块并等高亮用：切到该角色 → 等 GUI 把块渲染出来 → 滚过去 */
+  async function followBlock(vm, t, blockId) {
+    if (!blockId) return null
+    const ws = getBlocklyWorkspace()
+    if (!ws) return null
+    if (vm.editingTarget && vm.editingTarget.id !== t.id) {
+      vm.setEditingTarget(t.id)
+      safeEmitWorkspaceUpdate(vm)
+      await sleepMs(120)
+    }
+    for (let i = 0; i < 8; i++) {
+      let has = false
+      try { has = !!ws.getBlockById(blockId) } catch { has = false }
+      if (has) return scrollToBlock(ws, blockId)
+      await sleepMs(150)
+    }
+    return null
+  }
+
+  // ---------------- 注入账本：谁是我塞进去的（F0：绝不自动清理） ----------------
+  // 旧行为（问题清单 F0）：AI 把作者的积木 move_block 挂到一个"刚注入、还游离"的块上，
+  // 下一次 add_blocks 之后**那个块连同作者的子树一起消失**（5664 → 5650，locate 报找不到）。
+  // 不管底层到底是谁删的（VM 的 createBlock 不会删、shareBlocksToTarget 也不会），
+  // 插件这边的承诺改成两条硬规则：
+  //   ① 永不自动清理任何块 —— 要清必须显式 discardStale:true，而且只清"整棵子树都是我注入的"；
+  //   ② 每次注入后对账：原来有的块少了就当场报 lost（数据丢失不能静默）。
+  // 账本按 targetId 记，执行器被重注入就清空（reload 后 id 本来也全变了）。
+  const injectedLedger = new Map() // targetId -> Map<blockId, {opcode, at}>
+  function ledgerOf(t) {
+    let m = injectedLedger.get(t.id)
+    if (!m) { m = new Map(); injectedLedger.set(t.id, m) }
+    return m
+  }
+  /** 之前注入、现在**仍是顶层**（= 没被 AI 拼进脚本，也没被用户拖走）的块 */
+  function staleInjected(t) {
+    const m = injectedLedger.get(t.id)
+    if (!m) return []
+    const out = []
+    for (const [id, info] of m) {
+      const b = t.blocks._blocks[id]
+      if (!b) { m.delete(id); continue } // 已经被删/被重开工程，账本跟着清
+      if (b.parent) continue // 已经接到别处去了，不算游离
+      out.push({ id, opcode: b.opcode, at: info.at })
+    }
+    return out
+  }
+  /** 显式清理游离块：只删"整棵子树都是自己注入的"，碰到作者积木就跳过 */
+  function discardStale(vm, t, stale) {
+    const tracked = new Set((injectedLedger.get(t.id) || new Map()).keys())
+    const deleted = []
+    const skipped = []
+    for (const s of stale) {
+      const sub = [...subtreeIds(t.blocks, s.id)]
+      if (sub.some(id => !tracked.has(id))) { skipped.push(s.id); continue } // 上面挂着作者的东西，不碰
+      try {
+        t.blocks.deleteBlock(s.id)
+        deleted.push(s.id)
+        const m = injectedLedger.get(t.id)
+        if (m) for (const id of sub) m.delete(id)
+      } catch { skipped.push(s.id) }
+    }
+    if (deleted.length) {
+      t.blocks.emitProjectChanged()
+      safeEmitWorkspaceUpdate(vm)
+    }
+    return { deleted, skipped }
+  }
+
+  // ---------------- 把视口带过去（F1：用户当场看不到改了啥） ----------------
+  /** 滚到某个块（只看得到、不改数据）。返回实际走的 API，全失败给 null */
+  function scrollToBlock(ws, blockId) {
+    if (!ws || !blockId) return null
+    let block = null
+    try { block = ws.getBlockById(blockId) } catch { block = null }
+    try {
+      if (typeof ws.centerOnBlock === 'function') { ws.centerOnBlock(blockId); return 'centerOnBlock' }
+      if (!block) return null
+      const xy = block.getRelativeToSurfaceXY()
+      if (typeof ws.scrollBounds === 'function') {
+        ws.scrollBounds(xy.x, xy.y, xy.x + 200, xy.y + 80)
+        return 'scrollBounds'
+      }
+      if (typeof ws.scroll === 'function') {
+        const m = typeof ws.getMetrics === 'function' ? ws.getMetrics() : null
+        const s = ws.scale || 1
+        ws.scroll(xy.x * s - (m ? m.viewWidth / 2 : 400), xy.y * s - (m ? m.viewHeight / 2 : 300))
+        return 'scroll'
+      }
+    } catch { /* 回落 null */ }
+    return null
   }
 
   /** 运行时快照（只读，全用 try 兜：不同 VM 版本字段有差异，别让工具整个炸掉） */
@@ -534,10 +1016,12 @@
 
   /**
    * 把 sb3 形态的 blocks dict 转成 shareBlocksToTarget 要的活块数组。
+   * @param {object} dict  sb3 blocks dict
+   * @param {object} [positions]  旧 id → {x, y}：顶层块该放哪（不传就用 dict 里的 x/y，再不行顺序下排）
    * @returns {{blocks: Array, index: Object, warnings: string[]}}
    *   index: AI 给的块 id → 它在 blocks 数组里的下标（用于反推注入后的新 id）
    */
-  function toLiveBlocks(dict) {
+  function toLiveBlocks(dict, positions) {
     const out = []
     const index = Object.create(null)
     const warnings = []
@@ -630,10 +1114,11 @@
       if (src.mutation) blk.mutation = src.mutation
       if (src.comment) blk.comment = src.comment
       if (blk.topLevel) {
-        // 没给坐标的顶层块自动往下排，免得全叠在 (0,0) 让用户找不到
-        const hasXY = Number.isFinite(src.x) && Number.isFinite(src.y)
-        blk.x = hasXY ? src.x : 48
-        blk.y = hasXY ? src.y : 48 + topLevelSeen * 150
+        // 坐标优先级：调用方排好的位置 > dict 里的 x/y > 顺序往下排（G4：别再叠成一堆）
+        const planned = positions && positions[oldId]
+        const hasXY = planned || (Number.isFinite(src.x) && Number.isFinite(src.y))
+        blk.x = planned ? planned.x : (hasXY ? src.x : 48)
+        blk.y = planned ? planned.y : (hasXY ? src.y : 48 + topLevelSeen * 150)
         if (!hasXY) topLevelSeen++
       }
       index[oldId] = push(blk) // 先占下标，再转换（转换会把影子块追加在这个块后面）
@@ -1009,13 +1494,62 @@
     blocks._deleteScript(id)
   }
 
+  /**
+   * 补建输入槽（F2）。真机踩过：move_block 把 repeat_until 的 CONDITION 里的块拔走后，
+   * 这个空槽在 sb3 序列化里会整条消失，再想接回去时 update_block / move_block 都报
+   * 「块 a% 没有输入 CONDITION（现有: SUBSTACK）」—— 于是这个 repeat_until 永久变成
+   * "没有条件"的死块，只能删掉重建。这里按**该 opcode 的合法输入名**当场补一个空槽。
+   */
+  function ensureInputSlot(vm, blocks, parentId, inputName) {
+    const p = blocks.getBlock(parentId)
+    if (!p) return null
+    if (p.inputs && p.inputs[inputName]) return p.inputs[inputName]
+    const spec = opcodeSpec(vm, p.opcode)
+    if (!spec || !spec.inputs.includes(inputName)) return null
+    p.inputs[inputName] = { name: inputName, block: null, shadow: null }
+    return p.inputs[inputName]
+  }
+
+  /** 同 opcode 的别的块上，这个输入用的什么影子块 → 拿来做模板（补空槽时别用错类型） */
+  function siblingShadowTemplate(vm, opcode, inputName) {
+    for (const target of (vm.runtime.targets || [])) {
+      const all = target.blocks._blocks
+      for (const b of Object.values(all)) {
+        if (!b || b.opcode !== opcode || !b.inputs) continue
+        const inp = b.inputs[inputName]
+        if (!inp) continue
+        const sid = inp.shadow || (inp.block && all[inp.block] && all[inp.block].shadow ? inp.block : null)
+        const s = sid ? all[sid] : null
+        if (s && s.shadow) return { opcode: s.opcode, fields: JSON.parse(JSON.stringify(s.fields || {})) }
+      }
+    }
+    return null
+  }
+
+  /** 造一个影子块（补空槽时连默认值一起补；没有模板就用空文本，视觉上无害） */
+  function makeShadowBlock(blocks, parentId, tpl) {
+    const id = `dshs${(++primSeq).toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    const fields = tpl ? tpl.fields : { TEXT: { name: 'TEXT', value: '' } }
+    blocks._blocks[id] = {
+      id, opcode: tpl ? tpl.opcode : 'text', next: null, parent: parentId,
+      shadow: true, topLevel: false, inputs: {}, fields
+    }
+    return id
+  }
+
   /** 把块塞进 parentId 的某个输入槽。原来挂着的块（不是影子）退回顶层，不删 */
-  function attachInput(blocks, id, parentId, inputName) {
+  function attachInput(vm, blocks, id, parentId, inputName, opts) {
     const p = blocks.getBlock(parentId)
     const b = blocks.getBlock(id)
     if (!p || !b) throw new Error(`接链失败：找不到块 ${!p ? parentId : id}`)
-    const input = p.inputs && p.inputs[inputName]
-    if (!input) throw new Error(`块 ${parentId} 没有输入 "${inputName}"（现有: ${Object.keys(p.inputs || {}).join(', ') || '无'}）`)
+    let input = p.inputs && p.inputs[inputName]
+    if (!input) {
+      if (opts && opts.createIfMissing) input = ensureInputSlot(vm, blocks, parentId, inputName)
+      if (!input) {
+        throw new Error(`块 ${parentId} 没有输入 "${inputName}"（现有: ${Object.keys(p.inputs || {}).join(', ') || '无'}）`
+          + '。要补建只有"这个 opcode 的合法输入名"才行（用 scratch_get_opcodes({ opcode }) 查）')
+      }
+    }
     const displaced = input.block && input.block !== input.shadow && input.block !== id ? input.block : null
     if (displaced) {
       const d = blocks.getBlock(displaced)
@@ -1033,7 +1567,7 @@
   }
 
   /** 断链/接链主体。返回一份"从哪来、到哪去、挤掉了谁"的报告 */
-  function moveBlockIn(vm, t, spec) {
+  async function moveBlockIn(vm, t, spec) {
     const blocks = t.blocks
     const id = String(spec.id || '')
     const mode = String(spec.mode || 'after')
@@ -1064,7 +1598,7 @@
         const parentId = dest.parent
         const wasInput = slot.input
         unlinkBlock(blocks, to) // 腾出槽位（它后面的链跟着它走）
-        if (wasInput) attachInput(blocks, id, parentId, wasInput)
+        if (wasInput) attachInput(vm, blocks, id, parentId, wasInput, { createIfMissing: true })
         else attachAfter(blocks, id, parentId)
         attachAfter(blocks, to, id)
         report.to = { parent: parentId, input: wasInput || null, before: to }
@@ -1076,7 +1610,7 @@
       if (!to) throw new Error('input 模式需要 toBlockId')
       if (!spec.input) throw new Error('input 模式需要 inputName（如 CONDITION / SUBSTACK / OPERAND1）')
       report.from = (unlinkBlock(blocks, id) || {}).from || null
-      const r = attachInput(blocks, id, to, spec.input)
+      const r = attachInput(vm, blocks, id, to, spec.input, { createIfMissing: true })
       report.displaced = r.displaced
       report.to = { parent: to, input: spec.input }
     } else {
@@ -1086,8 +1620,9 @@
     blocks.resetCache()
     blocks.emitProjectChanged()
     safeEmitWorkspaceUpdate(vm)
-    // 移动/接链后亮一下：让用户看见"这块被挪到这儿了"
+    // 移动/接链后亮一下 + 把视口带过去（F1：用户看着窗口，得能看见这块被挪到哪儿了）
     report.glowed = glowBlocks(vm, [id, to].filter(Boolean)) || undefined
+    if (spec.follow !== false) report.followed = (await followBlock(vm, t, id)) || undefined
     return report
   }
 
@@ -1154,11 +1689,16 @@
     switch (op) {
       case 'project_meta': {
         const pj = snapshotJson(vm)
+        const total = pj.targets.reduce((n, t) => n + countBlocksOf(t.blocks).real, 0)
         return {
-          title: document.title.replace(/ - TurboWarp$/, ''),
+          title: document.title.replace(/ - TurboWarp.*$/, ''),
           extensions: pj.extensions,
           // AI 写积木时要知道"现在光标在哪个角色上"（read_script 缺省也用它）
           editingTarget: vm.editingTarget ? vm.editingTarget.getName() : null,
+          // 口径（B2）：targets[].blockCount 是**文件里的真块数**（不含影子）；
+          // read_script / list_scripts 报的是**展开视图**（inline 字面量被物化成影子块）。
+          blockCount: total,
+          blockCountView: 'raw',
           targets: pj.targets.map(t => {
             const c = countBlocksOf(t.blocks)
             return {
@@ -1171,24 +1711,63 @@
         }
       }
       case 'snapshot': {
-        let pj = snapshotJson(vm)
-        if (args && args.target) pj = { targets: pj.targets.filter(t => t.name === args.target || t.isStage) }
-        return pj
+        // A2：以前不管多大都整份回（25MB 工程 → 1.8MB JSON），到工具层被**静默**截断，
+        // ok:true 依旧成立、数据其实没进来。现在自己先量：超预算就明确说「截断了」+ 给续读路，
+        // 而不是让调用方去 spill 文件里 grep。
+        const a = args || {}
+        const budget = Math.min(Math.max(Number(a.maxBytes) || 240000, 20000), 4000000)
+        const full = snapshotJson(vm)
+        const only = a.target ? full.targets.filter(t => t.name === a.target || t.isStage) : full.targets
+        const pj = { targets: only }
+        if (full.extensions) pj.extensions = full.extensions
+        for (const k of Object.keys(full)) {
+          if (k !== 'targets' && k !== 'extensions') pj[k] = full[k]
+        }
+        let bytes = 0
+        try { bytes = JSON.stringify(pj).length } catch { bytes = 0 }
+        if (bytes <= budget) return pj
+        // 超了：按 target 切一份"索引"，明确告诉调用方怎么接着拿
+        return {
+          truncated: true,
+          bytes,
+          maxBytes: budget,
+          targets: only.map(t => ({
+            name: t.name,
+            isStage: !!t.isStage,
+            blockCount: countBlocksOf(t.blocks).real,
+            blockCountWithShadows: countBlocksOf(t.blocks).withShadow,
+            variables: Object.keys(t.variables || {}).length,
+            lists: Object.keys(t.lists || {}).length,
+            costumes: (t.costumes || []).length,
+            sounds: (t.sounds || []).length
+          })),
+          howToContinue: 'snapshot 太大（整份 ' + Math.round(bytes / 1024) + 'KB > ' + Math.round(budget / 1024) + 'KB）。'
+            + '① 加 target:"角色名" 只拿一个角色，或 ② maxBytes:' + Math.max(budget * 4, 1000000) + ' 放宽（注意别把上下文撑爆），'
+            + '③ 读代码优先用 scratch_read_script / scratch_project_overview（它们按块/字节分页，不会静默丢数据）。',
+          hint: '别把这个 truncated 结果当完整项目用。'
+        }
       }
       case 'read_script': {
         // 瘦身版（问题记录 P2-2 / §15.4）：以前无论要什么，都回「全部块 + 全部变量」，
         // 真机踩过 Stage 26 个块却回 7.5MB（全是 variables 里的长列表）、按钮 475KB。
-        // 现在默认：只回块、不回变量、块数超上限要分页，并且**总是带脚本索引**（很小、最有用）。
+        // 现在默认：只回块、不回变量、块数/字节双上限、可翻页。
+        // 块数口径（B2）：这里的 blockCount 是**展开视图**（inline 字面量被物化成影子块），
+        // 和 project.json 里的真块数不是一个数 —— 两个都报，别再让人对不上账。
         const t = findTarget(vm, args && args.target)
         const a = args || {}
         const blocks = t.blocks._blocks
         const allIds = Object.keys(blocks)
+        const counts = blockCounts(blocks)
         const scripts = scriptIndex(vm, t).map(s => Object.assign(s, { label: scriptLabel(blocks, s) }))
-        const meta = {
+        const meta = a.meta === false ? {} : {
           target: t.getName(),
           isClone: !t.isOriginal,
-          blockCount: allIds.length,
+          blockCount: counts.total,
+          blockCountRaw: counts.raw,
+          shadowCount: counts.shadows || undefined,
+          blockCountView: 'expanded',
           scriptCount: scripts.filter(s => s.kind === 'script').length,
+          definitionCount: scripts.filter(s => s.kind === 'definition').length || undefined,
           looseCount: scripts.filter(s => s.kind === 'loose').length
         }
 
@@ -1209,14 +1788,19 @@
           })
         }
 
-        // 选块集合：单个脚本 > opcode 过滤 > 全部
+        // 选块集合：起点块 > opcode 过滤 > 全部。
+        // blockId（F3）：起点可以是**任意块**（不一定是顶层）—— 只回它这一棵；
+        // 配合 branch:"SUBSTACK" 只看那个分支、depth:N 只看前 N 层，就不必整段读。
+        const root = a.scriptId || a.blockId || a.topLevelBlockId
+        const branchOnly = Array.isArray(a.branch) ? a.branch.filter(Boolean)
+          : (typeof a.branch === 'string' && a.branch ? [a.branch] : null)
+        const maxDepth = Number.isFinite(Number(a.depth)) && Number(a.depth) >= 0 ? Number(a.depth) : null
         let ids
-        const root = a.scriptId || a.topLevelBlockId
         if (root) {
           if (!blocks[root]) {
-            throw new Error(`找不到脚本 ${root}（角色 "${t.getName()}" 里没有这个块 id；先用 summary:true 拿清单）`)
+            throw new Error(`找不到块 ${root}（角色 "${t.getName()}" 里没有这个 id；先用 summary:true / list_scripts 拿清单）`)
           }
-          ids = collectIds(blocks, root)
+          ids = collectIds2(blocks, root, { branchOnly, maxDepth })
         } else {
           ids = allIds
         }
@@ -1226,17 +1810,50 @@
           ids = ids.filter(id => blocks[id] && set.has(blocks[id].opcode))
         }
         const offset = Math.min(Math.max(Number(a.offset) || 0, 0), ids.length)
-        // 缺省上限 1500 块：够读绝大多数角色，又不至于把上下文打爆
+        // 双上限：块数（缺省 1500）+ 字节（缺省 40KB）。以前只有块数，
+        // 结果 354 块的脚本也回 100KB —— 到工具层就被静默截断了（A2），等于白读。
         const limit = Math.min(Math.max(Number(a.limit) || 1500, 1), 20000)
-        const page = ids.slice(offset, offset + limit)
+        const budget = Math.min(Math.max(Number(a.maxBytes) || 40000, 2000), 400000)
+        const page = []
+        let bytes = 0
+        for (let i = offset; i < ids.length && page.length < limit; i++) {
+          const b = blocks[ids[i]]
+          if (!b) continue
+          let len = 0
+          try { len = JSON.stringify(b).length + 20 } catch { len = 200 }
+          if (page.length && bytes + len > budget) break
+          page.push(ids[i])
+          bytes += len
+        }
         const out = Object.assign(meta, {
           returned: page.length,
           filteredCount: ids.length,
           offset: offset || undefined,
+          bytes: bytes || undefined,
+          maxBytes: budget,
           hasMore: offset + page.length < ids.length || undefined,
+          nextOffset: offset + page.length < ids.length ? offset + page.length : undefined,
+          truncated: offset + page.length < ids.length || undefined,
           blocks: {}
         })
         for (const id of page) out.blocks[id] = blocks[id]
+        if (root) {
+          // 这块在哪、上面是谁（F3：插完想确认位置，不该整段读一遍）
+          const chain = []
+          let cur = blocks[root] && blocks[root].parent
+          let guard = 0
+          while (cur && blocks[cur] && guard++ < 12) {
+            chain.push({ id: cur, opcode: blocks[cur].opcode })
+            cur = blocks[cur].parent
+          }
+          const slot = (() => {
+            const b = blocks[root]
+            if (!b || !b.parent) return null
+            const s = blockSlot(t.blocks, b.parent, root)
+            return s ? (s.input || 'next') : null
+          })()
+          out.context = { root, opcode: blocks[root].opcode, slot, ancestors: chain.length ? chain : undefined }
+        }
         // 变量默认不回（这是 7.5MB 的元凶）；要就显式 includeVariables: true
         if (a.includeVariables === true) {
           const vs = varSummary(t, { includeLists: a.includeLists === true, listLimit: a.listLimit })
@@ -1248,9 +1865,10 @@
           if (vs.listLengths) out.listNames = vs.listLengths
           out.variablesOmitted = true
         }
-        if (!root && !opFilters) out.scripts = scripts.slice(0, Number(a.scriptLimit) || 60)
+        if (!root && !opFilters && a.meta !== false) out.scripts = scripts.slice(0, Number(a.scriptLimit) || 60)
         if (out.hasMore) {
-          out.hint = `只回了 ${page.length}/${ids.length} 块（offset=${offset}）。用 offset 翻页、或 scriptId/opcodes 收窄。`
+          out.hint = `只回了 ${page.length}/${ids.length} 块（约 ${bytes} 字节，上限 ${budget}；offset=${offset}）。`
+            + `继续读传 offset:${offset + page.length}，或用 scriptId/blockId/opcodes/depth 收窄。`
         }
         return out
       }
@@ -1264,14 +1882,41 @@
         const input = args.blocks
         if (!input || typeof input !== 'object') throw new Error('blocks 必填（sb3 blocks dict）')
         if (Array.isArray(input)) throw new Error('blocks 要传 sb3 dict（{id: 块对象}），不是数组')
-        // 变量引用先落地（AI 手写的空 id、背包跨角色搬来的旧 id，都在这儿被接上或补建）
+
+        // ① 形状校验（G3）：拼错的 input 名/字段名**默认直接拦下来**。
+        //    这类错误不报错、不警告，只在运行时表现为"算式恒为 0" —— 必须提前拦。
+        const shape = validatePayload(vm, input, { lenient: args.lenient === true })
+
+        // ② 变量引用先落地（AI 手写的空 id、背包跨角色搬来的旧 id，都在这儿被接上或补建）
         const refs = resolveRefs(vm, t, input, args.variables)
-        const { blocks: liveBlocks, index, warnings } = toLiveBlocks(input)
+
+        // ③ 布局（G4）：先算顶层块坐标，别让它们叠成一坨（用户想拖开时块黏手，容易连带丢块）
+        const roots = Object.keys(input).filter(id => {
+          const b = input[id]
+          return b && !Array.isArray(b) && !b.shadow && !b.parent
+        })
+        const layoutMode = args.layout === 'given' ? 'given' : (args.layout === 'auto' ? 'auto' : 'smart')
+        const lay = planLayout(input, roots, t.blocks._blocks, layoutMode)
+
+        // ④ 上一轮注入仍游离的块：**只报告，永不自动删**（F0）
+        const stale = staleInjected(t)
+        const discard = args.discardStale === true ? discardStale(vm, t, stale) : null
+        const staleLeft = args.discardStale === true ? staleInjected(t) : stale
+
+        const { blocks: liveBlocks, index, warnings } = toLiveBlocks(input, lay.positions)
         if (!liveBlocks.length) throw new Error('blocks 里没有可注入的块')
 
         const before = new Set(Object.keys(t.blocks._blocks))
+        const beforeOpcode = {}
+        for (const id of before) {
+          const b = t.blocks._blocks[id]
+          if (b) beforeOpcode[id] = b.opcode
+        }
         await vm.shareBlocksToTarget(liveBlocks, t.id)
         const newIds = Object.keys(t.blocks._blocks).filter(id => !before.has(id))
+        // ⑤ 只增不删自检（F0 的兜底）：注入绝不该让任何原有块消失。真消失了就当场喊，
+        //    别让 AI 过几轮才发现「作者的判定逻辑没了」（那次是 5664→5650，谁也说不清谁删的）。
+        const lost = [...before].filter(id => !t.blocks._blocks[id])
 
         // idMap：newBlockIds 按数组下标顺序换 id，createBlock 也按数组顺序插入 _blocks，
         // 所以 index[旧 id] 就是它在 newIds 里的位置。逐条用 opcode 自校验，错位就招供。
@@ -1289,11 +1934,26 @@
         } else {
           warnings.push(`注入后新增 ${newIds.length} 块，但送入 ${liveBlocks.length} 块，数量对不上`)
         }
+        // 记账：这些 id 是"我注入的"，下次 add_blocks 只用来报告游离状态，不删
+        {
+          const m = ledgerOf(t)
+          const at = new Date().toISOString()
+          for (const nid of newIds) {
+            const b = t.blocks._blocks[nid]
+            if (b) m.set(nid, { opcode: b.opcode, at })
+          }
+        }
 
         // 触发 GUI 刷新（用户实时看到新积木）
         safeEmitWorkspaceUpdate(vm)
         // 新积木亮一下（用户当场能看到"AI 刚往这儿塞了东西"）；影子块不发光，最多 8 块
         const glowed = glowBlocks(vm, newIds.filter(nid => t.blocks._blocks[nid] && !t.blocks._blocks[nid].shadow))
+        // ⑥ 把视口带过去（F1）：用户看着窗口也得能看见我往哪儿塞了东西。
+        //    排在 emitWorkspaceUpdate 之后 —— GUI 重建工作区是异步的，要先给它一点时间。
+        let followed = null
+        if (args.follow !== false) {
+          followed = await followBlock(vm, t, idMap && roots.length ? idMap[roots[0]] : null)
+        }
         return {
           added: newIds.length,
           inputBlocks: Object.keys(index).length,
@@ -1302,6 +1962,8 @@
           idMap,
           idMapReliable,
           glowed: glowed || undefined,
+          followed: followed || undefined,
+          layout: { mode: lay.mode, placed: lay.placed ? lay.placed.length : undefined, overlap: lay.overlap.length ? lay.overlap.slice(0, 5) : undefined },
           // 变量引用发生了什么（只在真动过时才出现，免得把小输出撑大）
           refs: (refs.created.length || refs.remapped.length)
             ? { created: refs.created.length ? refs.created : undefined, remapped: refs.remapped.length ? refs.remapped : undefined, kept: refs.kept }
@@ -1309,6 +1971,25 @@
           refsHint: refs.created.length
             ? `补建了 ${refs.created.length} 个变量/列表（内容已在 requires 里带上）：${refs.created.map(c => c.name).join('、')}`
             : (refs.remapped.length ? `有 ${refs.remapped.length} 个变量引用按名字改指向了目标角色里已有的同名变量` : undefined),
+          // 形状校验的结果：checked/unverified 是覆盖度，inputWarnings 是"少输入"这类提醒
+          shapeCheck: { checked: shape.checked, unverified: shape.unverified, errors: shape.errors.length || undefined },
+          inputWarnings: shape.warnings.length ? shape.warnings.slice(0, 6) : undefined,
+          staleInjected: staleLeft.length
+            ? {
+                count: staleLeft.length,
+                ids: staleLeft.slice(0, 8).map(s => s.id),
+                hint: '这些是之前注入、现在仍游离在顶层的块（不会被自动清理，也不会被自动删）。'
+                  + '想把它们收掉：scratch_add_blocks({ ... , discardStale: true })（只清"整棵子树都是 AI 注入的"）。'
+              }
+            : undefined,
+          discarded: discard ? { count: discard.deleted.length, ids: discard.deleted.slice(0, 8), skipped: discard.skipped.length || undefined, skippedWhy: discard.skipped.length ? '这些块上面挂着作者原有的积木，没敢删' : undefined } : undefined,
+          lost: lost.length
+            ? {
+                count: lost.length,
+                opcodes: [...new Set(lost.map(id => (beforeOpcode[id] || '?')))].slice(0, 8),
+                warning: '⚠️ 注入后**原有块消失了**（本操作只该新增）。先 scratch_rollback 回滚，再把这次的 blocks 报给开发者。'
+              }
+            : undefined,
           warnings: warnings.length ? warnings : undefined,
           hint: idMapReliable
             ? '后续引用新块请用 idMap 里的新 ID（shareBlocksToTarget 会全部换新 ID）'
@@ -1592,9 +2273,12 @@
 
         for (const [name, value] of Object.entries(changes.inputs || {})) {
           const target = blocks.getBlock(id)
-          const input = target.inputs[name]
+          // F2：空槽被 sb3 序列化丢掉后，按「该 opcode 的合法输入名」补建，不再逼人删块重建
+          const input = target.inputs[name] || ensureInputSlot(vm, blocks, id, name)
           if (!input) {
-            throw new Error(`块 ${id} 没有输入 "${name}"（现有: ${Object.keys(target.inputs).join(', ') || '无'}）`)
+            const spec = opcodeSpec(vm, target.opcode)
+            throw new Error(`块 ${id}（${target.opcode}）没有输入 "${name}"（现有: ${Object.keys(target.inputs).join(', ') || '无'}）`
+              + (spec ? `。这个积木的输入是 ${spec.inputs.join('、')}` : '。用 scratch_get_opcodes({ opcode }) 查它有哪些输入'))
           }
           // 字面量可能是 [1,[10,'x']]（带遮挡标志）或直接给值
           const desc = Array.isArray(value) && (value[0] === 1 || value[0] === 2 || value[0] === 3) ? value[1] : value
@@ -1607,7 +2291,7 @@
             )
           }
 
-          // 分支 1：接上一个已存在的块（sb3 形态 [1, '块id']）
+          // 分支 1：接上一个已存在的块（sb3 形态 [1, '块 id']）
           if (typeof desc === 'string' && blocks.getBlock(desc)) {
             const child = blocks.getBlock(desc)
             if (child.id === id) throw new Error(`输入 ${name} 不能接自己`)
@@ -1619,10 +2303,15 @@
           }
 
           // 分支 2：写字面量 → 改影子块的 field
-          const shadowId = input.shadow || input.block
-          const shadow = shadowId ? blocks.getBlock(shadowId) : null
+          let shadowId = input.shadow || input.block
+          let shadow = shadowId ? blocks.getBlock(shadowId) : null
           if (!shadow) {
-            throw new Error(`输入 ${name} 没有影子块，无法写值（现有形态: ${JSON.stringify(input)}）`)
+            // F2 续：槽是新的/空的，连默认影子块都没有 —— 按同 opcode 的别的块补一个同类型影子
+            shadowId = makeShadowBlock(blocks, id, siblingShadowTemplate(vm, target.opcode, name))
+            shadow = blocks.getBlock(shadowId)
+            input.block = shadowId
+            input.shadow = shadowId
+            notes.push(`输入 ${name} 原来没有影子块（空槽），补了一个 ${shadow.opcode} 默认值`)
           }
           const fieldNames = Object.keys(shadow.fields || {})
           if (fieldNames.length !== 1) {
@@ -1656,11 +2345,14 @@
         blocks.emitProjectChanged()
         safeEmitWorkspaceUpdate(vm)
         const glowed = glowBlocks(vm, [id])
+        // F1：改完把视口带到这个块上（用户看得见"AI 改了这儿"）
+        const followed = args.follow !== false ? await followBlock(vm, t, id) : null
         const after = blocks.getBlock(id)
         return {
           updated: id,
           applied,
           glowed: glowed || undefined,
+          followed: followed || undefined,
           notes: notes.length ? notes : undefined,
           block: { opcode: after.opcode, x: after.x, y: after.y }
         }
@@ -1728,11 +2420,12 @@
         // 那条路已经处理好了变量落地和 id 换新，别在这里再造一套。
         const t = findTarget(vm, args && args.target)
         if (!args || !args.blockId) throw new Error('blockId 不能为空')
-        return moveBlockIn(vm, t, {
+        return await moveBlockIn(vm, t, {
           id: args.blockId,
           mode: args.mode,
           to: args.toBlockId,
-          input: args.inputName
+          input: args.inputName,
+          follow: args.follow
         })
       }
 
@@ -1865,7 +2558,40 @@
           return { action: 'rename', kind, id: hit.variable.id, scope: hit.owner.isStage ? 'global' : 'local', from, to: hit.variable.name }
         }
 
-        throw new Error(`未知 action "${action}"（set / create / delete / rename）`)
+        // G7：只想确认"第 328 项是 0 还是 1"，不该被迫整份拉两条列表。
+        // 下标照 Scratch 的 **1-based** 习惯（这是 H1 那个坑：0/越界会静默返回空串）。
+        if (action === 'get') {
+          if (!hit) throw notFound()
+          const raw = hit.variable.value
+          const base = {
+            action: 'get',
+            kind,
+            name: hit.variable.name,
+            id: hit.variable.id,
+            scope: hit.owner.isStage ? 'global' : 'local'
+          }
+          if (kind !== 'list') return Object.assign(base, { value: clipScalar(raw) })
+          const arr = Array.isArray(raw) ? raw : []
+          if (a.index !== undefined) {
+            const idx = Number(a.index)
+            if (!Number.isFinite(idx) || idx < 1 || idx > arr.length) {
+              throw new Error(`第 ${a.index} 项越界（列表「${hit.variable.name}」共 ${arr.length} 项）。`
+                + 'Scratch 列表从 1 开始；越界本身会静默返回空串，这里直接报错免得你误判成"值是空"')
+            }
+            return Object.assign(base, { index: idx, value: clipScalar(arr[idx - 1]), length: arr.length })
+          }
+          const from = Math.max(1, Number(a.from) || 1)
+          const count = Math.min(Math.max(Number(a.count) || 50, 1), 1000)
+          return Object.assign(base, {
+            from,
+            count: Math.min(count, Math.max(arr.length - from + 1, 0)),
+            length: arr.length,
+            values: arr.slice(from - 1, from - 1 + count).map(clipScalar),
+            truncated: from - 1 + count < arr.length || undefined
+          })
+        }
+
+        throw new Error(`未知 action "${action}"（set / get / create / delete / rename）`)
       }
 
       case 'costume': {
@@ -1917,6 +2643,30 @@
         }
 
         throw new Error(`未知 action "${action}"（rename / delete / set）`)
+      }
+
+      case 'rename_target': {
+        // G2：以前角色名改不了（只有 variable / costume 的 rename），只能手改 project.json。
+        // 走 VM 自己的 renameSprite：它会去重、并同步「碰到角色名」的积木字段（sensing_of 之类）。
+        const a = args || {}
+        const t = findTarget(vm, a.target)
+        const to = String(a.to || a.newName || '').trim()
+        if (!to) throw new Error('to 必填（新角色名）')
+        if (t.isStage) throw new Error('舞台不能改名（Scratch 里舞台名字固定，改了会破坏 sense/引用）')
+        if (!t.isOriginal) throw new Error('这是克隆体，没有独立的角色名；请对原始角色操作')
+        const from = t.getName()
+        if (from === to) return { from, to, unchanged: true }
+        if (typeof vm.renameSprite !== 'function') throw new Error('这个宿主没有 vm.renameSprite，改不了角色名')
+        vm.renameSprite(t.id, to)
+        const after = t.getName()
+        // GUI 的角色栏/工具箱都要刷（renameSprite 只 emitTargetsUpdate）
+        safeEmitWorkspaceUpdate(vm)
+        return {
+          from,
+          to: after,
+          deduped: after !== to || undefined,
+          hint: after !== to ? `目标里有同名角色，实际改成了「${after}」` : undefined
+        }
       }
 
       case 'tidy_blocks': {
@@ -1973,6 +2723,20 @@
           if (ops2.length) { byCategory[cat.id] = ops2; ops2.forEach(o => set.add(o)) }
         }
         const list = [...set].sort()
+        // 只问一个 opcode 时，直接把它的形状（输入名 / 字段名）给出来 —— G3 的正解入口：
+        // 写 add_blocks 之前先查一次，就不会把 OPERAND1 塞进 operator_add。
+        const ask = args && (args.opcode || args.opcodes)
+        const asked = Array.isArray(ask) ? ask.slice(0, 20) : (ask ? [String(ask)] : null)
+        if (asked) {
+          const schemas = {}
+          for (const op of asked) {
+            const spec = opcodeSpec(vm, op)
+            schemas[op] = spec
+              ? { inputs: spec.inputs, fields: spec.fields.length ? spec.fields : undefined, source: spec.source }
+              : { unknown: true, hint: op === 'procedures_call' ? 'procedures_call 的输入名是参数 id（来自 mutation.argumentids），不固定' : '没拿到形状表（扩展没加载 / 冷门块），注入时不校验输入名' }
+          }
+          return { asked: asked.length, schemas, familyHint: INPUT_FAMILY_HINT }
+        }
         return { count: list.length, opcodes: list, byCategory, hatBlocks: fromHats.sort() }
       }
 
@@ -2040,7 +2804,17 @@
       case 'run': {
         const action = (args && args.action) || 'greenflag'
         const rt = vm.runtime
-        const before = runtimeState(vm)
+        const a = args || {}
+        // D5：以前每次返回完整 before/after 状态转储（30+ 变量 + 38 个列表长度），
+        // 而调用方通常只要「线程/克隆数有没有动」。现在默认 brief，要看全量传 detail:true。
+        const brief = a.detail !== true
+        const snap = () => {
+          const s = runtimeState(vm, { includeLists: false })
+          return brief
+            ? { running: s.running, threads: s.threads, clones: s.clones || {}, stepMs: s.stepMs }
+            : s
+        }
+        const before = snap()
         if (action === 'greenflag') {
           vm.greenFlag()
           if (typeof vm.start === 'function') vm.start() // GUI 里通常在跑；headless/暂停时可自愈
@@ -2054,23 +2828,38 @@
           throw new Error(`未知 action ${action}（greenflag | stopall | start | stoploop）`)
         }
         // 让绿旗线程真的跑起来几帧，用户才看得到变化（也给调用方一个稳定的读数）
-        const wait = Math.min(Math.max(Number(args && args.waitMs) || 300, 0), 5000)
+        const wait = Math.min(Math.max(Number(a.waitMs) || 300, 0), 5000)
         if (wait) await sleepMs(wait)
-        const after = runtimeState(vm)
+        const after = snap()
         return {
           action,
-          before: { running: before.running, threads: before.threads },
+          before,
           after,
+          // 变量真的动了几个：给"绿旗到底有没有跑起来"一个不看全量也能懂的读数
+          changedVars: (() => {
+            if (brief) return undefined
+            const b = before.pageVars || {}
+            const af = after.pageVars || {}
+            const out = {}
+            let n = 0
+            for (const k of Object.keys(af)) {
+              if (b[k] !== af[k]) { out[k] = af[k]; n++ }
+              if (n >= 20) break
+            }
+            return n ? out : undefined
+          })(),
           hint: action === 'greenflag' && !after.running
-            ? '绿旗点了，但没有任何线程在跑 —— 项目可能没有接绿旗的脚本，或者脚本第一帧就结束了（这种是正常现象）'
-            : undefined
+            ? '绿旗点了，但没有任何线程在跑 —— 项目可能没有接绿旗的脚本，或者脚本第一帧就结束了（这种是正常现象）。'
+              + '注意：running:true 只代表 VM 在跑，不代表界面在响应（窗口卡死时 VM 照样在跑，用 scratch_selftest 的帧心跳判断）。'
+            : '注意：running:true 只代表 VM 有活线程，不代表界面在响应；界面是否卡死看 scratch_selftest 的"帧心跳"'
         }
       }
 
       case 'state': {
+        const a = args || {}
         const st = runtimeState(vm, {
-          targetName: args && args.target,
-          includeLists: !!(args && args.includeLists === true)
+          targetName: a.target,
+          includeLists: !!a.includeLists === true
         })
         // 顺手把"点绿旗之后到底有没有在动"这件事说清楚：线程清单比单个布尔值有用
         const rt = vm.runtime
@@ -2084,6 +2873,37 @@
             stackDepth: th.stack && th.stack.length
           }))
         if (threads.length) st.activeThreads = threads
+        // C2：列表只报长度，想知道"是不是泄漏了"只能靠运气（那次是从两次 run 的 before/after 里偶然看出来
+        // 4358→4379 的）。这里直接和上一次 state 比，给 lengthDelta。
+        const lenNow = st.pageLists || {}
+        if (stateLastLengths && Object.keys(lenNow).length) {
+          const delta = {}
+          for (const [k, v] of Object.entries(lenNow)) {
+            const prev = stateLastLengths[k]
+            if (typeof prev === 'number' && prev !== v) delta[k] = v - prev
+          }
+          if (Object.keys(delta).length) st.pageListDelta = delta
+        }
+        if (Object.keys(lenNow).length) stateLastLengths = Object.assign({}, lenNow)
+        // G7：想确认 520 项里第 328 项是 0 还是 1，以前只能整份拉（两条列表 ≈ 6KB）
+        if (a.listSlice && typeof a.listSlice === 'object') {
+          const name = a.listSlice.name
+          const from = Math.max(1, Number(a.listSlice.from) || 1) // Scratch 列表 1-based
+          const count = Math.min(Math.max(Number(a.listSlice.count) || 20, 1), 500)
+          const stage = rt.getTargetForStage()
+          const named = a.target ? (rt.targets || []).find(x => x.getName() === a.target) : null
+          const owner = [vm.editingTarget, named, stage].find(o => o && o.variables && Object.values(o.variables).some(v => v.name === name && (v.type === 'list' || Array.isArray(v.value))))
+          const v = owner && Object.values(owner.variables).find(x => x.name === name)
+          if (!v) throw new Error(`找不到列表「${name}」（可用于 state.listSlice 的列表见 pageLists）`)
+          const arr = Array.isArray(v.value) ? v.value : []
+          st.listSlice = {
+            name,
+            length: arr.length,
+            from,
+            // 下标照 Scratch 的 1-based 习惯来，省得 AI 自己减一（这是 H1 那个坑）
+            values: arr.slice(from - 1, from - 1 + count).map(clipScalar)
+          }
+        }
         return st
       }
 
@@ -2092,19 +2912,168 @@
         const blocks = t.blocks._blocks
         const all = scriptIndex(vm, t).map(s => Object.assign(s, { label: scriptLabel(blocks, s) }))
         const minBlocks = Number(args && args.minBlocks) || 0
-        const kind = (args && args.kind) || 'all' // all | script | loose
-        const list = all.filter(s => s.blockCount >= minBlocks && (kind === 'all' || s.kind === kind))
+        // kind：all | script（帽子打头）| definition（自定义积木定义）| loose（真·游离）| called（定义 + 被调用的）
+        const kind = (args && args.kind) || 'all'
+        const counts = blockCounts(blocks)
+        const pick = (s) => {
+          if (kind === 'all') return true
+          if (kind === 'called') return s.kind === 'definition' && s.calledBy > 0
+          return s.kind === kind
+        }
+        const list = all.filter(s => s.blockCount >= minBlocks && pick(s))
         const limit = Math.min(Math.max(Number(args && args.limit) || 100, 1), 500)
         return {
           target: t.getName(),
           isClone: !t.isOriginal,
-          blockCount: Object.keys(blocks).length,
+          // 口径（B2）：blockCount 是展开视图（含物化影子），blockCountRaw 才是 project.json 里的真块数
+          blockCount: counts.total,
+          blockCountRaw: counts.raw,
+          blockCountView: 'expanded',
           scriptCount: all.filter(s => s.kind === 'script').length,
+          definitionCount: all.filter(s => s.kind === 'definition').length,
           looseCount: all.filter(s => s.kind === 'loose').length,
           returned: Math.min(list.length, limit),
           scripts: list.slice(0, limit),
-          note: 'kind=script 是帽子块打头的真脚本；kind=loose 是作者拖出来的游离块（没有帽子、不会自己运行）。'
+          note: 'kind=script 是帽子块打头的真脚本；kind=definition 是**自定义积木定义**（calledBy 是被调用次数，'
+            + '这类是引擎主干、不是垃圾）；kind=loose 才是作者拖出来的真·游离块（没有帽子、不会自己运行）。'
             + '看某段脚本的块体：scratch_read_script({ scriptId: blockId })'
+        }
+      }
+
+      case 'project_overview': {
+        // D1：一次问清「整个项目长什么样」。以前要靠 N 次 list_scripts / read_script 拼，
+        // 每次都可能被截断 —— 实测把 AI 逼到自己解压 sb3、写了个 148 行的 dumper。
+        // 这里给的是**结构索引**（不是块体）：每个角色/舞台的 opcode 直方图、自定义积木清单
+        // （参数原型 / 是否 warp / 被调用几次）、调用关系、每段脚本一行摘要。
+        const a = args || {}
+        const topOpcodes = Math.min(Math.max(Number(a.topOpcodes) || 12, 1), 40)
+        const scriptsPerTarget = Math.min(Math.max(Number(a.scriptsPerTarget) || 12, 1), 200)
+        const only = typeof a.target === 'string' && a.target ? a.target : null
+        const all = (vm.runtime.targets || []).filter(t => t.isOriginal && (!only || t.getName() === only))
+        if (only && !all.length) throw new Error(`找不到角色 "${only}"`)
+        let extensions = null
+        try {
+          const em = vm.runtime.extensionManager
+          const loaded = em && em._loadedExtensions
+          if (loaded) extensions = typeof loaded.keys === 'function' ? [...loaded.keys()] : [...loaded]
+        } catch { /* 不同 VM 版本字段不同，拿不到就不报 */ }
+        const targets = all.map(t => {
+          const blocks = t.blocks._blocks
+          const counts = blockCounts(blocks)
+          const scripts = scriptIndex(vm, t).map(s => Object.assign(s, { label: scriptLabel(blocks, s) }))
+          const hist = {}
+          for (const b of Object.values(blocks)) {
+            if (!b || b.shadow) continue
+            hist[b.opcode] = (hist[b.opcode] || 0) + 1
+          }
+          const opcodes = Object.entries(hist).sort((x, y) => y[1] - x[1]).slice(0, topOpcodes)
+          const definitions = scripts.filter(s => s.kind === 'definition')
+          const oneLine = (s) => ({
+            id: s.blockId,
+            kind: s.kind,
+            name: s.label || s.opcode,
+            blocks: s.blockCount,
+            at: [s.x, s.y],
+            calls: s.calls && s.calls.length ? s.calls.slice(0, 6) : undefined,
+            calledBy: s.kind === 'definition' ? s.calledBy : undefined,
+            warp: s.kind === 'definition' ? s.warp : undefined
+          })
+          return {
+            name: t.getName(),
+            isStage: t.isStage,
+            blockCount: counts.total,
+            blockCountRaw: counts.raw,
+            shadowCount: counts.shadows || undefined,
+            scripts: scripts.filter(s => s.kind === 'script').length,
+            definitions: definitions.length,
+            loose: scripts.filter(s => s.kind === 'loose').length,
+            opcodes: Object.fromEntries(opcodes),
+            customBlocks: definitions.map(s => ({ proccode: s.proccode, params: s.params, warp: s.warp, calledBy: s.calledBy, scriptId: s.blockId })),
+            // 未定义就被调用 / 定义了没人调用 —— 结构性问题的两个典型信号
+            unusedDefinitions: definitions.filter(s => !s.calledBy).map(s => s.proccode).filter(Boolean).slice(0, 10),
+            headScripts: scripts.filter(s => s.kind !== 'loose').slice(0, scriptsPerTarget).map(oneLine),
+            looseHeads: scripts.filter(s => s.kind === 'loose').slice(0, 10).map(oneLine)
+          }
+        })
+        return {
+          title: docTitle(),
+          editingTarget: vm.editingTarget ? vm.editingTarget.getName() : null,
+          extensions: extensions || undefined,
+          blockCountView: 'expanded',
+          blockCount: targets.reduce((n, t) => n + t.blockCount, 0),
+          blockCountRaw: targets.reduce((n, t) => n + t.blockCountRaw, 0),
+          targets,
+          hint: '要看某段脚本的块体：scratch_read_script({ scriptId })；只看某个分支：read_script({ blockId, branch:"SUBSTACK", depth:2 })；'
+            + '单块上下文：scratch_inspect({ blockId })'
+        }
+      }
+
+      case 'inspect': {
+        // F3：插完一块想确认"它落在哪、上面是谁、输入槽都接了什么"——
+        // 以前只能整段读（354 块 / 100KB）或整份 snapshot（1.8MB），代价高到不可能做验证。
+        const t = findTarget(vm, args && args.target)
+        const blocks = t.blocks
+        const id = args && args.blockId
+        if (!id) throw new Error('blockId 必填')
+        const b = blocks.getBlock(id)
+        if (!b) throw new Error(`找不到块 ${id}（角色 "${t.getName()}"；先用 list_scripts / read_script summary 拿真实 id）`)
+        const desc = (bid) => {
+          if (!bid) return null
+          const x = blocks.getBlock(bid)
+          if (!x) return { id: bid, missing: true }
+          return { id: bid, opcode: x.opcode, shadow: !!x.shadow }
+        }
+        // 内联字面量的值藏在小影子块的字段里 —— 直接给出来，省得 AI 再读一遍
+        const literalOf = (bid) => {
+          const x = bid ? blocks.getBlock(bid) : null
+          if (!x || !x.shadow) return undefined
+          const fs = x.fields || {}
+          const k = Object.keys(fs)[0]
+          return k ? fs[k].value : undefined
+        }
+        const inputs = {}
+        for (const [name, inp] of Object.entries(b.inputs || {})) {
+          inputs[name] = {
+            block: inp.block || null,
+            opcode: inp.block ? (blocks.getBlock(inp.block) || {}).opcode : undefined,
+            value: inp.block === inp.shadow || !inp.block ? literalOf(inp.block || inp.shadow) : undefined,
+            shadow: inp.shadow && inp.shadow !== inp.block ? inp.shadow : undefined
+          }
+        }
+        let slot = null
+        if (b.parent) {
+          const s = blockSlot(blocks, b.parent, id)
+          slot = s ? (s.input || 'next') : 'stale-parent'
+        }
+        // 往上找到这条脚本的帽子（顶层块），报告嵌套深度
+        let stackTop = id
+        let depth = 0
+        for (let cur = b.parent; cur && depth < 200; cur = (blocks.getBlock(cur) || {}).parent) {
+          stackTop = cur
+          depth++
+        }
+        const topBlock = blocks.getBlock(stackTop)
+        return {
+          target: t.getName(),
+          blockId: id,
+          opcode: b.opcode,
+          shadow: !!b.shadow,
+          topLevel: !b.parent,
+          position: { x: b.x, y: b.y },
+          fields: Object.fromEntries(Object.entries(b.fields || {}).map(([k, v]) => [k, { value: v.value, id: v.id }])),
+          inputs,
+          parent: b.parent ? { id: b.parent, opcode: (blocks.getBlock(b.parent) || {}).opcode, slot } : null,
+          next: b.next ? { id: b.next, opcode: (blocks.getBlock(b.next) || {}).opcode } : null,
+          // 谁指着我（next 链上前一个）—— 用 parent 反查不稳，直接扫一遍
+          previous: (() => {
+            if (!b.parent) return null
+            const p = blocks.getBlock(b.parent)
+            return p && p.next === id ? { id: p.id, opcode: p.opcode } : null
+          })(),
+          script: { topId: stackTop, topOpcode: topBlock ? topBlock.opcode : null, depth, isScript: !!(topBlock && ((vm.runtime._hats || {})[topBlock.opcode])) },
+          subtree: { blocks: collectIds(blocks._blocks, id).length },
+          mutation: b.mutation ? b.mutation : undefined,
+          hint: '改输入值用 scratch_update_block({ blockId, changes:{ inputs:{ 名字: 值 } } })，改字段用 changes.fields'
         }
       }
 
@@ -2155,29 +3124,57 @@
         const py = Math.round(180 - sy)
         const mouse = rt.ioDevices && rt.ioDevices.mouse
         if (!mouse) throw new Error('拿不到 runtime.ioDevices.mouse')
-        const threadsBefore = (rt.threads || []).length
+        const threadsBefore = (rt.threads || []).map(th => th.id)
+        const idsBefore = new Set(threadsBefore)
         const payload = { x: px, y: py, canvasWidth: 480, canvasHeight: 360, isDown: true }
+        // 先自己 pick 一下"这个坐标上到底有没有东西"（F4：以前 hatsStarted:0 但流程确实推进了，
+        // 分不清是"没命中"还是"命中了但这个角没有点击帽子"）。renderer 不存在时 pick 会抛，兜住。
+        const renderer = rt.renderer
+        let pickHit = null
+        let pickError = null
+        try {
+          if (renderer && typeof renderer.pick === 'function') {
+            const drawableID = renderer.pick(px, py)
+            if (drawableID !== null && drawableID !== undefined && drawableID >= 0) {
+              const hit = (rt.targets || []).find(x => x.drawableID === drawableID)
+              pickHit = hit
+                ? { target: hit.getName(), isClone: !hit.isOriginal, drawableID }
+                : { drawableID, target: null }
+            }
+          }
+        } catch (e) { pickError = e && e.message ? e.message : String(e) }
         // ⚠️ postData 在「没有 renderer.pick」的宿主里会抛（headless / 播放器页）。
         //    这种情况不该整个 op 失败 —— 记下原因，走下面的 hat 退化路。
-        let pickError = null
+        let postError = null
         try {
           mouse.postData(payload)
           await sleepMs(60)
           mouse.postData(Object.assign({}, payload, { isDown: false }))
           await sleepMs(120)
         } catch (e) {
-          pickError = e && e.message ? e.message : String(e)
+          postError = e && e.message ? e.message : String(e)
         }
-        let via = pickError ? 'pick-error' : 'pick'
-        let hats = (rt.threads || []).length - threadsBefore
-        if (hats <= 0 && target && a.forceHat !== false) {
+        const started = () => (rt.threads || [])
+          .filter(th => th && !idsBefore.has(th.id))
+          .map(th => ({
+            target: th.target && th.target.getName(),
+            opcode: (() => {
+              try { const b = th.target && th.target.blocks.getBlock(th.topBlock); return b ? b.opcode : null } catch { return null }
+            })()
+          }))
+        let via = postError ? 'pick-error' : (pickHit ? 'pick' : (renderer && typeof renderer.pick === 'function' ? 'pick-miss' : 'pick'))
+        let startedList = started()
+        if (!startedList.length && target && a.forceHat !== false) {
           // 退化路：直接按角色启动点击帽子（克隆体的点击也是这样触发的）
           try {
             const th = rt.startHats('event_whenthisspriteclicked', null, target)
-            hats = Array.isArray(th) ? th.length : (th ? 1 : 0)
+            const n = Array.isArray(th) ? th.length : (th ? 1 : 0)
             via = 'hat-fallback'
+            startedList = n ? started() : []
+            if (!startedList.length && n) startedList = [{ target: target.getName(), opcode: 'event_whenthisspriteclicked' }]
           } catch (e) { via = 'hat-error: ' + e.message }
         }
+        const aliveThreads = (rt.threads || []).filter(th => th.status !== 4).length
         return {
           clicked: target ? target.getName() : null,
           isClone: target ? !target.isOriginal : undefined,
@@ -2185,12 +3182,19 @@
           stageXY: { x: Math.round(sx), y: Math.round(sy) },
           canvasXY: { x: px, y: py },
           via,
-          hatsStarted: Math.max(hats, 0),
-          running: (rt.threads || []).some(th => th.status !== 4),
+          // pick 的结果：命中谁 / 什么都没命中 / pick 不可用，三种情况分开说
+          pick: pickHit || undefined,
+          pickMissed: !pickHit && !pickError && !postError ? true : undefined,
+          started: startedList.length ? startedList : undefined,
+          hatsStarted: startedList.length,
+          running: aliveThreads > 0,
+          threads: aliveThreads,
           hint: via === 'hat-fallback'
-            ? '没走 renderer.pick（无渲染/没点中），改成直接启动该角色的「当角色被点击」帽子。'
-              + (pickError ? ` pick 失败原因：${pickError}` : '')
-            : undefined
+            ? '没启动点击帽子（pick 没命中 / 这个角没有「当角色被点击」），改成直接启动该角色的点击帽子。'
+              + (postError ? ` postData 失败原因：${postError}` : '')
+            : (startedList.length === 0 && aliveThreads > 0
+                ? `这次点击没有启动新线程，但已有 ${aliveThreads} 条线程在跑 —— 流程可能是它们推进的（别据此判断点击失败）。`
+                : undefined)
         }
       }
 
@@ -2282,6 +3286,16 @@
         }
         const pct = (p) => (samples.length ? samples.slice().sort((x, y) => x - y)[Math.min(samples.length - 1, Math.floor((samples.length - 1) * p))] : null)
         const avg = samples.length ? samples.reduce((x, y) => x + y, 0) / samples.length : null
+        // D4：桌面版实测 stepMs 恒等 33.333（=30fps 的帧帽）—— 那只说明"被帧率卡住"，
+        // **看不出还有多少余量**。这里把帧帽和余量一起报，别再让 AI 把它当"刚好跑满"。
+        let frameCapMs = null
+        try {
+          const fr = vm.runtime.framerate
+          frameCapMs = typeof fr === 'number' && fr > 0 ? 1000 / fr : 1000 / 30
+        } catch { frameCapMs = 1000 / 30 }
+        let compiled = false
+        try { compiled = !!(vm.runtime.compilerOptions && vm.runtime.compilerOptions.enabled) } catch { compiled = false }
+        const atCap = avg !== null && frameCapMs !== null && avg >= frameCapMs * 0.97
         const out = {
           seconds: secs,
           samples: samples.length,
@@ -2290,8 +3304,16 @@
             p50: pct(0.5), p95: pct(0.95), max: samples.length ? Math.max(...samples) : null
           },
           fps: avg ? Number((1000 / avg).toFixed(1)) : null,
+          frameCapMs: frameCapMs !== null ? Number(frameCapMs.toFixed(2)) : undefined,
+          atFrameCap: atCap || undefined,
+          headroomMs: avg !== null && frameCapMs !== null ? Number((frameCapMs - avg).toFixed(2)) : undefined,
+          compiler: compiled,
           threadsPeak: threadPeak.n,
           note: 'stepMs = VM 每帧步进耗时（含所有脚本）。fps 由它反推；项目自己的 fps 变量常常是存档残留值，别信。'
+            + (atCap ? ' ⚠️ 这次 stepMs 已经顶到帧帽（' + (frameCapMs || 0).toFixed(1) + 'ms = '
+              + Math.round(1000 / (frameCapMs || 33.3)) + 'fps 上限）：说明帧时间被帧率闸住，'
+              + '**看不出还有多少余量**，只能做改前/改后对比。' : '')
+            + (compiled ? ' 编译器开着：块级热点拿不到，别把 100% 挂在帽子块上当成热点。' : '')
         }
         if (wantAttr) {
           const total = attr.base + attr.wait
@@ -2301,8 +3323,6 @@
           // blockGlowInFrame 也停在帽子上，runtime.profiler 是 null。
           // 所以这时只能给「哪条脚本的线程活着」，给不出块级热点。必须如实说 ——
           // 否则就会把 100% 挂在帽子上，冒充"热点是 event_whenflagclicked"。
-          let compiled = false
-          try { compiled = !!(vm.runtime.compilerOptions && vm.runtime.compilerOptions.enabled) } catch { compiled = false }
           if (compiled) {
             out.attribution = {
               compiled: true,

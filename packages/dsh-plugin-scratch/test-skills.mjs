@@ -26,7 +26,7 @@ let config
 try { mod.apply(fakeCtx, { safety: 'preview', bridgePort: 31999, maxSnapshots: 5, skillsEnabled: true }) } catch (e) { console.log('apply threw (expected if bridge binds):', e.message) }
 
 // ⚠️ 加了新工具就要改这个数（它是个防手滑的探针：少一个立刻红）
-t('33 个工具注册（31 功能 + skill 2 个）', registered.size === 33, String(registered.size) + ': ' + [...registered.keys()].join(','))
+t('38 个工具注册（36 功能 + skill 2 个）', registered.size === 38, String(registered.size) + ': ' + [...registered.keys()].join(','))
 t('scratch_skills 注册', registered.has('scratch_skills'))
 t('scratch_skill_edit 注册', registered.has('scratch_skill_edit'))
 
@@ -34,7 +34,7 @@ t('scratch_skill_edit 注册', registered.has('scratch_skill_edit'))
 const skillsTool = registered.get('scratch_skills')
 const editTool = registered.get('scratch_skill_edit')
 let r = await skillsTool.execute({ action: 'list' })
-t('list 返回 11 篇（10 正文+INDEX）', r.count === 11, 'count=' + r.count)
+t('list 返回 13 篇（12 正文+INDEX）', r.count === 13, 'count=' + r.count)
 t('list 每篇有标题摘要', r.skills.every(s => s.title && typeof s.on === 'boolean'))
 t('缺省全开', r.skills.every(s => s.on === true))
 const sb3 = r.skills.find(s => s.name === 'sb3-json-reference.md')

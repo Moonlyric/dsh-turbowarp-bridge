@@ -184,7 +184,7 @@ try {
   // ⚠️ Windows 上 import() 绝对路径必须转成 file:// URL，否则 "G:\..." 会被当成 g: 协议
   const mod = await import(pathToFileURL(join(ROOT, 'packages', 'dsh-plugin-scratch', 'index.js')).href)
   mod.apply(fakeCtx, { safety: 'preview', bridgePort: 31841, maxSnapshots: 3, skillsEnabled: false })
-  t('插件 apply 未抛错，注册了 33 个工具', registered.size === 33, '实际 ' + registered.size)
+  t('插件 apply 未抛错，注册了 38 个工具', registered.size === 38, '实际 ' + registered.size)
   const call = async (name, args) => {
     const tool = registered.get(name)
     if (!tool) throw new Error('没有工具 ' + name)
@@ -325,7 +325,7 @@ try {
   const clicked = await call('scratch_click', { target: workTarget })
   t('scratch_click 能点（返回点到了谁 + 换了画布坐标）',
     clicked.clicked === workTarget && Number.isFinite(clicked.canvasXY.x) && Number.isFinite(clicked.canvasXY.y), J(clicked, 220))
-  t('click 在真渲染器上优先走 pick（不是一上来就退化）', ['pick', 'hat-fallback'].includes(clicked.via), String(clicked.via))
+  t('click 在真渲染器上优先走 pick（不是一上来就退化）', ['pick', 'pick-miss', 'hat-fallback'].includes(clicked.via), String(clicked.via))
   const keyed = await call('scratch_press_key', { key: 'ArrowRight', holdMs: 40 })
   t('scratch_press_key ok', keyed.key === 'ArrowRight', J(keyed, 160))
 
@@ -711,6 +711,61 @@ try {
   const healProbe = await raw.evalJson(`({ bridge: typeof window.__dshBridge, targets: window.vm ? window.vm.runtime.targets.length : -1 })`)
   t('独立通道确认页面上执行器真的回来了', healProbe.bridge === 'object' && healProbe.targets >= 2, J(healProbe, 160))
 
+  step('6.8 v0.10.0：结构总览 / 单块上下文 / 子树读 / 截图裁剪 / 帧心跳 / 输入名校验（桌面版真机）')
+  const ov = await call('scratch_project_overview', {})
+  t('project_overview 给每角色 opcode 直方图 + 脚本一行摘要',
+    Array.isArray(ov.targets) && ov.targets.length >= 2 && !!ov.targets[0].opcodes &&
+    Array.isArray(ov.targets.find(x => x.name === workTarget).headScripts),
+    J(ov.targets && ov.targets.map(x => x.name), 120))
+  t('project_overview 把块数口径写清楚了（expanded + raw 两个都给）',
+    ov.blockCountView === 'expanded' && Number.isFinite(ov.blockCountRaw), J({ v: ov.blockCountView, raw: ov.blockCountRaw }))
+  const ls2 = await call('scratch_list_scripts', { target: workTarget })
+  const headScript = (ls2.scripts || []).find(s => s.kind !== 'loose')
+  t('list_scripts 报了三档（script/definition/loose）与 blockCountRaw',
+    Number.isFinite(ls2.definitionCount) && Number.isFinite(ls2.looseCount) && Number.isFinite(ls2.blockCountRaw),
+    J({ d: ls2.definitionCount, l: ls2.looseCount, raw: ls2.blockCountRaw }))
+  const ins = await call('scratch_inspect', { blockId: headScript.blockId })
+  t('inspect 给出 parent/next/inputs/所属脚本（不用整段读）',
+    ins.blockId === headScript.blockId && !!ins.inputs && !!ins.script && ins.script.topId === headScript.blockId,
+    J({ op: ins.opcode, script: ins.script }, 200))
+  const sub = await call('scratch_read_script', { target: workTarget, blockId: headScript.blockId, depth: 0 })
+  t('read_script({ blockId, depth:0 }) 只回 1 块（D2 按子树读）', sub.returned === 1, J({ n: sub.returned }))
+  // 注意：这一轮插件是 preview 档 —— 写操作先出 planId，真正落盘在 scratch_apply。
+  // G3 的校验发生在**落盘那一步**（executePlan → add_blocks），所以这里要走完 apply。
+  const badPlan = await call('scratch_add_blocks', {
+    target: workTarget,
+    blocks: { zz: { opcode: 'operator_add', inputs: { OPERAND1: [1, [4, '1']], OPERAND2: [1, [4, '2']] }, fields: {}, topLevel: true, parent: null, next: null } }
+  })
+  const badInject = await call('scratch_apply', { planId: badPlan.planId })
+    .then(r => r, e => ({ error: e.message }))
+  t('拼错输入名被当场拦下，并给出正确的 NUM1/NUM2（G3：以前静默丢弃、算式恒为 0）',
+    /NUM1/.test(String(badInject && badInject.error)) && /OPERAND1/.test(String(badInject && badInject.error)),
+    J(badInject && badInject.error, 200))
+
+  const shotFull = await call('scratch_screenshot', { path: join(OUT, 'shot-full.png') })
+  const shotStage = await call('scratch_screenshot', { path: join(OUT, 'shot-stage.png'), region: 'stage' })
+  t('region:"stage" 真的只截舞台（同格式下文件明显更小）',
+    shotStage.region === 'stage' && shotStage.bytes > 2000 && shotStage.bytes < shotFull.bytes,
+    `${shotFull.bytes} → ${shotStage.bytes}`)
+  t('截图回 frameHash（16 位十六进制）', /^[0-9a-f]{16}$/.test(String(shotStage.frameHash)), String(shotStage.frameHash))
+  const shotStage2 = await call('scratch_screenshot', { region: 'stage' })
+  t('同一画面连截两张 → sameAsPrev:true（帧心跳的原料）',
+    shotStage2.frameHash === shotStage.frameHash && shotStage2.sameAsPrev === true,
+    J({ a: shotStage.frameHash, b: shotStage2.frameHash, same: shotStage2.sameAsPrev }))
+  const self2 = await call('scratch_selftest', {})
+  const hb = (self2.checks || []).find(c => c.check === '帧心跳')
+  t('selftest 有「帧心跳」这一项，而且这次是绿的（画面静止 + VM 没在跑，属正常）',
+    !!hb && hb.ok === true, J(hb, 240))
+  const clk2 = await call('scratch_click', { target: workTarget })
+  t('click 回了 pick/pickMissed/started（分得清"没命中"和"命中了但没帽子"）',
+    ('pick' in clk2) || clk2.pickMissed === true || Array.isArray(clk2.started) || clk2.hatsStarted === 0,
+    J({ via: clk2.via, pick: clk2.pick, missed: clk2.pickMissed, started: clk2.started }, 200))
+  const briefRun = await call('scratch_run', { action: 'greenflag', waitMs: 250 })
+  t('run 默认 brief（不回完整状态转储，D5）',
+    !!(briefRun.before && briefRun.after) && briefRun.before.pageVars === undefined,
+    J(briefRun.before, 160))
+  await call('scratch_run', { action: 'stopall', waitMs: 120 })
+
   step('7. 存档 → 从磁盘装回来（真走一遍文件往返）')
   const outSb3 = join(OUT, 'desktop-roundtrip.sb3')
   const saved = await call('scratch_save_project', { path: outSb3 })
@@ -718,6 +773,15 @@ try {
   const buf = readFileSync(saved.savedTo)
   t('存出来的是合法 zip（PK 魔数）', buf[0] === 0x50 && buf[1] === 0x4b, buf.subarray(0, 2).toString('hex'))
   t('文件大小与回报一致', statSync(saved.savedTo).size === saved.bytes, `${statSync(saved.savedTo).size} vs ${saved.bytes}`)
+  // F5：存到**新路径**时 overwrote 必须是 false（以前 `overwrote: !renamed` 会谎报 true）
+  const newPath = join(OUT, `desktop-new-${Date.now()}.sb3`)
+  const savedNew = await call('scratch_save_project', { path: newPath })
+  t('存到此前不存在的路径：created=true / overwrote=false（F5 的语义）',
+    savedNew.created === true && savedNew.overwrote === false && existsSync(newPath),
+    J({ created: savedNew.created, overwrote: savedNew.overwrote }, 160))
+  const savedAgain = await call('scratch_save_project', { path: newPath, overwrite: true })
+  t('显式 overwrite:true 覆盖已存在文件时才 overwrote=true',
+    savedAgain.overwrote === true && savedAgain.created !== true, J(savedAgain, 160))
 
   // path 参数：会话已存在时 open_editor 应该把它装进现有会话，而不是再开一个窗口
   const reopen = await call('scratch_open_editor', { app: 'desktop', path: saved.savedTo })

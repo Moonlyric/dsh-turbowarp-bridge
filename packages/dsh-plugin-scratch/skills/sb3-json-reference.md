@@ -114,3 +114,26 @@
 - 舞台：x ∈ [-240, 240]，y ∈ [-180, 180]，中心 (0,0)
 - 工作区放置 top-level 块：x/y 是积木区坐标（左上原点，向右下增），社区脚本普遍放在 x ∈ [40, 400], y ∈ [40, 600]
 - **AI 注入的块建议 y 每条脚本 +150 步进**，别全叠一处（用户找不到）
+
+## 输入名对照（拼错会被静默丢弃，v0.10.0 起会当场报错）
+
+| 积木族 | 输入名 |
+|---|---|
+| `operator_add/subtract/multiply/divide/mod` | `NUM1` / `NUM2` |
+| `operator_gt/lt/equals`、`operator_and/or` | `OPERAND1` / `OPERAND2` |
+| `operator_not` | `OPERAND` |
+| `operator_join/contains` | `STRING1` / `STRING2` |
+| `operator_letter_of` | `LETTER` / `STRING` |
+| `operator_length` | `STRING` |
+| `operator_round` / `operator_mathop` | `NUM`（mathop 另带字段 `OPERATOR`） |
+| `operator_random` | `FROM` / `TO` |
+| `control_if` / `if_else` | `CONDITION` + `SUBSTACK`（+ `SUBSTACK2`） |
+| `control_repeat` | `TIMES` + `SUBSTACK` |
+| `control_repeat_until` / `while` | `CONDITION` + `SUBSTACK` |
+
+完整的按 opcode 查更快：`scratch_get_opcodes({ opcode })`。
+`add_blocks` 注入前会用这张表校验（`shapeCheck`），写错直接报错并列出正确名字；确需强行注入传 `lenient:true`。
+
+**字段 vs 输入别搞混**：`data_setvariableto` 的 `VARIABLE` 是**字段**（`fields: { VARIABLE: ["名字", "id"] }`），
+它的值才在 `inputs.VALUE`。写成 `inputs.VARIABLE` 同样静默无效。
+

@@ -833,7 +833,7 @@ async function main() {
   t('显式 includeVariables:true 才回 variables（还附了摘要）',
     r.ok === true && !!r.result.variables && !!r.result.variablesSummary)
   r = await rpc('read_script', { target: 'Sprite1', scriptId: 'no_such_script' })
-  t('scriptId 不存在时明确报错并指向 summary', r.ok === false && /找不到脚本/.test(r.error), r.error)
+  t('scriptId 不存在时明确报错并指向 summary', r.ok === false && /找不到块/.test(r.error) && /summary/.test(r.error), r.error)
 
   // ---- list_scripts ----
   r = await rpc('list_scripts', { target: 'Sprite1' })
@@ -1325,6 +1325,148 @@ async function main() {
   t('越界序号明确报错', r.ok === false && /越界/.test(r.error), r.error)
   r = await rpc('costume', { target: 'Sprite1', action: 'rename', name: '不存在的造型', newName: 'x' })
   t('造型名不存在时把实际有哪些列出来', r.ok === false && /没有造型/.test(r.error), r.error)
+
+  // ==================== v0.10.0：输入名校验 / 只增不删 / 自动布局 / 子树读 / 单块上下文 ====================
+  console.log('[test] v0.10.0 写操作安全 + 读的新姿势')
+  const sp = vm.runtime.targets.find(x => !x.isStage)
+  const topDict = (opcode, extra) => Object.assign({
+    opcode, next: null, parent: null, inputs: {}, fields: {}, topLevel: true, x: 0, y: 0
+  }, extra || {})
+
+  // G3：拼错的输入名必须当场拦下来（这类错静默得太彻底）
+  const badAdd = { bad1: topDict('operator_add', { inputs: { OPERAND1: [1, [4, '1']], OPERAND2: [1, [4, '2']] } }) }
+  r = await rpc('add_blocks', { target: 'Sprite1', blocks: badAdd, follow: false })
+  t('拼错输入名（OPERAND1 塞进 operator_add）直接报错，并给出正确的 NUM1/NUM2',
+    r.ok === false && /NUM1/.test(r.error) && /OPERAND1/.test(r.error), r.error)
+  r = await rpc('add_blocks', { target: 'Sprite1', blocks: badAdd, lenient: true, follow: false })
+  t('lenient:true 才放行（并且 shapeCheck.errors 会记着有几处不对）',
+    r.ok === true && r.result.shapeCheck && r.result.shapeCheck.errors >= 1, r.error + ' / ' + J2(r.result && r.result.shapeCheck))
+  if (r.ok) {
+    const badIds = Object.values(r.result.idMap || {})
+    r = await rpc('delete_blocks', { target: 'Sprite1', blockIds: badIds })
+    t('（清理）删掉 lenient 注入的那段', r.ok === true, r.error)
+  }
+
+  // F0：第二次注入绝不清理上一次注入的游离块
+  const orDict = { or1: topDict('operator_or', { inputs: { OPERAND1: [1, [10, 'a']], OPERAND2: [1, [10, 'b']] } }) }
+  r = await rpc('add_blocks', { target: 'Sprite1', blocks: orDict, follow: false })
+  const orId = r.ok && r.result.idMap && r.result.idMap.or1
+  t('先注入一个游离的 operator_or', r.ok === true && !!orId, r.error)
+  const countBefore = Object.keys(sp.blocks._blocks).length
+  r = await rpc('add_blocks', { target: 'Sprite1', blocks: { hat2: topDict('event_whenflagclicked') }, follow: false })
+  t('第二次 add_blocks 不会删掉上一次注入的游离块（F0：以前会连它挂着的作者积木一起没）',
+    r.ok === true && !!sp.blocks._blocks[orId], r.error)
+  t('而且会如实报告 staleInjected（提醒，不自动清）',
+    r.ok === true && r.result.staleInjected && r.result.staleInjected.count >= 1, J2(r.result && r.result.staleInjected))
+  t('注入只增不删：lost 为空（真丢了会当场喊）', r.ok === true && !r.result.lost, J2(r.result && r.result.lost))
+  t('这次注入没有减少块数', Object.keys(sp.blocks._blocks).length > countBefore, `${countBefore} -> ${Object.keys(sp.blocks._blocks).length}`)
+
+  // F0：stale 清理必须显式，而且只清"整棵子树都是自己注入的"
+  r = await rpc('add_blocks', { target: 'Sprite1', blocks: { hat3: topDict('event_whenflagclicked') }, discardStale: true, follow: false })
+  t('discardStale:true 才真的清（并报清掉几个）',
+    r.ok === true && r.result.discarded && r.result.discarded.count >= 1, J2(r.result && r.result.discarded))
+  t('清掉的确实包括上一轮那个游离的 operator_or', !sp.blocks._blocks[orId])
+
+  // G4：没给坐标时按估算高度往下排，不叠成一坨
+  const threeStacks = {
+    s1: topDict('event_whenflagclicked', { next: 's1b', x: undefined, y: undefined }),
+    s1b: { opcode: 'motion_movesteps', next: null, parent: 's1', inputs: { STEPS: [1, [4, '10']] }, fields: {}, topLevel: false },
+    s2: topDict('event_whenkeypressed', { x: undefined, y: undefined }),
+    s3: topDict('event_whenbroadcastreceived', { x: undefined, y: undefined })
+  }
+  r = await rpc('add_blocks', { target: 'Sprite1', blocks: threeStacks, follow: false })
+  const ys = r.ok ? [r.result.idMap.s1, r.result.idMap.s2, r.result.idMap.s3].map(id => sp.blocks._blocks[id].y) : []
+  t('三个顶层脚本被自动错开（y 互不相同、间距 >= 100px，G4 的"叠成一堆"）',
+    r.ok === true && new Set(ys).size === 3 && Math.abs(ys[1] - ys[0]) >= 100 && Math.abs(ys[2] - ys[1]) >= 100, JSON.stringify(ys))
+
+  // F3：只读一小段 / 只读一个分支
+  const s1Id = r.ok && r.result.idMap.s1
+  r = await rpc('read_script', { target: 'Sprite1', blockId: s1Id, depth: 0 })
+  t('read_script({blockId, depth:0}) 只回起点这一个块', r.ok === true && r.result.returned === 1, r.error)
+  r = await rpc('read_script', { target: 'Sprite1', scriptId: s1Id })
+  t('read_script({scriptId}) 回整条脚本（2 块）', r.ok === true && r.result.returned >= 2, JSON.stringify(r.result && r.result.returned))
+  t('read_script 带 context（这块属于哪条脚本、槽位）', r.ok === true && r.result.context && r.result.context.root === s1Id, J2(r.result && r.result.context))
+  r = await rpc('read_script', { target: 'Sprite1', maxBytes: 400, meta: false })
+  t('read_script 有字节上限：超了 truncated + nextOffset（不再闷声截断）',
+    r.ok === true && r.result.truncated === true && Number.isInteger(r.result.nextOffset) && !r.result.target, J2({ t: r.result.truncated, n: r.result.nextOffset }))
+
+  // F3：单块上下文
+  r = await rpc('inspect', { target: 'Sprite1', blockId: s1Id })
+  t('inspect 给出 parent/next/inputs/所属脚本（不用整段读）',
+    r.ok === true && r.result.opcode === 'event_whenflagclicked' && r.result.next && r.result.script && r.result.script.topId === s1Id,
+    J2(r.result && { op: r.result.opcode, next: r.result.next, script: r.result.script }))
+  r = await rpc('inspect', { target: 'Sprite1', blockId: 'nope' })
+  t('inspect 找不到块时报错并指路', r.ok === false && /找不到块/.test(r.error), r.error)
+
+  // D1：一次看清整个项目
+  r = await rpc('project_overview', {})
+  t('project_overview 给每个角色的 opcode 直方图 + 脚本/自定义积木摘要',
+    r.ok === true && r.result.targets.length === 2 && !!r.result.targets[0].opcodes &&
+    typeof r.result.blockCountRaw === 'number' && Array.isArray(r.result.targets[0].headScripts),
+    r.error + ' / ' + J2(r.result && { n: r.result.targets && r.result.targets.length }))
+
+  // B2：块数口径写清楚（展开视图 vs 文件真块数）
+  r = await rpc('list_scripts', { target: 'Sprite1' })
+  t('list_scripts 同时报 blockCount（展开）与 blockCountRaw（文件真块数）',
+    r.ok === true && Number.isFinite(r.result.blockCount) && Number.isFinite(r.result.blockCountRaw) &&
+    r.result.blockCountRaw <= r.result.blockCount, J2({ a: r.result.blockCount, b: r.result.blockCountRaw }))
+  t('list_scripts 报 definitionCount（C1：定义不能混进 loose）',
+    r.ok === true && Number.isFinite(r.result.definitionCount), J2(r.result && r.result.definitionCount))
+
+  // F2：输入槽被拔空后能补建
+  const ruDict = {
+    ru: topDict('control_repeat_until', { next: null, inputs: { SUBSTACK: [2, null] } }),
+    lt: topDict('operator_lt', { inputs: { OPERAND1: [1, [4, '1']], OPERAND2: [1, [4, '2']] } })
+  }
+  r = await rpc('add_blocks', { target: 'Sprite1', blocks: ruDict, follow: false })
+  const ruId = r.ok && r.result.idMap && r.result.idMap.ru
+  const ltId = r.ok && r.result.idMap && r.result.idMap.lt
+  t('注入一个没有 CONDITION 的 repeat_until + 一个比较块', r.ok === true && !!ruId && !!ltId, r.error)
+  r = await rpc('move_block', { target: 'Sprite1', blockId: ltId, mode: 'input', toBlockId: ruId, inputName: 'CONDITION', follow: false })
+  t('空槽（序列化里已经没了的 CONDITION）能补建并接上（F2：以前只能删掉重建）',
+    r.ok === true && sp.blocks._blocks[ruId].inputs.CONDITION && sp.blocks._blocks[ruId].inputs.CONDITION.block === ltId,
+    r.error + ' / ' + J2(r.result))
+  r = await rpc('move_block', { target: 'Sprite1', blockId: ltId, mode: 'input', toBlockId: ruId, inputName: 'NOPE', follow: false })
+  t('接不存在的输入名会报错并列出这个块真实的输入',
+    r.ok === false && /没有输入/.test(r.error) && /CONDITION/.test(r.error), r.error)
+
+  // C2 / G7：列表切片 + 长度增量
+  r = await rpc('variable', { target: 'Sprite1', action: 'create', kind: 'list', name: '切片列表', value: [10, 20, 30, 40] })
+  t('（准备）建一个 4 项列表', r.ok === true, r.error)
+  r = await rpc('state', { target: 'Sprite1', listSlice: { name: '切片列表', from: 2, count: 2 } })
+  t('state.listSlice 从第 2 项开始给 2 项（Scratch 的 1-based 下标）',
+    r.ok === true && r.result.listSlice && r.result.listSlice.values.join(',') === '20,30', J2(r.result && r.result.listSlice))
+  await rpc('variable', { target: 'Sprite1', action: 'set', kind: 'list', name: '切片列表', value: [10, 20, 30, 40, 50] })
+  r = await rpc('state', { target: 'Sprite1' })
+  t('state 报 pageListDelta（和上一次比，C2：列表泄漏不用靠运气发现）',
+    r.ok === true && r.result.pageListDelta && r.result.pageListDelta['切片列表'] === 1, J2(r.result && r.result.pageListDelta))
+  r = await rpc('variable', { target: 'Sprite1', action: 'get', kind: 'list', name: '切片列表', index: 3 })
+  t('variable get 按 index 只取一项', r.ok === true && String(r.result.value) === '30', J2(r.result))
+  r = await rpc('variable', { target: 'Sprite1', action: 'get', kind: 'list', name: '切片列表', index: 99 })
+  t('variable get 越界会明确报错（不静默返回空串）', r.ok === false && /越界/.test(r.error), r.error)
+
+  // D5：run 默认瘦身
+  r = await rpc('run', { action: 'greenflag', waitMs: 120 })
+  t('run 默认只回 running/threads/clones/stepMs（D5：不再每次回完整状态转储）',
+    r.ok === true && r.result.before && r.result.after &&
+    Object.keys(r.result.before).length <= 5 && r.result.before.pageVars === undefined,
+    J2(r.result && r.result.before))
+  r = await rpc('run', { action: 'stopall', waitMs: 60, detail: true })
+  t('run detail:true 才回全量状态（老行为保留）', r.ok === true && !!r.result.after.pageVars, J2(r.result && Object.keys(r.result.after || {})))
+
+  // G2：角色改名
+  r = await rpc('rename_target', { target: 'Sprite1', to: '细胞' })
+  t('rename_target 真的改名并报 from/to', r.ok === true && r.result.to === '细胞' && r.result.from === 'Sprite1', r.error + ' / ' + J2(r.result))
+  r = await rpc('rename_target', { target: '细胞', to: 'Sprite1' })
+  t('（改回来）', r.ok === true && r.result.to === 'Sprite1', r.error)
+  r = await rpc('rename_target', { target: 'Stage', to: 'x' })
+  t('舞台改名被拒绝（Scratch 里舞台名固定）', r.ok === false && /舞台不能改名/.test(r.error), r.error)
+
+  // opcode 形状查询（G3 的正解入口）
+  r = await rpc('get_opcodes', { opcode: 'operator_add' })
+  t('get_opcodes({opcode}) 直接给出输入名（写块前查一次就不会写错）',
+    r.ok === true && r.result.schemas.operator_add.inputs.join(',') === 'NUM1,NUM2', J2(r.result && r.result.schemas))
+
 
   console.log(`\n===== ops 层单测: ${pass} pass / ${fail} fail =====`)
   process.exit(fail ? 1 : 0)

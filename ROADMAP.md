@@ -321,6 +321,72 @@ Blockly 那边是靠多条事件补的），自己写 `unlinkBlock` + `attachAft
 - 确定性回归：往页面里塞一个 sandbox iframe → 会话仍然固在主 frame（修之前这条必然挂）。
 - 自愈回归：把页面上的执行器删掉再调工具 → 自动重注入、`reinjects` 记 1、独立通道确认执行器回来了。
 
+## v0.10.0：按实地反馈清单逐条清账（2026-10-18）
+
+这一轮的输入是一份**真实使用记录**：25MB / 94 造型 / 3 角色的作品，做"只读观察 + 从零写一个作品"，
+清单里 40 条问题。下面按清单编号对账 —— 每条都写清"现在是什么行为"，没做的也写明为什么。
+
+### 数据丢失 / 静默错误（最优先）
+
+| 清单 | 以前 | 现在 |
+|---|---|---|
+| **F0** `add_blocks` 会清掉上次注入的游离块，连带删掉挂在它上面的作者积木（实测丢了一棵 9 块的条件子树） | 无解释、`locate` 报找不到 | **永不自动清理**。注入账本按角色记下"哪些块是我塞的"；下次注入只在 `staleInjected` 里**提醒**，不删。要清就显式 `discardStale:true`，而且只清「整棵子树都是 AI 注入的」，碰到作者积木会跳过并报 `discarded.skipped`。另外每次注入后对账：原有块少了就当场报 `lost`（带 opcode），不再闷声 |
+| **G3** 拼错 input 名（`OPERAND1` 塞进 `operator_add`）静默丢弃，返回全绿，白干 8~10 轮 | 无校验 | 注入前按 opcode 形状表**硬校验**输入名/字段名，写错直接报错并列出正确的 `NUM1/NUM2`；`shapeCheck` 报覆盖度（`checked/unverified`），确需强行注入传 `lenient:true`。形状表来源优先级：内置表 → GUI 里 Blockly 的块定义 → 项目里已有的同类块 |
+| **F2** 输入槽被拔空后无法重建（`update_block`/`move_block` 都报"没有输入 CONDITION"） | 只能删块重建 | `move_block` / `update_block` 按**该 opcode 的合法输入名**当场补建空槽（连影子块一起补，类型从同 opcode 的别的块抄） |
+| **G4** 注入的脚本互相重叠，用户拖开时误删 41 块 | 给 240px 间距，实际渲染 600~1600px，完全叠住 | 没给坐标 → 按**估算高度**排到现有内容右边（`estStackHeightSb3`）；坐标给全了 → 尊重（背包 `load(40,40)` 就落 40,40）；给了但算下来会叠 → `layout.overlap` 报出来 |
+
+### 读数不可信（第二优先：这类会让人把"环境坏了"误判成"代码写错了"）
+
+| 清单 | 现在 |
+|---|---|
+| **G9** 窗口「假活」：VM 在跑、界面已冻结、用户点绿旗/停止没反应，而 `selftest` 7 项全绿 | `selftest` 新增**帧心跳**：连截两张 PNG 比哈希，`画面不变 && VM 有线程` → 明确报「界面很可能已冻结」并指路 `scratch_restart_window`。`screenshot` 每张回 `frameHash`/`capturedAt`，与上一张相同标 `sameAsPrev` + `frozenHint`。新增 `scratch_restart_window`：按 pid 杀进程、用调试端口重开、把上次打开的文件重新装上 |
+| **B1** `open_editor` 的 `meta/targets/editingTarget` 是空白默认工程 | 返回值里明说 `beforeLoad` 是"桌面版冷启动的默认空工程，不是用户的作品"；带文件时**先返回**（`loading:true`），装载在后台，后续任何工具调用都过"装载闸"自动等它装完 |
+| **B2** 同一角色三个块数（2364 / 5657） | 三个 API 统一口径并**两个都给**：`blockCount`（展开视图，含物化影子）+ `blockCountRaw`（≈project.json 真块数）+ `blockCountView` |
+| **C1** `procedures_definition` 被归进 loose「游离块」 | 单列 `kind:"definition"`，带 `calledBy`（被调用次数）/`params`/`warp`；`kind=called` 只看被调用过的定义。`note` 里写明"定义是引擎主干、不是垃圾" |
+| **F4** `click` 返回 `hatsStarted:0` 但流程推进了 | 点击**前后各做一次 `renderer.pick`**：`pick`（命中谁）/`pickMissed`（真没命中）/`started`（这次新起哪些线程）；`hatsStarted:0 && threads>0` 时明说"流程可能是已有线程推进的，别据此判断点击失败" |
+| **F5** `save_project` 对新路径也报 `overwrote:true` | 改成 `overwrote = 原本存在 && 真覆盖`，并新增 `created`；hint 分三种情况说清 |
+| **C2** `state` 列表只报长度 | 新增 `pageListDelta`（和上次 state 比）；`listSlice:{name,from,count}` 按 1-based 取一段（越界直接报错，不静默返回空串） |
+
+### 读 / 查能力（把"自己写 148 行 dumper"变成一次调用）
+
+| 清单 | 现在 |
+|---|---|
+| **D1** 没有全项目结构总览 | 新工具 `scratch_project_overview`：每角色 opcode 直方图（`topOpcodes`）+ 自定义积木清单（proccode/params/warp/calledBy）+ 未使用定义 + 每段脚本一行摘要（含 `calls`）。预算内一次给全 |
+| **D2** 不能按分支/子树读 | `read_script({ blockId, branch:"SUBSTACK", depth:2 })`；`depth:0` = 只要这个块；`next` 链不算深度。块数 + 字节**双上限**分页（`hasMore/nextOffset/bytes`） |
+| **F3** 没有"只读这一小段"的轻量校验 | 新工具 `scratch_inspect({ blockId })`：parent + 槽位（`CONDITION`/`next`）、next、每个输入接了谁/字面量值/影子、所属脚本（帽子块 + 嵌套深度）、子树块数。插完/改完查它，不用整段读 |
+| **A2** 大返回被工具层静默截断 | 各 op 自己先量：`read_script` 按字节分页、`snapshot` 超预算返回 `truncated` + 按 target 的索引 + 续读办法；插件层再加最后一道闸 —— 渲染后超 60KB 就换成 `{truncated, bytes, spillPath, preview}` 信封（全文落盘），**永远不会有"看起来成功其实没拿到"** |
+| **D5** `run` 每次回完整状态转储 | 默认 brief（`running/threads/clones/stepMs`），`detail:true` 才回全量；`changedVars` 只在 detail 时给 |
+| **D4** 编译器下 profile 无意义 | 除了原有的"compiled → granularity:script"，新增 `frameCapMs` / `atFrameCap` / `headroomMs`：`stepMs` 顶到帧帽时明说"看不出还有多少余量、只能做前后对比"，不再让人把它当"跑满了" |
+| **D3** 截图不能裁舞台 | `screenshot({ region:"stage" \| "workspace" })`：用 `getBoundingClientRect` 取舞台/积木区矩形，CDP `clip` 只截那块；拿不到矩形时退回整窗并在 `regionFallback` 说明 |
+
+### 起手式 / 工作流
+
+| 清单 | 现在 |
+|---|---|
+| **G1** 没有新建空白工程的接口 | `scratch_new_project({ sprite, backdrop, costume, savePath })` 与 `open_editor({ blank:true })`：插件侧现造一份标准 sb3（zip 手写 store、assetId 用内容 md5、两个内联 SVG），可顺手落盘。生成器有独立的 lab 测试（13 条：zip 合法性 / md5 / 真 scratch-vm 装载 / 两个 skin 都载入） |
+| **G2** 不能改角色名 | `scratch_target({ action:"rename", to })` → 走 VM 的 `renameSprite`（自动去重 + 同步引用角色名的积木字段）；舞台改名明确拒绝 |
+| **G6** 写操作不能进 batch | 批处理放开 `variable` 的 `create`/`set`（只动变量表、不碰积木结构），其它写动作仍然拒绝并说明原因 |
+| **G7** 列表调试只能整份拉 | `scratch_variable({ action:"get", kind:"list", index|from+count })` |
+| **F1** 写操作不跟随视口 | `add_blocks` / `update_block` / `move_block` 默认把工作区**滚到受影响的块**（`followed` 报实际走的 API）；`follow:false` 可关 |
+| **A1** `open_editor` 同步阻塞无反馈 | 窗口一接上就返回（`loading:true` + `beforeLoad`），装载在后台；`call()` 有装载闸，后续调用自动等 —— 用户看到的是"窗口开了、马上就回话了"，AI 也不会读到半装的项目 |
+
+### 顺手修的 / 文档
+
+- `list_scripts` 的 `kind` 增加 `definition` / `called`；`note` 重写（原来那句"loose 是不会自己运行的块"就是 C1 的误导来源）。
+- `get_opcodes({ opcode })` 现在能直接查形状（输入名/字段名），并在拼错时给出同族对照（算术 NUM* / 比较逻辑 OPERAND* / 字符串 STRING*）。
+- `read_script({ meta:false })` 翻页时不再重复回元信息。
+- 内置 skill 从 11 篇 → 13 篇：新增 `platform-traps.md`（H1~H13：1-based 下标、空串算术、warp 循环、键名对照…）和
+  `injection-semantics.md`（add_blocks 的输入/输出契约、三个 id 世界的区别、idMap 寿命）；`INDEX.md` 改成**任务路由 + 8 条真实翻车记录 + 30 秒套路**。
+  升级时会**覆盖**内置文档（旧版备份到 `.backup-v<旧版本>/`）—— 用户原话是"那个内置 skill 真的太简陋了，这 ai 仍旧疯狂试错"。
+- 文档补一条口径：`project_meta.blockCount` 是**文件里的真块数**，`read_script/list_scripts.blockCount` 是**展开视图**（B2 的根源）。
+
+### 验收
+
+- 替身层 `lab/test-content-ops.js` **280 条**（新增 34：输入名校验/只增不删/stale 清理/自动布局/子树读/单块上下文/块数口径/列表切片/run brief/改名/形状查询）。
+- 空白作品生成器 `lab/test-blank-project.mjs` **13 条**（新文件；真 scratch-vm 装载 + jszip 复核）。
+- 插件侧 `test-tools.mjs` **158 条**（新增 30：新工具注册与无会话报错、sb3 生成器、截断信封、装载闸、帧心跳、overwrote 语义、batch 轻写、执行器关键实现存在性）。
+- 桌面真机 `lab/desktop-cdp-check.mjs` **148 条**（新增 14：overview/inspect/子树读/G3 拦截/截图裁剪+frameHash/sameAsPrev/帧心跳/click 新字段/run brief/overwrote 语义）。
+
 ## v0.7.0：把「问题记录」清账（2026-10-18）
 
 那份 699 行的问题记录（四轮实测、26 条）逐条下场见 **`问题记录-处理台账.md`**。
