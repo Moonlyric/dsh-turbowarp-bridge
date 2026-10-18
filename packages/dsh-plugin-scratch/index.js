@@ -552,7 +552,9 @@ export function apply(ctx, config) {
   const builtinSkillDir = join(dirname(fileURLToPath(import.meta.url)), 'skills')
   const skillStateFile = join(skillDir, '.enabled.json')
   const builtinVersionFile = join(skillDir, '.builtin-version')
-  const SKILL_BUILTIN_VERSION = '8' // 升级内置 skill 时 bump（8 = 新增 sprite-split / boot-pipeline 两篇；
+  const SKILL_BUILTIN_VERSION = '9' // 升级内置 skill 时 bump（9 = 重整旧文档：architecture/performance/
+                                    //     getting-started/code-patterns 四篇补实测数据与「跨角色不能共享代码」的真相；
+                                    //     8 = 新增 sprite-split / boot-pipeline 两篇；
                                     //     7 = 新增 pen-3d / one-sprite-clones-ui /
                                     //     render-queue 三篇整套架构；6 = 新增 pen-text.md（画笔文字引擎）；
                                     //     5 = 新增 proven-patterns.md：从真实高完成度作品里读出来的十种写法；

@@ -54,7 +54,7 @@ t('boot-pipeline 有预热过程的积木序列', /图章/.test(r.content) && /�
 
 // ---- read ----
 r = await skillsTool.execute({ action: 'read', name: 'getting-started.md' })
-t('read 返回全文含五大错误', /5 个错/.test(r.content) && r.on === true)
+t('read 返回全文含六大错误', /6 个错/.test(r.content) && r.on === true)
 try { await skillsTool.execute({ action: 'read', name: '../../etc/passwd' }); t('路径穿越被拒（throw）', false, '没抛') }
 catch (e) { t('路径穿越被拒（throw）', /非法/.test(e.message), e.message) }
 // 注：defineTool execute 抛错才对——看它是 throw 还是返回
