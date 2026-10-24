@@ -30,7 +30,8 @@ const t = (name, cond, detail) => {
 const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 // v0.7.0 加了 9 个运行控制/可观测工具（19 → 28），v0.8.0 加了 2 个背包工具（→ 30）
 // v0.10.0 加了 5 个（结构总览 / 单块上下文 / 空白作品 / 角色改名 / 重启窗口）→ 38
-const TOOL_COUNT = 38
+// v0.14.0 加了 2 个资源工具（加音效 / 新建角色）→ 40（造型改成也吃本机 PNG 文件）
+const TOOL_COUNT = 40
 
 // ---- 桩：把收到的参数追加到一个文件里，冒充「被打开的程序」 ----
 const browserStub = join(STUB_DIR, 'stub-browser.cmd')
@@ -666,6 +667,66 @@ const v011 = [
 ]
 for (const [label, needle] of v011) {
   t(`执行器：${label}`, executorSrc.includes(needle), needle)
+}
+
+// v0.14.0：资源导入这条链（真机反馈 A1/A6 —— 只会收 SVG 源码，PNG/WAV 只能自己写打包器）
+// 这一节测的是**纯函数**：读盘归一化（assets.js）+ sprite3 打包（sb3.js）。
+// 真机那一半（storage.createAsset → addCostume/addSound/addSprite）在 lab 里用 CDP 验过，
+// 见 STATUS 的 v0.14.0 一节；这里守住"文件进来变成什么"这一层，回归时最容易坏的就是它。
+const { readAssetFile, readJsonFile, normalizeBlocksFile } = await import('./assets.js')
+const { buildSprite3, imageSize, zipStore } = await import('./sb3.js')
+{
+  const dir = join(STUB_DIR, 'assets')
+  mkdirSync(dir, { recursive: true })
+  // 最小合法 PNG（1×1 透明）+ 一段假 WAV 头：只为验扩展名/尺寸/名字，不追求能播
+  const onePx = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64')
+  const pngPath = join(dir, '干员头像.png')
+  writeFileSync(pngPath, onePx)
+  const wavPath = join(dir, 'deploy.wav')
+  writeFileSync(wavPath, Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(40)]))
+
+  const f = readAssetFile(pngPath)
+  t('读图：拿到 base64 + format + 去扩展名的名字', f.format === 'png' && f.name === '干员头像' && f.base64 === onePx.toString('base64'))
+  t('读图：base64 还原后跟原文件逐字节相同', Buffer.from(f.base64, 'base64').equals(onePx))
+  t('读图：给相对路径也能读（resolve 到 cwd）', (() => { try { return readAssetFile('nope-不存在.png').format } catch (e) { return /文件不存在/.test(e.message) } })())
+  t('读音频：format=wav（执行器按它选 AssetType.Sound）', readAssetFile(wavPath).format === 'wav')
+  t('PNG 尺寸识别（sprite3 的旋转中心靠它）', imageSize(onePx)?.w === 1 && imageSize(onePx)?.h === 1)
+
+  // sprite3：真机踩了两轮才定下来的形状（sprite.json 必须是**角色对象本身**）
+  const s3 = buildSprite3({ name: '甲', costumes: [{ name: 'c1', data: onePx, format: 'png' }] })
+  const names = s3.files
+  t('sprite3 里必须有 sprite.json（只放 project.json → "missing project or sprite json"）', names.includes('sprite.json'))
+  t('sprite3 里必须有 project.json（舞台那份）', names.includes('project.json'))
+  t('sprite3 资源按内容 md5 命名', names.some(n => /^[0-9a-f]{32}\.png$/.test(n)))
+  t('sprite3 的旋转中心按真实尺寸算（1×1 图 → 中心 1,1）', (() => {
+    const obj = s3.spriteJson
+    return obj.name === '甲' && obj.costumes[0].rotationCenterX === 1 && obj.costumes[0].rotationCenterY === 1
+  })())
+  t('sprite3 的 sprite.json 是**角色对象**（没有 targets/projectVersion 那层壳）', (() => {
+    const obj = s3.spriteJson
+    return obj.isStage === false && obj.targets === undefined && typeof obj.name === 'string' && Array.isArray(obj.costumes)
+  })())
+  t('sprite3 默认造型是一个 SVG 方块（不给图也能建角色）', (() => {
+    const p = buildSprite3({ name: '乙' })
+    return p.files.some(n => n.endsWith('.svg')) && p.costumeNames[0] === '造型1'
+  })())
+  t('zip 的 EOCD 能在末尾找到（手工 store zip 的完整性）', s3.buffer.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06])) > 0)
+
+  // blocksFile：三种形状
+  const jsonOne = join(dir, 'one.json')
+  const one = { targets: { 卡01: { a: { opcode: 'event_whenflagclicked', topLevel: true, parent: null, next: null, inputs: {}, fields: {} } } } }
+  writeFileSync(jsonOne, JSON.stringify(one))
+  const jobs = normalizeBlocksFile(readJsonFile(jsonOne), undefined)
+  t('blocksFile 多目标形状：targets 的键就是角色名', jobs.length === 1 && jobs[0].target === '卡01' && !!jobs[0].blocks.a)
+  const dictOnly = normalizeBlocksFile({ b: { opcode: 'event_whenflagclicked' } }, '某角色')
+  t('blocksFile 纯 blocks dict：用参数里的 target 兜底', dictOnly.length === 1 && dictOnly[0].target === '某角色')
+  const single = normalizeBlocksFile({ target: '自带目标', blocks: { c: { opcode: 'x' } } }, '参数目标')
+  t('blocksFile 单目标形状：文件里的 target 优先', single[0].target === '自带目标')
+  t('blocksFile 什么都没有时给一条明确的错', (() => { try { normalizeBlocksFile({ foo: 1 }, 'x'); return false } catch (e) { return /没找到积木/.test(e.message) } })())
+  t('blocksFile 的 targets 项里缺 blocks 会指名道姓', (() => { try { normalizeBlocksFile({ targets: { 甲: {} } }); return false } catch (e) { return /targets\["甲"\]/.test(e.message) } })())
+  t('插件侧真的有这 3 个新入口（add_sprite/add_sound/blocksFile）',
+    /name: 'scratch_add_sprite'/.test(indexSrc) && /name: 'scratch_add_sound'/.test(indexSrc) && /blocksFile/.test(indexSrc))
+  t('多目标注入只做一次快照（一条计划批量落盘）', /op === 'add_blocks_batch'/.test(indexSrc))
 }
 
 console.log(`\n===== 插件工具单测: ${pass} pass / ${fail} fail =====`)

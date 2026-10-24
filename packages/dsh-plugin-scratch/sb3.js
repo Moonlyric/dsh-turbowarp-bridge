@@ -205,3 +205,151 @@ export function buildBlankProject(o = {}) {
     parts
   }
 }
+
+// ---------------- .sprite3（单个角色的包，给 vm.addSprite 吃） ----------------
+// 为什么走 zip 而不是在页面里拼对象：vm.addSprite 内部就是 sb3.deserialize(输入, isSprite=true)，
+// 它拿到的第二返回值是 **zip**，造型字节只能从 zip 里读。少了 zip 里的资源，造型就没有 skin
+// （编辑器里显示成 "?"）—— 和 addCostume 那条老坑是同一类。
+// 好处：所有资源都按内容 md5 命名，天然和 sb3 的约定一致。
+
+/** 从图片字节里读宽高 —— sprite3 的 rotationCenter 是**必填数字**，给了就得对 */
+export function imageSize(buf) {
+  if (!buf || buf.length < 16) return null
+  const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf)
+  // PNG：IHDR 在偏移 16/20
+  if (b.readUInt32BE(0) === 0x89504E47) return { w: b.readUInt32BE(16), h: b.readUInt32BE(20), format: 'png' }
+  // GIF
+  const head3 = b.slice(0, 3).toString('latin1')
+  if (head3 === 'GIF') return { w: b.readUInt16LE(6), h: b.readUInt16LE(8), format: 'gif' }
+  // BMP
+  if (b[0] === 0x42 && b[1] === 0x4D) return { w: Math.abs(b.readInt32LE(18)), h: Math.abs(b.readInt32LE(22)), format: 'bmp' }
+  // JPEG：扫 SOFn 段（段长是 big-endian，含两字节长度本身）
+  if (b[0] === 0xFF && b[1] === 0xD8) {
+    let i = 2
+    while (i + 9 < b.length) {
+      if (b[i] !== 0xFF) { i++; continue }
+      const m = b[i + 1]
+      if (m === 0xD8 || m === 0x01 || (m >= 0xD0 && m <= 0xD7)) { i += 2; continue }
+      if (m === 0xD9 || m === 0xDA) break
+      const len = b.readUInt16BE(i + 2)
+      if (len < 8) break
+      const isSof = m >= 0xC0 && m <= 0xCF && m !== 0xC4 && m !== 0xC8 && m !== 0xCC
+      if (isSof) return { w: b.readUInt16BE(i + 7), h: b.readUInt16BE(i + 5), format: 'jpg' }
+      i += 2 + len
+    }
+  }
+  // WebP（只认 VP8X，够用）
+  if (b.slice(0, 4).toString('latin1') === 'RIFF' && b.slice(8, 12).toString('latin1') === 'WEBP') {
+    if (b.slice(12, 16).toString('latin1') === 'VP8X') {
+      return { w: 1 + b.readUIntLE(24, 3), h: 1 + b.readUIntLE(27, 3), format: 'webp' }
+    }
+  }
+  return null
+}
+
+/** SVG 文本里抠 width/height（拿不到就 null） */
+function svgSize(svgText) {
+  const m = /<svg[^>]*>/i.exec(svgText)
+  if (!m) return null
+  const tag = m[0]
+  const w = /\swidth\s*=\s*"([\d.]+)(?:px)?"/i.exec(tag)
+  const h = /\sheight\s*=\s*"([\d.]+)(?:px)?"/i.exec(tag)
+  if (!w || !h) return null
+  const ww = parseFloat(w[1])
+  const hh = parseFloat(h[1])
+  return Number.isFinite(ww) && Number.isFinite(hh) && ww > 0 && hh > 0 ? { w: ww, h: hh, format: 'svg' } : null
+}
+
+/**
+ * 造一个单角色的 .sprite3（zip）。
+ * @param {{name?:string, color?:string, costumes?:Array<{name:string, data:Buffer|string, format:string, cx?:number, cy?:number}>}} o
+ * @returns {{buffer:Buffer, spriteName:string, files:string[], costumeNames:string[]}}
+ */
+export function buildSprite3(o = {}) {
+  const name = String(o.name || '角色').slice(0, 60)
+  const raw = (Array.isArray(o.costumes) && o.costumes.length)
+    ? o.costumes
+    : [{ name: '造型1', data: Buffer.from(spriteSvg(o.color), 'utf8'), format: 'svg' }]
+  const parts = []
+  const costumes = raw.map((c, i) => {
+    const format = String(c.format || 'svg').toLowerCase()
+    const data = Buffer.isBuffer(c.data) ? c.data : Buffer.from(c.data)
+    const assetId = md5(data)
+    parts.push({ name: `${assetId}.${format}`, data })
+    // 旋转中心：调用方给了就用，否则按真实尺寸取中心（拿不到尺寸就退回 40×40 的常识值）
+    const size = format === 'svg' ? svgSize(String(c.data)) : imageSize(data)
+    const cx = typeof c.cx === 'number' ? c.cx : (size ? Math.round(size.w / 2) : 40)
+    const cy = typeof c.cy === 'number' ? c.cy : (size ? Math.round(size.h / 2) : 40)
+    return {
+      name: String(c.name || `造型${i + 1}`).slice(0, 60),
+      assetId,
+      md5ext: `${assetId}.${format}`,
+      dataFormat: format,
+      rotationCenterX: cx,
+      rotationCenterY: cy
+    }
+  })
+  const sprite = {
+    isStage: false,
+    name,
+    variables: {},
+    lists: {},
+    broadcasts: {},
+    blocks: {},
+    comments: {},
+    currentCostume: 0,
+    costumes,
+    sounds: [],
+    volume: 100,
+    layerOrder: 0,
+    visible: true,
+    x: 0,
+    y: 0,
+    size: 100,
+    direction: 90,
+    draggable: false,
+    rotationStyle: 'all around'
+  }
+  // 带一个空舞台：sprite3 的约定（全局变量/广播从舞台里来），空的就是"什么都不带进来"
+  const stage = {
+    isStage: true,
+    name: 'Stage',
+    variables: {},
+    lists: {},
+    broadcasts: {},
+    blocks: {},
+    comments: {},
+    currentCostume: 0,
+    costumes: [],
+    sounds: [],
+    volume: 100,
+    layerOrder: 0,
+    tempo: 60,
+    videoTransparency: 50,
+    videoState: 'on',
+    textToSpeechLanguage: null
+  }
+  const projectJson = {
+    projectVersion: 3,
+    targets: [stage],
+    monitors: [],
+    extensions: [],
+    meta: { semver: '3.0.0', vm: '0.2.0', agent: 'dsh-plugin-scratch' }
+  }
+  // ⚠️ sprite3 的包里有**两个** json，真机实测（三种形状逐个试）：
+  //   · project.json = 整份项目（这里只放舞台：空舞台 = 什么全局变量/广播都不带进来）
+  //   · sprite.json  = **角色对象本身**（不是 {projectVersion, targets}）——
+  //     放成项目形状会被校验拒掉：`sprite/required: should have required property 'name'`
+  //   · 只放 project.json 会直接报 "missing project or sprite json"（它先找 sprite.json）
+  parts.unshift({ name: 'project.json', data: Buffer.from(JSON.stringify(projectJson), 'utf8') })
+  parts.push({ name: 'sprite.json', data: Buffer.from(JSON.stringify(sprite), 'utf8') })
+  return {
+    buffer: zipStore(parts),
+    spriteName: name,
+    files: parts.map(p => p.name),
+    costumeNames: costumes.map(c => c.name),
+    // 给测试/调用方看的原件（要改哪一项就自己改再 zipStore）
+    projectJson,
+    spriteJson: sprite
+  }
+}

@@ -16,7 +16,8 @@ import { spawn, execFileSync } from 'node:child_process'
 import { basename } from 'node:path'
 import { createHash } from 'node:crypto'
 // 空白作品生成器（G1）：手写最小 sb3 太劝退，插件直接造一份给你（md5 命名 / zip / 两个内联 SVG）
-import { buildBlankProject } from './sb3.js'
+import { buildBlankProject, buildSprite3 } from './sb3.js'
+import { readAssetFile, readJsonFile, normalizeBlocksFile } from './assets.js'
 // CDP 直连（不需要浏览器扩展）—— 见 cdp.js 顶部注释。TurboWarp Desktop 走的就是这条路。
 import { attachCdp, findFreePort, tagForPage, probeCdp } from './cdp.js'
 
@@ -57,6 +58,12 @@ export const Config = z.object({
 const readLive = (value) => (value !== null && typeof value === 'object' && typeof value.get === 'function' ? value.get() : value)
 /** dsh 家目录（DSH_HOME 已经是 ~/.dsh，别再拼一层） */
 const homeDir = () => process.env.DSH_HOME || join(homedir(), '.dsh')
+
+// ---------------- 本机资源文件读取（造型/音效） ----------------
+// 真机反馈（A1/A6）：桥以前只收 SVG **源码**，而这个 AI 真做的作品素材是 PNG（头像 180×180、
+// 敌人图标 158×158）+ WAV 音效 —— 于是"导入美术资源"这一步只能自己去写 sb3 打包器。
+// 现在插件侧直接读盘转 base64，页面侧 storage.createAsset 建资源：PNG/WAV 和 SVG 一样一条调用。
+// 实现在 assets.js（纯函数，能单独测）。
 
 // ---------------- 返回值清洗：必须是「无损 JSON」----------------
 // 真实的 harness 会校验工具返回值（`value is not lossless JSON`），而 `undefined`
@@ -512,6 +519,35 @@ export function apply(ctx, config) {
 
   async function executePlan(plan) {
     const snap = await takeSnapshot(plan.sessionId, plan.label)
+    // 多目标批量注入（blocksFile 的 {targets:{...}} 形状）：一条计划、一次快照，
+    // 落盘时逐个 target 注入。失败的 target 单独记下来，不吞掉其余成功的。
+    if (plan.op === 'add_blocks_batch' && plan.args && Array.isArray(plan.args.items)) {
+      const targets = []
+      for (const it of plan.args.items) {
+        try {
+          const r = await call(plan.sessionId, 'add_blocks', {
+            target: it.target, blocks: it.blocks, variables: it.variables,
+            lenient: it.lenient, layout: it.layout, follow: it.follow, discardStale: it.discardStale
+          })
+          targets.push(Object.assign({ target: it.target, ok: true }, r))
+        } catch (e) {
+          targets.push({ target: it.target, ok: false, error: e && e.message ? e.message : String(e) })
+        }
+      }
+      const failed = targets.filter(t => !t.ok)
+      return {
+        snapshotAt: snap.at,
+        label: plan.label,
+        targets,
+        added: targets.map(t => t.target),
+        totals: {
+          targets: targets.length,
+          ok: targets.length - failed.length,
+          failed: failed.length
+        },
+        error: failed.length ? `有 ${failed.length} 个目标注入失败：${failed.map(f => `${f.target}（${f.error}）`).join('；')}` : undefined
+      }
+    }
     const r = await call(plan.sessionId, plan.op, plan.args)
     return Object.assign({ snapshotAt: snap.at, label: plan.label }, r)
   }
@@ -552,7 +588,9 @@ export function apply(ctx, config) {
   const builtinSkillDir = join(dirname(fileURLToPath(import.meta.url)), 'skills')
   const skillStateFile = join(skillDir, '.enabled.json')
   const builtinVersionFile = join(skillDir, '.builtin-version')
-  const SKILL_BUILTIN_VERSION = '13' // 升级内置 skill 时 bump（13 = 新增 multi-minigame-shell.md：
+  const SKILL_BUILTIN_VERSION = '14' // 升级内置 skill 时 bump（14 = sprite-split 加「一张卡一个角色」反例
+                                    //     （12 角色 / 444 块 = 19%）；getting-started 加「先看背包有什么」+
+                                    //     素材导入工具表；13 = 新增 multi-minigame-shell.md：
                                     //     章节式作品的共用壳（界面变量 + 三态门 + 台词队列 + 存档码）；
                                     //     12 = backpack/injection-semantics 补
                                     //     listLimit、变量 scope、creates 的 (全局) 标记；
@@ -1391,11 +1429,14 @@ export function apply(ctx, config) {
       + '确需强行注入传 lenient:true。形状不确定就先 scratch_get_opcodes({ opcode:"operator_add" })。'
       + '**只增不删**：绝不清理你上次注入的游离块（返回里 staleInjected 只是提醒）；真要清传 discardStale:true（只清整棵子树都是 AI 注入的）。'
       + '没给坐标时按估算高度自动排到现有内容右边（不会叠在一起）；改完会把视口带过去（follow:false 可关）。'
-      + '返回 idMap（旧 ID → 新 ID）——后续引用新块必须用新 ID。preview 档下不会立刻落盘，会返回 planId 等 scratch_apply。',
+      + '返回 idMap（旧 ID → 新 ID）——后续引用新块必须用新 ID。preview 档下不会立刻落盘，会返回 planId 等 scratch_apply。'
+      + '**上千块别写在参数里**：用 blocksFile 指一个本机 .json（三种形状：纯 blocks dict / {target,blocks} / {targets:{名字:blocks}}），'
+      + '插件读盘后一次注入；多目标形状只做一次快照、一条调用。',
     parameters: {
       session: { type: 'string' },
-      target: { type: 'string', description: '目标精灵名' },
+      target: { type: 'string', description: '目标精灵名（多目标文件里可省略）' },
       blocks: { type: 'object', additionalProperties: true, description: 'sb3 blocks dict（同 project.json 里 targets[].blocks 的格式）' },
+      blocksFile: { type: 'string', description: '本机 .json 路径：blocks dict / {target,blocks,variables} / {targets:{名字:blocks}} 三种都收' },
       variables: { type: 'array', description: '可选：要一起建的变量/列表声明 [{name, type:"variable"|"list"|"broadcast", scope:"local"|"global", value}]（不传则按块里的名字自动建、值为空；scope:"global" 挂舞台 —— 几 MB 的字库表必须是全局的）' },
       lenient: { type: 'boolean', description: 'true = 输入名/字段名写错也只警告、照样注入（缺省是直接报错拦下来）' },
       layout: { type: 'string', description: 'auto（缺省，自动排到现有内容右边）| given（尊重你给的 x/y）' },
@@ -1405,17 +1446,39 @@ export function apply(ctx, config) {
     output: jsonOut,
     async execute(args) {
       const sid = needSession(args?.session)
-      if (!args?.blocks) throw new Error('blocks 必填')
-      return withChanged(await guardedWrite(sid, 'add_blocks', {
-        target: args.target,
-        blocks: args.blocks,
-        variables: Array.isArray(args.variables) ? args.variables : undefined,
+      let jobs
+      if (args?.blocksFile) {
+        jobs = normalizeBlocksFile(readJsonFile(args.blocksFile), args.target)
+      } else {
+        if (!args?.blocks) throw new Error('blocks 或 blocksFile 必填')
+        jobs = [{ target: args.target, blocks: args.blocks, variables: args.variables }]
+      }
+      const common = {
         lenient: args.lenient === true ? true : undefined,
         layout: args.layout === 'given' ? 'given' : undefined,
         follow: args.follow === false ? false : undefined,
         discardStale: args.discardStale === true ? true : undefined
-      },
-      'pre-add_blocks', { target: args.target, blocks: args.blocks }))
+      }
+      if (jobs.length === 1) {
+        const j = jobs[0]
+        if (!j.target) throw new Error('单目标注入必须给 target（或让文件里带 target/名字）')
+        return withChanged(await guardedWrite(sid, 'add_blocks', {
+          target: j.target,
+          blocks: j.blocks,
+          variables: Array.isArray(j.variables) ? j.variables : (Array.isArray(args.variables) ? args.variables : undefined),
+          ...common
+        },
+        'pre-add_blocks', { target: j.target, blocks: j.blocks }))
+      }
+      // 多目标：一条计划、一次快照，落盘时逐个 target 注入（executePlan 里展开）
+      const missing = jobs.filter(j => !j.target).length
+      if (missing) throw new Error(`有 ${missing} 个目标没名字（targets 的键就是角色名）`)
+      const r = await guardedWrite(sid, 'add_blocks_batch',
+        { items: jobs.map(j => ({ target: j.target, blocks: j.blocks, variables: j.variables, ...common })) },
+        'pre-add_blocks',
+        { targets: jobs.map(j => ({ target: j.target, blocks: Object.keys(j.blocks).length })) })
+      if (r && r.mode) return r
+      return withChanged(r)
     }
   }))
 
@@ -1463,20 +1526,100 @@ export function apply(ctx, config) {
 
   ctx.tools.register(defineTool({
     name: 'scratch_add_costume',
-    description: '向角色添加 SVG 造型。svg 参数为 SVG 源码文本。',
+    description: '给角色加造型。两种来源：path（**本机图片文件**，png/jpg/jpeg/gif/bmp/svg/webp —— 插件读盘转 base64 传过去）'
+      + '或 svg（直接给 SVG 源码）。加完会验 skin：载不进去就自动撤掉、不留 "?" 占位造型。'
+      + 'PNG 的旋转中心交给渲染器按真实图形算，不用手填。加多个造型就多调几次（或 scratch_add_sprite 一次带一堆）。',
     parameters: {
       session: { type: 'string' },
       target: { type: 'string' },
-      name: { type: 'string', description: '造型名' },
-      svg: { type: 'string', required: true, description: 'SVG 源码' }
+      name: { type: 'string', description: '造型名（缺省用文件名）' },
+      path: { type: 'string', description: '本机图片路径（绝对路径，或相对当前工作目录）' },
+      svg: { type: 'string', description: 'SVG 源码（跟 path 二选一）' }
     },
     output: jsonOut,
     async execute(args) {
       const sid = needSession(args?.session)
-      return withChanged(await guardedWrite(sid, 'add_costume',
-        { target: args.target, name: args.name, svg: args.svg },
-        'pre-add_costume',
-        { target: args.target, name: args.name, svgBytes: (args.svg || '').length }))
+      let payload
+      let preview
+      if (args?.path) {
+        const f = readAssetFile(args.path)
+        if (!['png', 'jpg', 'jpeg', 'gif', 'bmp', 'svg', 'webp'].includes(f.format)) {
+          throw new Error(`不认识的图片格式 .${f.format}（支持 png/jpg/jpeg/gif/bmp/svg/webp）：${f.abs}`)
+        }
+        payload = { target: args.target, name: args.name || f.name, bytes: f.base64, format: f.format }
+        preview = { target: args.target, name: payload.name, file: f.abs, bytes: f.bytes.length, format: f.format }
+      } else if (args?.svg) {
+        payload = { target: args.target, name: args.name, svg: args.svg }
+        preview = { target: args.target, name: args.name, svgBytes: args.svg.length }
+      } else {
+        throw new Error('要嘛给 path（本机图片文件）要嘛给 svg（SVG 源码）')
+      }
+      return withChanged(await guardedWrite(sid, 'add_costume', payload, 'pre-add_costume', preview))
+    }
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'scratch_add_sound',
+    description: '给角色加音效（本机 wav/mp3/ogg/m4a/flac，插件读盘转 base64）。'
+      + '加完会回报 rate / sampleCount / 秒数 —— 拿不到这些说明解码失败（存进去了但播不出声）。',
+    parameters: {
+      session: { type: 'string' },
+      target: { type: 'string' },
+      name: { type: 'string', description: '音效名（缺省用文件名）' },
+      path: { type: 'string', required: true, description: '本机音频路径' }
+    },
+    output: jsonOut,
+    async execute(args) {
+      const sid = needSession(args?.session)
+      if (!args?.path) throw new Error('path 必填')
+      const f = readAssetFile(args.path)
+      if (!['wav', 'mp3', 'ogg', 'm4a', 'flac'].includes(f.format)) {
+        throw new Error(`不认识的音频格式 .${f.format}（支持 wav/mp3/ogg/m4a/flac）：${f.abs}`)
+      }
+      return withChanged(await guardedWrite(sid, 'add_sound', {
+        target: args.target, name: args.name || f.name, bytes: f.base64, format: f.format
+      }, 'pre-add_sound', { target: args.target, name: args.name || f.name, file: f.abs, bytes: f.bytes.length }))
+    }
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'scratch_add_sprite',
+    description: '新建角色（等于编辑器里点「添加角色」）。角色自带造型：costumePath 给本机图片、costumeSvg 给 SVG 源码，'
+      + '都不给就一个默认方块。costumePaths 可以一次塞一堆（头像/卡面这种一角色 N 造型的场景一条调用就够）。'
+      + '走官方 sprite3 解析（含校验），**不会**改写已有角色的块 id。新角色在最上层、没有积木。',
+    parameters: {
+      session: { type: 'string' },
+      name: { type: 'string', required: true, description: '新角色名' },
+      costumePath: { type: 'string', description: '本机图片路径（做第一个造型）' },
+      costumePaths: { type: 'array', items: { type: 'string' }, description: '本机图片路径数组（一次加多个造型，造型名取文件名）' },
+      costumeSvg: { type: 'string', description: 'SVG 源码（做第一个造型，跟 path 二选一）' },
+      color: { type: 'string', description: '默认方块的颜色（默认 #4c97ff）' },
+      x: { type: 'number', description: '初始 x（缺省 0）' },
+      y: { type: 'number', description: '初始 y（缺省 0）' },
+      size: { type: 'number', description: '初始大小 1-540（缺省 100）' },
+      visible: { type: 'boolean', description: 'false = 建好就隐藏（缺省显示）' }
+    },
+    output: jsonOut,
+    async execute(args) {
+      const sid = needSession(args?.session)
+      if (!args?.name) throw new Error('name 必填')
+      const costumeList = []
+      const paths = Array.isArray(args.costumePaths) && args.costumePaths.length
+        ? args.costumePaths
+        : (args.costumePath ? [args.costumePath] : [])
+      for (const p of paths) {
+        const f = readAssetFile(p)
+        costumeList.push({ name: f.name, data: f.bytes, format: f.format })
+      }
+      if (args.costumeSvg) costumeList.push({ name: '造型1', data: Buffer.from(String(args.costumeSvg), 'utf8'), format: 'svg' })
+      const built = buildSprite3({ name: args.name, color: args.color, costumes: costumeList })
+      return withChanged(await guardedWrite(sid, 'add_sprite', {
+        zipB64: built.buffer.toString('base64'),
+        x: typeof args.x === 'number' ? args.x : undefined,
+        y: typeof args.y === 'number' ? args.y : undefined,
+        size: typeof args.size === 'number' ? args.size : undefined,
+        visible: args.visible === false ? false : undefined
+      }, 'pre-add_sprite', { name: args.name, costumes: built.costumeNames, bytes: built.buffer.length }))
     }
   }))
 
@@ -1531,7 +1674,8 @@ export function apply(ctx, config) {
 
   ctx.tools.register(defineTool({
     name: 'scratch_skills',
-    description: 'Scratch 实践经验库（公开作品里常见做法的归纳）。action=list 列出全部 skill（含摘要和开关状态）；action=read 读取某篇全文；action=toggle 开关某篇（用户表示不想让你用某经验时用它）。经验仅供参考，不是强制要求——但写积木前建议扫 sb3-json-reference。',
+    description: 'Scratch 实践经验库（公开作品里常见做法的归纳）。action=list 列出全部 skill（含摘要和开关状态）；action=read 读取某篇全文；action=toggle 开关某篇（用户表示不想让你用某经验时用它）。经验仅供参考，不是强制要求——但写积木前建议扫 sb3-json-reference、platform-traps。'
+      + 'list 的返回里还带 `backpack`（**已经做好的整块东西**：文字引擎、常用片段），别自己重造。',
     parameters: {
       action: { type: 'string', description: 'list | read | toggle（缺省 list）' },
       name: { type: 'string', description: 'skill 文件名（如 sb3-json-reference.md），read/toggle 必填' }
@@ -1544,10 +1688,19 @@ export function apply(ctx, config) {
       const action = args?.action || 'list'
       if (action === 'list') {
         const list = listSkills()
+        // 真机教训（A3）：AI 要显示中文/数字 HUD，最后自己手绘了 7 段数码管 —— 而背包里
+        // 早就躺着 142 块的「文字引擎」（4 万多个字形，纯画笔）。这不是能力缺失，是**没找到**。
+        // 所以把"背包里有什么"直接塞进 skill 列表的返回里：AI 几乎总会先扫一眼 skill。
+        let backpack = []
+        try {
+          backpack = listBackpack().items.map(x => ({ name: x.name, title: x.title, when: x.when, blocks: x.blocks }))
+        } catch { /* 背包读不了不影响 skill */ }
         return {
           count: list.length,
           skills: list,
+          backpack: backpack.length ? backpack : undefined,
           note: 'on=false 的 skill 是用户/你之前关掉的。按需 read，没必读完。'
+            + (backpack.length ? ' 背包里的东西直接 scratch_backpack_load 注进项目，别自己重写。' : '')
         }
       }
       if (action === 'read') {
@@ -2224,17 +2377,25 @@ export function apply(ctx, config) {
     name: 'scratch_run',
     description: '控制项目运行：greenflag 点绿旗（顺手确保 VM 在跑）、stopall 停止全部线程（红灯）、start/stoploop 起停 VM 循环。'
       + '默认**只回** running/threads/clones/stepMs 这几个数（D5：以前每次都回完整 before/after 状态转储，30+ 变量 + 38 个列表长度）。'
-      + '要看全量变量/线程就传 detail:true。running:true **只代表 VM 有活线程**，不代表界面在响应（窗口假活看 scratch_selftest 的帧心跳）。',
+      + '要看全量变量/线程就传 detail:true。running:true **只代表 VM 有活线程**，不代表界面在响应（窗口假活看 scratch_selftest 的帧心跳）。'
+      + '**别用固定时长等游戏走到某一步**，用 until 等状态：{var:"MODE",op:"==",value:2}（op 支持 == != > < >= <= contains）。'
+      + 'waitMs 上限 30000（以前 5000，真机实测"跑到 Boss"十几秒根本不够）。',
     parameters: {
       session: { type: 'string' },
       action: { type: 'string', description: 'greenflag | stopall | start | stoploop（缺省 greenflag）' },
-      waitMs: { type: 'number', description: '动作后等多久再读数（缺省 300ms，给脚本跑几帧）' },
+      waitMs: { type: 'number', description: '动作后等多久再读数（缺省 300ms；给了 until 时它是**超时上限**，缺省 10000，最大 30000）' },
+      until: { type: 'object', additionalProperties: true, description: '等到条件满足就立刻返回：{var:"变量名", op:"==", value:期望值}；返回 until:{met,waitedMs,value,reason}' },
       detail: { type: 'boolean', description: 'true = 连完整状态（页面变量、克隆体分布、线程清单）一起回' }
     },
     output: jsonOut,
     async execute(args) {
       const sid = needSession(args?.session)
-      return await call(sid, 'run', { action: args?.action || 'greenflag', waitMs: args?.waitMs, detail: args?.detail === true }, 30000)
+      return await call(sid, 'run', {
+        action: args?.action || 'greenflag',
+        waitMs: args?.waitMs,
+        until: args?.until && typeof args.until === 'object' ? args.until : undefined,
+        detail: args?.detail === true
+      }, 40000)
     }
   }))
 
@@ -2242,13 +2403,16 @@ export function apply(ctx, config) {
     name: 'scratch_state',
     description: '读运行时状态（只读）：running（有没有线程在跑）、threads、targets、克隆体分布、stepMs/fps、舞台标量变量。'
       + '列表默认只报长度，但会给 pageListDelta（和上一次 state 比，C2：列表是不是在泄漏不用再靠运气发现）。'
-      + '想看某几项就传 listSlice:{name, from, count}（**下标从 1 开始**）。'
+      + '想看某几项就传 listSlice:{name, from, count}（**下标从 1 开始**）；要一次看多条就传数组 '
+      + 'listSlice:[{name:"E_ALIVE"},{name:"O_HP",from:4,count:12}]（或简写 ["E_ALIVE","O_HP"]），'
+      + '结果在 listSlices 里（以前一次只能问一条，查 4 条列表要 4 次调用）。'
       + '「点了没反应」「到底跑没跑」这类问题先看这个；但 running:true 只代表 VM 在跑，界面是否冻结看 scratch_selftest。',
     parameters: {
       session: { type: 'string' },
       target: { type: 'string', description: '顺带报这个角色的坐标/大小/可见/局部变量' },
       includeLists: { type: 'boolean', description: '把列表内容也回传（长列表会很大，缺省只看长度）' },
-      listSlice: { type: 'object', additionalProperties: true, description: '只读某个列表的一段：{name:"列表名", from:1, count:20}（from 从 1 开始）' }
+      listSlice: { type: 'object', additionalProperties: true, description: '只读某个列表的一段：{name:"列表名", from:1, count:20}（from 从 1 开始）' },
+      listSlices: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '一次读多条列表：[{name:"E_ALIVE"},{name:"O_HP",from:4,count:12}]' }
     },
     output: jsonOut,
     async execute(args) {
@@ -2256,7 +2420,8 @@ export function apply(ctx, config) {
       return await call(sid, 'state', {
         target: args?.target,
         includeLists: args?.includeLists === true,
-        listSlice: args?.listSlice
+        listSlice: args?.listSlice,
+        listSlices: Array.isArray(args?.listSlices) ? args.listSlices : undefined
       })
     }
   }))
@@ -2266,8 +2431,9 @@ export function apply(ctx, config) {
     description: '点舞台上的东西：给 target（按名字找角色/克隆体，用造型包围盒中心）或给 x/y（舞台坐标 -240..240 / -180..180）。'
       + '先发真实鼠标事件，再用 renderer.pick 确认**这个坐标上到底有没有东西**（F4：以前 hatsStarted:0 但流程确实推进了，'
       + '分不清是"没命中"还是"命中了但没点击帽子"）。'
-      + '返回：pick（命中谁）/ pickMissed / started（这次新起了哪些线程）/ hatsStarted / via。'
-      + 'hatsStarted:0 且 threads>0 时会明确说"流程可能是已有线程推进的，别据此判断点击失败"。',
+      + '返回：pick（命中谁）/ pickMissed / started（这次新起了哪些线程）/ hatsStarted / via / changedVars（**点击前后变量变了哪几个**）。'
+      + 'hatsStarted:0 且 threads>0 时会明确说"流程可能是已有线程推进的，别据此判断点击失败"——'
+      + '实测广播接收线程在同一 tick 里跑完时 hatsStarted 经常是 0，这时看 changedVars 才是准的。',
     parameters: {
       session: { type: 'string' },
       target: { type: 'string', description: '要点的角色名（有克隆体时优先可见的那个）' },
@@ -2357,7 +2523,7 @@ export function apply(ctx, config) {
       + '只有桌面版 CDP 会话能用（浏览器扩展那条路没有这个能力，也不打算加 —— 要截图就用 open_editor({app:"desktop"}) 开桌面版）。',
     parameters: {
       session: { type: 'string' },
-      path: { type: 'string', description: '存到哪（缺省 <快照目录同级>/scratch-shots/时间戳.png）' },
+      path: { type: 'string', description: '存到哪（缺省 <快照目录同级>/scratch-shots/时间戳.png）。要交付/写进 README 就直接给项目里的路径，省得再拷一次' },
       format: { type: 'string', description: 'png | jpeg（缺省 png）' },
       quality: { type: 'number', description: 'jpeg 质量 1-100（缺省 80）' },
       region: { type: 'string', description: 'full（缺省）| stage（只截舞台）| workspace（只截积木区）' }
@@ -2602,11 +2768,13 @@ export function apply(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'scratch_target',
     description: '角色级的操作：action:"list" 列角色（名字 / 是否舞台 / 块数 / 造型数），'
-      + 'action:"rename" 给角色改名（G2：以前改不了，只能手改 project.json；会同步引用角色名的积木，重名会自动去重）。',
+      + 'action:"rename" 给角色改名（G2：以前改不了，只能手改 project.json；会同步引用角色名的积木，重名会自动去重），'
+      + 'action:"delete" 删角色（连同它的克隆体；**不能**删舞台、也不会删最后一个角色）。'
+      + '新建角色用 scratch_add_sprite。',
     parameters: {
       session: { type: 'string' },
-      action: { type: 'string', description: 'list（缺省）| rename' },
-      target: { type: 'string', description: 'rename 时的目标角色名' },
+      action: { type: 'string', description: 'list（缺省）| rename | delete' },
+      target: { type: 'string', description: 'rename / delete 的目标角色名' },
       to: { type: 'string', description: 'rename 的新名字' }
     },
     output: jsonOut,
@@ -2627,7 +2795,12 @@ export function apply(ctx, config) {
         return withChanged(await guardedWrite(sid, 'rename_target', { target: args.target, to: args.to },
           `pre-rename-${args.target || ''}`, { target: args.target, to: args.to }))
       }
-      throw new Error(`未知 action "${action}"（list / rename）`)
+      if (action === 'delete') {
+        if (!args?.target) throw new Error('delete 需要 target（要删哪个角色）')
+        return withChanged(await guardedWrite(sid, 'delete_sprite', { target: args.target },
+          `pre-delete-${args.target}`, { target: args.target }))
+      }
+      throw new Error(`未知 action "${action}"（list / rename / delete）`)
     }
   }))
 

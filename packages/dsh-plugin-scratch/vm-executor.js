@@ -310,6 +310,77 @@
     return all.filter(t => t.getName() === name)
   }
 
+  /**
+   * base64 → 字节。资源（PNG/MP3）走这条：插件侧读文件、页面侧建 asset。
+   * ⚠️ 必须还原成**字节**再交给 storage.createAsset（字符串会被 Asset.decodeText 当 ArrayBuffer 解，
+   *    抛 "parameter 1 is not of type 'ArrayBuffer'"，见 add_costume 那段注释）。
+   */
+  function b64Bytes(b64) {
+    const s = String(b64 || '')
+    if (!s) throw new Error('base64 内容为空')
+    const bin = atob(s)
+    const out = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
+    return out
+  }
+
+  /** 图片/音频格式 → storage.AssetType + dataFormat 归一 */
+  const COSTUME_FORMATS = { png: 'png', jpg: 'jpg', jpeg: 'jpeg', gif: 'gif', bmp: 'bmp', svg: 'svg', webp: 'webp' }
+  const SOUND_FORMATS = { wav: 'wav', mp3: 'mp3', ogg: 'ogg', oga: 'ogg', m4a: 'm4a', flac: 'flac' }
+
+  /**
+   * 等到某个变量满足条件（scratch_run 的 until）。为什么不是「等 15 秒」：
+   * 真机实测等固定时长很脆弱 —— 帧率、倍速、加载时间一变就对不上；而且一旦提前满足，
+   * 后面几秒全白等。这里轮询 50ms，满足就立刻返回，附带 waitedMs 说明等了多少。
+   * 找不到变量**不抛错**（可能只是还没被创建），如实报 met:false + reason。
+   */
+  async function waitUntil(vm, cond, timeoutMs) {
+    const name = String(cond.var || cond.name || '')
+    if (!name) throw new Error('until 需要 { var: "变量名", op?: "==", value: 期望值 }')
+    const op = String(cond.op || '==')
+    const want = cond.value
+    const deadline = Date.now() + Math.max(Number(timeoutMs) || 0, 0)
+    const started = Date.now()
+    const read = () => {
+      const all = vm.runtime.targets || []
+      for (const t of all) {
+        if (!t || !t.variables) continue
+        for (const v of Object.values(t.variables)) {
+          if (v && v.name === name && v.type !== 'list') return v.value
+        }
+      }
+      return undefined
+    }
+    const test = (got) => {
+      switch (op) {
+        case '==': return String(got) === String(want)
+        case '!=': return String(got) !== String(want)
+        case '>': return Number(got) > Number(want)
+        case '<': return Number(got) < Number(want)
+        case '>=': return Number(got) >= Number(want)
+        case '<=': return Number(got) <= Number(want)
+        case 'contains': return String(got).includes(String(want))
+        default: throw new Error(`until.op 不认识：${op}（== != > < >= <= contains）`)
+      }
+    }
+    let last
+    let seen = false
+    for (;;) {
+      last = read()
+      if (last !== undefined) seen = true
+      if (seen && test(last)) return { met: true, waitedMs: Date.now() - started, value: clipScalar(last) }
+      if (Date.now() >= deadline) {
+        return {
+          met: false,
+          waitedMs: Date.now() - started,
+          value: seen ? clipScalar(last) : undefined,
+          reason: seen ? '等到超时，条件仍不满足' : `没找到变量「${name}」（检查名字，或它是不是还没被创建）`
+        }
+      }
+      await sleepMs(50)
+    }
+  }
+
   function clipScalar(v) {
     // 数字/布尔原样给（AI 要判断真假和大小，别全变字符串）；字符串超长才截断
     if (typeof v === 'number' || typeof v === 'boolean') return v
@@ -2166,19 +2237,31 @@
         const t = findTarget(vm, args && args.target)
         const storage = vm.runtime.storage
         if (!storage) throw new Error('storage 不可用')
-        const svgText = String((args && args.svg) || '')
-        if (!svgText.trim()) throw new Error('svg 不能为空')
-        if (!/<svg[\s>]/i.test(svgText)) throw new Error('svg 看起来不是 SVG 源码（要以 <svg …> 开头）')
-        const bytes = new TextEncoder().encode(svgText)
-        const asset = storage.createAsset(
-          storage.AssetType.ImageVector, 'svg', bytes, null, true
-        )
+        // 两个入口：svg（源码文本）| bytes + format（本机图片文件，插件侧读成 base64）
+        let bytes
+        let dataFormat
+        let assetType
+        if (args && args.bytes) {
+          dataFormat = COSTUME_FORMATS[String(args.format || 'png').toLowerCase()]
+          if (!dataFormat) throw new Error(`不认识的图片格式 "${args.format}"（png/jpg/jpeg/gif/bmp/svg/webp）`)
+          bytes = b64Bytes(args.bytes)
+          if (bytes.length < 16) throw new Error('图片内容太短，不像是有效文件')
+          assetType = dataFormat === 'svg' ? storage.AssetType.ImageVector : storage.AssetType.ImageBitmap
+        } else {
+          const svgText = String((args && args.svg) || '')
+          if (!svgText.trim()) throw new Error('svg 不能为空')
+          if (!/<svg[\s>]/i.test(svgText)) throw new Error('svg 看起来不是 SVG 源码（要以 <svg …> 开头）')
+          bytes = new TextEncoder().encode(svgText)
+          dataFormat = 'svg'
+          assetType = storage.AssetType.ImageVector
+        }
+        const asset = storage.createAsset(assetType, dataFormat, bytes, null, true)
         const md5ext = asset.assetId + '.' + asset.dataFormat
         const name = (args && args.name) || 'ai-costume'
         await vm.addCostume(md5ext, {
           name,
           assetId: asset.assetId, // 5.x 序列化器直接读此字段（缺了会导致快照 sb3 验证失败）
-          md5ext, dataFormat: 'svg',
+          md5ext, dataFormat,
           asset // load-costume 会从它派生 md5 / dataFormat
           // 故意不给 rotationCenterX/Y：留空时 load-costume 会用 renderer.getSkinRotationCenter
           // 按真实图形算旋转中心（load-costume.js:409-412）。硬编码 48/50 会把任意尺寸的
@@ -2194,16 +2277,126 @@
             try { t.deleteCostume(idx) } catch { /* 撤不掉也要把错误报出来 */ }
           }
           throw new Error(
-            '这个 SVG 渲染器没载入（skin 为空）—— 多半是缺 width/height/viewBox、或图形为空。'
-            + '已经把它从项目里撤掉了（不留 "?" 占位造型）。换一个带实际图形和宽高的 SVG 再来。'
+            `这个${dataFormat === 'svg' ? ' SVG' : '图片'}渲染器没载入（skin 为空）—— 多半是缺 width/height/viewBox（SVG）、`
+            + '或者文件本身损坏/不是真图片。已经把它从项目里撤掉了（不留 "?" 占位造型）。换一个能正常打开的再试。'
           )
         }
         return {
           costume: added.name || name,
           md5ext,
+          dataFormat,
           skin: !!added.skinId,
           rotationCenter: [added.rotationCenterX, added.rotationCenterY],
           size: Array.isArray(added.size) ? added.size : undefined
+        }
+      }
+      case 'add_sound': {
+        // 音频：storage.createAsset(Sound) → vm.addSound（内部 decodeSoundPlayer 填 sampleCount/rate）
+        const t = findTarget(vm, args && args.target)
+        const storage = vm.runtime.storage
+        if (!storage) throw new Error('storage 不可用')
+        if (typeof vm.addSound !== 'function') throw new Error('这个宿主没有 vm.addSound（老版本 VM？）')
+        const dataFormat = SOUND_FORMATS[String((args && args.format) || 'wav').toLowerCase()]
+        if (!dataFormat) throw new Error(`不认识的音频格式 "${args.format}"（wav/mp3/ogg/m4a/flac）`)
+        const bytes = b64Bytes(args && args.bytes)
+        if (bytes.length < 32) throw new Error('音频内容太短，不像是有效文件')
+        const asset = storage.createAsset(storage.AssetType.Sound, dataFormat, bytes, null, true)
+        const md5ext = asset.assetId + '.' + asset.dataFormat
+        const name = (args && args.name) || 'ai-sound'
+        // ⚠️ 两个形状都是真机试出来的：
+        //   ① TurboWarp 的 vm.addSound 是**两个参数** (sound, targetId) —— 上游 scratch-vm 才是三个
+        //      (md5ext, sound, targetId)。参数对不上时它会把 sound 对象当 targetId，
+        //      报 "No target with ID: [object Object]"。
+        //   ② 声音对象里的文件名字段叫 **md5**（不是 md5ext）—— 少了它 loadSound 里
+        //      `sound.md5.indexOf(...)` 直接抛 "Cannot read properties of undefined"。
+        //   照抄项目里已有音效的字段名（assetId/rate/sampleCount/name/md5/dataFormat/data/asset/soundId）。
+        const sound = {
+          name,
+          assetId: asset.assetId,
+          md5: md5ext,
+          dataFormat,
+          // asset 必须给**真 asset 对象**：给 '' 时它退回 storage.load，解出来 sampleCount=2
+          // （真机实测：加了但放出来是空的）。照抄"从文件加音效"这条路上能用的形状。
+          asset,
+          soundId: asset.assetId
+        }
+        if (vm.addSound.length >= 3) await vm.addSound(md5ext, sound, t.id)
+        else await vm.addSound(sound, t.id)
+        const list = t.getSounds() || []
+        const added = list.filter(s => s && s.assetId === asset.assetId).slice(-1)[0] || list[list.length - 1]
+        return {
+          sound: added ? added.name : name,
+          md5ext,
+          dataFormat,
+          // decodeSoundPlayer 失败时这两项会是 undefined/NaN —— 那就是"存进去了但播不出声"
+          rate: added && Number.isFinite(added.rate) ? added.rate : undefined,
+          sampleCount: added && Number.isFinite(added.sampleCount) ? added.sampleCount : undefined,
+          seconds: added && Number.isFinite(added.sampleCount) && Number.isFinite(added.rate) && added.rate
+            ? Math.round((added.sampleCount / added.rate) * 100) / 100
+            : undefined,
+          ok: !!(added && added.soundId)
+        }
+      }
+      case 'add_sprite': {
+        // 新角色：插件侧把 .sprite3（zip）拼好传进来，这里交给 vm.addSprite 走官方解析 + 校验。
+        // 为什么不在页面里手搓 RenderedTarget：drawableID/skin/序列化任何一环漏了就变成
+        // 「角色在列表里但看不见、点不到」—— 那类 bug 最难查。官方入口一次到位。
+        if (typeof vm.addSprite !== 'function') throw new Error('这个宿主没有 vm.addSprite（老版本 VM？）')
+        const bytes = b64Bytes(args && args.zipB64)
+        const before = new Set((vm.runtime.targets || []).map(x => x.id))
+        await vm.addSprite(bytes.buffer)
+        const created = (vm.runtime.targets || []).filter(x => !before.has(x.id) && x.isOriginal)
+        const t = created[0]
+        if (!t) throw new Error('vm.addSprite 没报错，但运行时里没多出角色（宿主实现变了？）')
+        // 位置/大小：addSprite 只认 sprite3 里的值，这里按参数补（用户/AI 通常想直接摆好）
+        if (typeof args.x === 'number') t.setXY(args.x, typeof args.y === 'number' ? args.y : 0)
+        if (typeof args.size === 'number') t.setSize(args.size)
+        if (typeof t.setVisible === 'function') t.setVisible(args.visible !== false)
+        return {
+          added: [t.getName()],
+          sprite: t.getName(),
+          costumes: (t.getCostumes() || []).map(c => c.name),
+          sounds: (t.getSounds() || []).map(s => s.name),
+          drawable: t.drawableID,
+          xy: [Math.round(t.x), Math.round(t.y)],
+          zOrder: t.layerOrder,
+          hint: '新角色在最上层；它没有积木（要写脚本用 scratch_add_blocks target 指到它）。'
+            + '注意 add_sprite 走的是官方 sprite3 解析，**不影响**已有角色的块 id。'
+        }
+      }
+      case 'delete_sprite': {
+        // 删角色：**不能**用 vm.deleteSprite —— 桌面版把它包成了带 confirm() 的 GUI 动作，
+        // 自动化调用会弹一个"确定删除吗"的模态框卡住整条链路。这里直接做运行时层面的删除。
+        const rt = vm.runtime
+        const t = findTarget(vm, args && args.target)
+        if (t.isStage) throw new Error('舞台删不了（要删角色就指名道姓）')
+        const name = t.getName()
+        const others = (rt.targets || []).filter(x => x.isOriginal && !x.isStage && x.sprite !== t.sprite)
+        if (!others.length) throw new Error(`「${name}」是最后一个角色，删了项目就只剩舞台了 —— 拒绝。`)
+        const victims = (rt.targets || []).filter(x => x.sprite === t.sprite)
+        const victimIds = new Set(victims.map(v => v.id))
+        for (const v of victims) {
+          try { rt.stopForTarget(v) } catch { /* 没线程在跑就算了 */ }
+          try { rt.disposeTarget(v.id) } catch { /* 已经没了 */ }
+          const i = rt.targets.indexOf(v)
+          if (i >= 0) rt.targets.splice(i, 1)
+        }
+        // 监视器指着被删的角色会留在画面上显示 undefined
+        if (Array.isArray(rt.monitors)) {
+          rt.monitors = rt.monitors.filter(m => !m || !victimIds.has(m.targetId))
+        }
+        // 编辑目标被删了 → 挑一个活着的（优先别的角色，没有就舞台）
+        if (vm.editingTarget && victimIds.has(vm.editingTarget.id)) {
+          const next = others[0] || rt.getTargetForStage()
+          if (next && typeof vm.setEditingTarget === 'function') vm.setEditingTarget(next.id)
+        }
+        try { vm.emitTargetsUpdate && vm.emitTargetsUpdate() } catch { /* GUI 没接上就算了 */ }
+        try { vm.emitWorkspaceUpdate && vm.emitWorkspaceUpdate() } catch { /* 没块的角色切过去会报 */ }
+        try { rt.emitProjectChanged && rt.emitProjectChanged() } catch { /* 同上 */ }
+        return {
+          deleted: [name],
+          clonesRemoved: victims.length - 1,
+          remaining: (rt.targets || []).filter(x => x.isOriginal).map(x => x.getName())
         }
       }
       case 'restore': {
@@ -2849,13 +3042,23 @@
           throw new Error(`未知 action ${action}（greenflag | stopall | start | stoploop）`)
         }
         // 让绿旗线程真的跑起来几帧，用户才看得到变化（也给调用方一个稳定的读数）
-        const wait = Math.min(Math.max(Number(a.waitMs) || 300, 0), 5000)
-        if (wait) await sleepMs(wait)
+        // waitMs 上限从 5s 提到 30s：真实游戏「跑到 Boss 出场」动辄十几秒，5s 根本不够
+        // （实测只能拆成好几次调用，而游戏在两次调用之间还在跑，读数就对不上了）。
+        // 更推荐用 until（见下）：等到某个状态而不是干等固定时长。
+        const waitRaw = a.waitMs === undefined ? (a.until ? 10000 : 300) : Number(a.waitMs)
+        const wait = Math.min(Math.max(waitRaw || 0, 0), 30000)
+        let untilInfo
+        if (a.until && typeof a.until === 'object') {
+          untilInfo = await waitUntil(vm, a.until, wait)
+        } else if (wait) {
+          await sleepMs(wait)
+        }
         const after = snap()
         return {
           action,
           before,
           after,
+          until: untilInfo,
           // 变量真的动了几个：给"绿旗到底有没有跑起来"一个不看全量也能懂的读数
           changedVars: (() => {
             if (brief) return undefined
@@ -2869,10 +3072,13 @@
             }
             return n ? out : undefined
           })(),
-          hint: action === 'greenflag' && !after.running
-            ? '绿旗点了，但没有任何线程在跑 —— 项目可能没有接绿旗的脚本，或者脚本第一帧就结束了（这种是正常现象）。'
-              + '注意：running:true 只代表 VM 在跑，不代表界面在响应（窗口卡死时 VM 照样在跑，用 scratch_selftest 的帧心跳判断）。'
-            : '注意：running:true 只代表 VM 有活线程，不代表界面在响应；界面是否卡死看 scratch_selftest 的"帧心跳"'
+          hint: untilInfo && !untilInfo.met
+            ? `没等到条件满足（${untilInfo.reason || '超时'}）。想多等一会儿就把 waitMs 调大（上限 30000）；`
+              + '想等的是列表/克隆数就用 scratch_state 自己轮询。'
+            : (action === 'greenflag' && !after.running
+              ? '绿旗点了，但没有任何线程在跑 —— 项目可能没有接绿旗的脚本，或者脚本第一帧就结束了（这种是正常现象）。'
+                + '注意：running:true 只代表 VM 在跑，不代表界面在响应（窗口卡死时 VM 照样在跑，用 scratch_selftest 的帧心跳判断）。'
+              : '注意：running:true 只代表 VM 有活线程，不代表界面在响应；界面是否卡死看 scratch_selftest 的"帧心跳"')
         }
       }
 
@@ -2907,23 +3113,40 @@
         }
         if (Object.keys(lenNow).length) stateLastLengths = Object.assign({}, lenNow)
         // G7：想确认 520 项里第 328 项是 0 还是 1，以前只能整份拉（两条列表 ≈ 6KB）
-        if (a.listSlice && typeof a.listSlice === 'object') {
-          const name = a.listSlice.name
-          const from = Math.max(1, Number(a.listSlice.from) || 1) // Scratch 列表 1-based
-          const count = Math.min(Math.max(Number(a.listSlice.count) || 20, 1), 500)
+        // 支持一次问多条：listSlice: [...]（真机实测「查 4 条列表要 4 次调用」纯属浪费往返）
+        const sliceSpecs = (() => {
+          const raw = a.listSlice !== undefined ? a.listSlice : a.listSlices
+          if (!raw) return []
+          const arr = Array.isArray(raw) ? raw : [raw]
+          return arr.map(s => (typeof s === 'string' ? { name: s } : s)).filter(s => s && s.name)
+        })()
+        if (sliceSpecs.length) {
           const stage = rt.getTargetForStage()
           const named = a.target ? (rt.targets || []).find(x => x.getName() === a.target) : null
-          const owner = [vm.editingTarget, named, stage].find(o => o && o.variables && Object.values(o.variables).some(v => v.name === name && (v.type === 'list' || Array.isArray(v.value))))
-          const v = owner && Object.values(owner.variables).find(x => x.name === name)
-          if (!v) throw new Error(`找不到列表「${name}」（可用于 state.listSlice 的列表见 pageLists）`)
-          const arr = Array.isArray(v.value) ? v.value : []
-          st.listSlice = {
-            name,
-            length: arr.length,
-            from,
-            // 下标照 Scratch 的 1-based 习惯来，省得 AI 自己减一（这是 H1 那个坑）
-            values: arr.slice(from - 1, from - 1 + count).map(clipScalar)
+          const out = []
+          for (const spec of sliceSpecs.slice(0, 20)) {
+            const name = spec.name
+            const from = Math.max(1, Number(spec.from) || 1) // Scratch 列表 1-based
+            const count = Math.min(Math.max(Number(spec.count) || 20, 1), 500)
+            const owner = [vm.editingTarget, named, stage].find(o => o && o.variables && Object.values(o.variables).some(v => v.name === name && (v.type === 'list' || Array.isArray(v.value))))
+            const v = owner && Object.values(owner.variables).find(x => x.name === name)
+            if (!v) {
+              // 单条模式仍然抛错（老行为，报错信息有用）；多条模式里只标一下，别整条调用失败
+              if (sliceSpecs.length === 1) throw new Error(`找不到列表「${name}」（可用于 state.listSlice 的列表见 pageLists）`)
+              out.push({ name, error: '找不到这个列表' })
+              continue
+            }
+            const arr = Array.isArray(v.value) ? v.value : []
+            out.push({
+              name,
+              length: arr.length,
+              from,
+              // 下标照 Scratch 的 1-based 习惯来，省得 AI 自己减一（这是 H1 那个坑）
+              values: arr.slice(from - 1, from - 1 + count).map(clipScalar)
+            })
           }
+          st.listSlice = out[0]
+          st.listSlices = out
         }
         return st
       }
@@ -3103,6 +3326,11 @@
         // 没命中再退化到「显式启动这个角色的点击帽子」——克隆体/无渲染环境下 pick 不可靠。
         const rt = vm.runtime
         const a = args || {}
+        // 点完到底有没有生效，以前只能再调一次 scratch_state 对比（实测就是这样排查的）。
+        // 这里直接给「点击前后变量变了哪几个」—— hatsStarted 不可靠时它才是真凭据。
+        const varsBefore = (() => {
+          try { return runtimeState(vm, { includeLists: false }).pageVars || {} } catch { return {} }
+        })()
         let target = null
         if (a.target) {
           const cands = findTargets(vm, a.target)
@@ -3196,6 +3424,18 @@
           } catch (e) { via = 'hat-error: ' + e.message }
         }
         const aliveThreads = (rt.threads || []).filter(th => th.status !== 4).length
+        const varsChanged = (() => {
+          try {
+            const now = runtimeState(vm, { includeLists: false }).pageVars || {}
+            const out = {}
+            let n = 0
+            for (const k of Object.keys(now)) {
+              if (varsBefore[k] !== now[k]) { out[k] = now[k]; n++ }
+              if (n >= 12) break
+            }
+            return n ? out : null
+          } catch { return null }
+        })()
         return {
           clicked: target ? target.getName() : null,
           isClone: target ? !target.isOriginal : undefined,
@@ -3208,6 +3448,8 @@
           pickMissed: !pickHit && !pickError && !postError ? true : undefined,
           started: startedList.length ? startedList : undefined,
           hatsStarted: startedList.length,
+          // 点击生效的**真凭据**：变量变了哪几个（hatsStarted=0 但流程推进过的情况真的存在）
+          changedVars: varsChanged || undefined,
           running: aliveThreads > 0,
           threads: aliveThreads,
           hint: via === 'hat-fallback'

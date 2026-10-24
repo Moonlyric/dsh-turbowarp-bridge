@@ -26,7 +26,7 @@ let config
 try { mod.apply(fakeCtx, { safety: 'preview', bridgePort: 31999, maxSnapshots: 5, skillsEnabled: true }) } catch (e) { console.log('apply threw (expected if bridge binds):', e.message) }
 
 // ⚠️ 加了新工具就要改这个数（它是个防手滑的探针：少一个立刻红）
-t('38 个工具注册（36 功能 + skill 2 个）', registered.size === 38, String(registered.size) + ': ' + [...registered.keys()].join(','))
+t('40 个工具注册（38 功能 + skill 2 个）', registered.size === 40, String(registered.size) + ': ' + [...registered.keys()].join(','))
 t('scratch_skills 注册', registered.has('scratch_skills'))
 t('scratch_skill_edit 注册', registered.has('scratch_skill_edit'))
 

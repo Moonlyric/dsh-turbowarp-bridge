@@ -55,7 +55,9 @@ AI 侧的入口是 `scratch_open_editor`：用户说「打开 TurboWarp」时，
 | **主动唤起** | `scratch_open_editor`：AI 自己开浏览器/桌面版并等会话连上；新增 `path` 装作品 | ✅ 2026-10-16 / 扩展于 2026-10-17 |
 | **文件往返** | `scratch_load_project` / `scratch_save_project`（打开本机 .sb3、存回磁盘、默认不覆盖） | ✅ |
 | **M3** | 断链/接链（`move_block` 四模式）、变量/列表增删改（`variable`）、造型删改（`costume`） | ✅ v0.9.0 / v0.9.1（替身层 246 + 插件 128 + 桌面真机 134） |
-| **背包** | **AI 自维护的代码块背包**：把做好的可复用积木（pen 文字引擎、弹幕骨架、ECS 骨架…）预存下来，下次直接取用 | ✅ v0.8.0（36+14 条断言，见下） |
+| **背包** | **AI 自维护的代码块背包**：把做好的可复用积木（pen 文字引擎、弹幕骨架、ECS 骨架…）预存下来，下次直接取用 | ✅ v0.8.0（39 条断言，见下） |
+| **资源导入** | 真机反馈驱动的 v0.14.0：`add_sprite`（角色，走官方 sprite3 校验）/ `add_costume` 吃本机 **PNG** / `add_sound`（WAV）/ `blocksFile` 批量注入 / `target delete` —— 从此"有美术资源的作品"不用自己写 sb3 打包器 | ✅ v0.14.0（真桌面版 CDP 验收，见 STATUS） |
+| **运行观测** | `run.until`（等到状态而不是干等）、`state.listSlices`（一次问多条列表）、`click.changedVars`（点击前后的变量 diff）、`run.waitMs` 上限 5s→30s | ✅ v0.14.0 |
 | **M4** | 多标签页路由（SW 已按 tab 记账，还差 UI）、快照 diff 预览 UI、性能（大项目分页读） | 部分（路由已做） |
 | **M5** | 发布：npm 组合包 + `dsh plugin add`（版本锁定） | 未开始 |
 

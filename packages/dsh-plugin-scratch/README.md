@@ -6,7 +6,7 @@ AI 通过 `scratch_*` 工具读取/修改 Scratch 项目，用户在 TurboWarp �
 架构（两条传输路径，读写的是**同一份**页面执行器）：
 
 ```
-本插件（Node）= WebSocket 服务端（桥 :31820） + CDP 直连客户端 + 38 个 scratch_* 工具 + Skill 经验库 + 积木背包
+本插件（Node）= WebSocket 服务端（桥 :31820） + CDP 直连客户端 + 40 个 scratch_* 工具 + Skill 经验库 + 积木背包
 
   路一 · 扩展桥
         ↕ JSON-RPC over ws（握手 token）
@@ -126,7 +126,7 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
 > **只有浏览器（扩展桥）那条路要 token。** 桌面版走 CDP 直连：不用扩展、不用 token，
 > 因为它连的是"我们自己拉起来、自己注执行器"的进程，没有"本机任意页面都能连进来"这个问题。
 
-## 工具清单（38 个）
+## 工具清单（40 个）
 
 | 工具 | 方向 | 说明 |
 |---|---|---|
@@ -139,7 +139,10 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
 | `scratch_add_blocks` | 写 | 注入块：sb3 dict 进 → 自动转活块形态、ID 换新、扩展自动加载、返回 `idMap` |
 | `scratch_apply` | 写 | preview 档确认后落盘（传 `planId`） |
 | `scratch_locate` | UI | 工作区滚到块并高亮 3 秒（`scrolledBy` 会告诉你实际走的哪条滚动 API） |
-| `scratch_add_costume` | 写 | SVG → 造型（SVG 按**字节**存；载入失败会自己撤掉并报错，不留 "?" 占位造型）。桌面版也照常可用 —— 历史上"加完造型会话就死"的根因是 CDP 被 iframe 抢了上下文，v0.9.1 已修 |
+| `scratch_add_costume` | 写 | 加造型：`path`（本机 **PNG/JPG/GIF/BMP/WEBP/SVG 文件**）或 `svg`（源码）。载入失败会自己撤掉并报错，不留 "?" 占位造型。桌面版也照常可用 —— 历史上"加完造型会话就死"的根因是 CDP 被 iframe 抢了上下文，v0.9.1 已修 |
+| `scratch_add_sound` | 写 | 加音效（本机 wav/mp3/ogg/m4a/flac）。回报 rate / sampleCount / 秒数 —— 拿不到就是解码失败（存进去了但没声） |
+| `scratch_add_sprite` | 写 | 新建角色（走官方 sprite3 解析 + 校验）：`costumePath` / `costumePaths` / `costumeSvg`，可带 x/y/size/visible |
+| `scratch_target` | 写 | 角色级：`list` / `rename` / `delete`（连克隆体一起删；舞台和最后一个角色删不掉） |
 | `scratch_costume` | 写 | 造型 `rename` / `delete` / `set`（只剩一个造型时拒绝删除） |
 | `scratch_rollback` | 写 | 回滚快照（内存 + 磁盘双保险，dsh 重启也能滚） |
 | `scratch_update_block` | 写 | 改 `fields` 下拉 / `inputs` 输入值 / `x,y` 坐标（改完那块会**亮一下**） |
@@ -152,9 +155,9 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
 | `scratch_user_context` | 读 | 用户最近动作（选块 / 绿旗 / 运行态）+ 当前选中块 |
 | `scratch_skills` | 读 | 经验库 list / read / toggle |
 | `scratch_skill_edit` | 写 | 经验库 create / update / append / delete |
-| `scratch_run` | 运行 | 点绿旗 / 停止全部 / 起停 VM 循环，返回动作前后的线程数、克隆数、页面变量 |
-| `scratch_state` | 读 | 运行期快照：`running`/`threads`/`targets`/`clones`/`stepMs`/`fps`/标量页变量；带 `target` 时附坐标/大小/可见/局部变量 |
-| `scratch_click` | 运行 | 点角色（按可见性→造型名筛克隆体，取包围盒中心）或点舞台坐标；`via` 说明走的是真 `pick` 还是退化的点击帽子 |
+| `scratch_run` | 运行 | 点绿旗 / 停止全部 / 起停 VM 循环，返回动作前后的线程数、克隆数、页面变量。`waitMs` 上限 **30s**；更推荐 `until:{var,op,value}`（等到状态，如 `MODE==2`，命中就提前返回 `waitedMs`） |
+| `scratch_state` | 读 | 运行期快照：`running`/`threads`/`targets`/`clones`/`stepMs`/`fps`/标量页变量；带 `target` 时附坐标/大小/可见/局部变量。`listSlice` / `listSlices` **一次问多条列表** |
+| `scratch_click` | 运行 | 点角色（按可见性→造型名筛克隆体，取包围盒中心）或点舞台坐标；`via` 说明走的是真 `pick` 还是退化的点击帽子；`changedVars` 给出**点击前后变了哪几个变量**（hatsStarted 不可靠时看它） |
 | `scratch_press_key` | 运行 | 按键（空格 `" "`、`"ArrowUp"`、字母 `"a"`），可按住 `holdMs` |
 | `scratch_profile` | 读 | 采样 VM 每步耗时 → avg/p50/p95/max + 反推 fps（别信项目里的 `fps` 变量）；**默认带热点归因** `attribution.hot`（哪条脚本/哪些 opcode 在吃帧，空转单列 `waitPct`） |
 | `scratch_screenshot` | 读 | 截编辑器窗口（CDP；180-208ms 量级）落盘给路径 —— 给用户看效果 / 自己核对画面。**只有桌面版那条路能截**，扩展会话会明确拒绝（不打算给扩展加 `captureVisibleTab`） |
@@ -164,7 +167,6 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
 | `scratch_project_overview` | 读 | **一次看清整个项目**：每角色 opcode 直方图 + 自定义积木（参数 / warp / 被调用次数）+ 脚本一行摘要 |
 | `scratch_inspect` | 读 | **单个块**的上下文：parent + 槽位、next、每个输入接了啥、所属脚本、子树块数（F3：不用整段读） |
 | `scratch_new_project` | 写 | **新建空白作品**（舞台 + 一个角色，各带内联 SVG 造型）；插件侧现造标准 sb3，可顺手落盘 |
-| `scratch_target` | 读/写 | 列角色 / **改角色名**（走 `vm.renameSprite`，同步引用角色名的积木） |
 | `scratch_restart_window` | 运行 | **杀掉重开**桌面版并重装上次的作品（窗口"假活"时的恢复动作） |
 | `scratch_backpack` | 读写 | **积木背包**：list/read/save/delete。把做好的脚本子树（连同它引用的变量/列表的值）存进 `$DSH_HOME/scratch-backpack/`，自动维护 `INDEX.md`；删除进 `_trash/` 不真删 |
 | `scratch_backpack_load` | 写 | 把背包里的一条注进项目（坐标整体平移、变量按名字接上或补建、`variableValues` 换内容）；受 `safety` 档位管 |
@@ -274,7 +276,7 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
 
 ## 文件
 
-- `index.js` — 入口：桥 + 握手 + 38 工具 + 快照持久化 + skill 区 + 背包 + 桌面版启动
+- `index.js` — 入口：桥 + 握手 + 40 工具 + 快照持久化 + skill 区 + 背包 + 桌面版启动
 - `cdp.js` — **CDP 直连**：给桌面版带调试端口启动、注入执行器、`tagForPage()` 贴协议标签
 - `vm-executor.js` — 扩展 `content-main.js` 的**逐字节副本**（CDP 注的就是它；
   改完扩展执行器跑 `node ../lab/sync-executor.mjs` 同步，`test-tools.mjs` 有一致性断言守着）
@@ -288,19 +290,25 @@ key = `dsh-plugin-scratch#scratch`），它的字段表必须与这三个 volati
 - `test-tools.mjs` — 插件侧工具行为（唤起编辑器 / token 配置包 / 地址白名单 / 桌面版去重 /
   CDP 桌面分支的启动参数与诚实报错 / `tagForPage` 四连 / 执行器副本一致性 / 桥端口被占自愈 /
   返回值无损 JSON / 打包契约（组合包字段、volatile 配置、浏览器半侧格式、窗口探针）+
-  v0.7.0 运行控制契约 + v0.8.0 背包与归因契约，109 断言）
+  v0.7.0 运行控制契约 + v0.8.0 背包与归因契约，181 断言）
 
-## 测试状态（2026-10-18 本轮实测，VPN 全程关闭）
+## 测试状态（2026-10-24 本轮实测）
 
 | 套件 | 结果 |
 |---|---|
-| `test-skills.mjs` | 23/23 ✅ |
+| `test-skills.mjs` | 34/34 ✅ |
 | `test-bridge-auth.mjs` | 21/21 ✅ |
-| `test-backpack.mjs` | 36/36 ✅ |
-| `test-tools.mjs` | 128/128 ✅（含打包契约：组合包 / volatile 配置 / 浏览器半侧 / 窗口探针 + v0.7.0 运行控制 + v0.8.0 背包与归因契约） |
-| `../lab/test-content-ops.js` | 246/246 ✅（含瘦身体积断言：5000 项列表场景 < 64KB） |
-| `../lab/real-machine-check.mjs`（真 Chrome / Edge + 真 turbowarp.org；不传 `SB3_FIXTURE`） | 115/115 ✅（Chrome、Edge 各一遍） |
-| `../lab/desktop-cdp-check.mjs`（TurboWarp Desktop + CDP；真开一个窗口、跑完自动关） | 134/134 ✅（含窗口可见性交叉验证 + 绿旗后角色真位移 + 高亮真亮真灭 + 真加 SVG 造型 + 子 frame 抢上下文回归 + 执行器自愈） |
+| `test-backpack.mjs` | 39/39 ✅ |
+| `test-tools.mjs` | 181/181 ✅（含 v0.14.0 资源导入：读盘归一化 / PNG 尺寸识别 / sprite3 打包形状 / blocksFile 三种形状） |
+| `../lab/test-content-ops.js` | 280/280 ✅（含瘦身体积断言：5000 项列表场景 < 64KB） |
+| `../lab/test-blank-project.mjs` | 13/13 ✅ |
+| `../lab/test-dissect.mjs` | 78/78 ✅ |
+| `../lab/real-machine-check.mjs`（真 Chrome / Edge + 真 turbowarp.org） | 上一轮 115/115 ✅（本轮没动这条链路） |
+| `../lab/desktop-cdp-check.mjs`（TurboWarp Desktop + CDP） | 上一轮 134/134 ✅（本轮没动这条链路） |
+
+v0.14.0 的那三个资源 op（`add_sprite` / `add_costume(PNG)` / `add_sound`）是在**真 TurboWarp 桌面版**上
+用 CDP 直接调 `window.__dshBridge.ops(...)` 验的（就是生产代码那条路）：新角色能弹出 drawable、
+PNG 造型 skin 正常且旋转中心 = 图心、WAV 解码出 48000Hz / 7680 采样 / 0.16s。数字见 STATUS。
 
 真机那一轮跑的是完整闭环，**28 个工具全覆盖**：唤起编辑器（含"没有会话时给 token 步骤"这条路）
 → 装扩展 → 填 token → 打开 turbowarp.org/editor → 握手认证 → list_sessions → snapshot

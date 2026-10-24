@@ -37,6 +37,27 @@
 | `control_start_as_clone` | 弹幕/粒子生成体 | 数据驱动生成必用 |
 | `event_whenthisspriteclicked` | 按钮 | UI 按钮（配造型切换） |
 
+## 动手之前先看一眼「已经有什么」
+
+两个地方**已经有现成的东西**，重造它们是最常见的浪费：
+
+1. **背包**（`scratch_skills({action:"list"}).backpack` 会一起列出来）：存的是**做好的整块积木**，
+   `scratch_backpack_load({name})` 直接注进项目。现在里面有：
+   - **文字引擎**（142 块 / 42221 个字形）：任意中文、数字、符号用**画笔**画出来，字号任意，不用造型、不用「说」气泡。
+     真机踩过：一个作品要显示 DP / 生命 / 波次，AI 不知道有这个，最后手绘了一套 7 段数码管 ——
+     **中文标签只能烘进背景图**（改一个字就要重出图）。要做 HUD / 中文界面先 load 它。
+2. **skill**：`scratch_skills({action:"read"})` 按需读。写积木前至少扫 `platform-traps.md`（输入名、下标、隐藏与图章…）。
+
+## 素材从哪来（v0.14.0 起不用自己打 sb3）
+
+| 要什么 | 工具 | 说明 |
+|---|---|---|
+| 加角色 | `scratch_add_sprite({ name, costumePath })` | 走官方 sprite3 解析，带校验；`costumePaths` 可一次给一堆 |
+| 加 PNG/JPG 造型 | `scratch_add_costume({ target, path })` | 读本机文件，旋转中心由渲染器按真实图形算 |
+| 加音效 | `scratch_add_sound({ target, path })` | wav/mp3/ogg；回报 rate/sampleCount，拿不到=没解码成功 |
+| 上千块积木 | `scratch_add_blocks({ blocksFile })` | 写个 json（`{targets:{名字:blocks}}` 多角色一次注入），别把 JSON 塞进参数 |
+| 删角色 | `scratch_target({ action:"delete", target })` | 连克隆体一起删；舞台/最后一个角色拒绝 |
+
 ## 检查清单（写完积木自查）
 
 - [ ] 每个**没勾 warp 的** `重复执行` 链里都有 `等待`（勾了 warp 的正好相反：一次跑完，里面不能等）
